@@ -89,9 +89,15 @@ export default function TestExecutionPage() {
       setBrowserView(data);
     });
 
-    newSocket.on('test-completed', (data: any) => {
+    newSocket.on('test-completed', (data: { sessionId: string, results: any }) => {
       setTestStatus('completed');
-      setProgress(prev => prev ? { ...prev, status: 'completed' } : null);
+      setProgress(prev => prev ? { 
+        ...prev, 
+        status: 'completed',
+        currentScenario: data.results.totalScenarios,
+        currentStep: data.results.totalSteps,
+        ...data.results
+      } : null);
     });
 
     newSocket.on('test-failed', (data: any) => {
@@ -161,10 +167,8 @@ export default function TestExecutionPage() {
   };
 
   const calculateProgress = () => {
-    if (!progress) return 0;
-    const scenarioProgress = progress.currentScenario / progress.totalScenarios;
-    const stepProgress = progress.currentStep / progress.totalSteps;
-    return Math.round((scenarioProgress + stepProgress / progress.totalScenarios) * 100);
+    if (!progress || !progress.totalSteps) return 0;
+    return Math.round((progress.currentStep / progress.totalSteps) * 100);
   };
 
   return (

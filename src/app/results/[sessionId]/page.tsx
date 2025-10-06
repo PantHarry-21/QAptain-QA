@@ -21,10 +21,13 @@ import {
   Lightbulb, 
   ShieldAlert, 
   Monitor,
-  Camera
+  Camera,
+  Download
 } from "lucide-react";
 import Link from 'next/link';
 import Image from 'next/image';
+
+import { io, Socket } from "socket.io-client";
 
 interface TestSession {
   id: string;
@@ -92,8 +95,29 @@ export default function ResultsPage() {
   const [report, setReport] = useState<TestReport | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [isDownloading, setIsDownloading] = useState(false);
+  const [socket, setSocket] = useState<Socket | null>(null);
 
   useEffect(() => {
+    const newSocket = io(process.env.NEXT_PUBLIC_SOCKET_URL || 'http://localhost:3000', {
+      path: '/api/socketio',
+      transports: ['websocket', 'polling']
+    });
+
+    newSocket.on('connect', () => {
+      newSocket.emit('join-session', { sessionId });
+    });
+
+    newSocket.on('test-log', (log: TestLog) => {
+      setLogs(prev => [...prev, log]);
+    });
+
+    newSocket.on('test-completed', (data: { results: TestSession }) => {
+      fetchResults();
+    });
+
+    setSocket(newSocket);
+
     const fetchResults = async () => {
       try {
         const response = await fetch(`/api/results/${sessionId}`);
@@ -114,7 +138,58 @@ export default function ResultsPage() {
     };
 
     fetchResults();
+
+    return () => {
+      newSocket.disconnect();
+    };
   }, [sessionId]);
+
+  const handleDownloadReport = async () => {
+    if (!session) return;
+    setIsDownloading(true);
+    try {
+      const response = await fetch('/api/generate-pdf', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sessionId: session.id,
+          testResult: {
+            status: session.status,
+            startTime: session.started_at,
+            endTime: session.completed_at,
+            duration: session.duration,
+            totalScenarios: session.total_scenarios,
+            passedScenarios: session.passed_scenarios,
+            failedScenarios: session.failed_scenarios,
+            totalSteps: (session.passed_steps || 0) + (session.failed_steps || 0),
+            passedSteps: session.passed_steps,
+            failedSteps: session.failed_steps,
+          },
+          logs,
+          scenarioResults: scenarios,
+          aiAnalysis: report,
+          url: session.url,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to generate PDF');
+      }
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `test-report-${sessionId}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to download report');
+    } finally {
+      setIsDownloading(false);
+    }
+  };
 
   const formatTime = (dateString?: string) => {
     if (!dateString) return 'N/A';
@@ -202,12 +277,22 @@ export default function ResultsPage() {
     <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-900 dark:to-slate-800">
       <div className="container mx-auto px-4 py-8">
         <div className="mb-8">
-          <Link href="/" passHref>
-            <Button variant="ghost" className="mb-4">
-              <ArrowLeft className="w-4 h-4 mr-2" />
-              Back to Home
+          <div className="flex justify-between items-start">
+            <Link href="/" passHref>
+              <Button variant="ghost" className="mb-4">
+                <ArrowLeft className="w-4 h-4 mr-2" />
+                Back to Home
+              </Button>
+            </Link>
+            <Button onClick={handleDownloadReport} disabled={isDownloading}>
+              {isDownloading ? (
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              ) : (
+                <Download className="w-4 h-4 mr-2" />
+              )}
+              Download Report
             </Button>
-          </Link>
+          </div>
           <div className="flex items-center justify-between mb-4">
             <div>
               <h1 className="text-4xl font-bold text-slate-900 dark:text-slate-100 mb-2">Test Results</h1>

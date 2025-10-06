@@ -274,12 +274,14 @@ async function generatePDFReport(data: {
     });
     yPosition += 15;
 
-    addText('Risk Assessment:', 20, 14, true);
-    addText(`Risk Level: ${data.aiAnalysis.riskAssessment.level.toUpperCase()}`, 25, 12);
-    data.aiAnalysis.riskAssessment.issues.forEach((issue, index) => {
-      checkPageSpace(15);
-      addText(`• ${issue}`, 25, 10);
-    });
+    if (data.aiAnalysis.riskAssessment) {
+      addText('Risk Assessment:', 20, 14, true);
+      addText(`Risk Level: ${data.aiAnalysis.riskAssessment.level.toUpperCase()}`, 25, 12);
+      data.aiAnalysis.riskAssessment.issues.forEach((issue, index) => {
+        checkPageSpace(15);
+        addText(`• ${issue}`, 25, 10);
+      });
+    }
   }
 
   // Execution Logs (Summary)
