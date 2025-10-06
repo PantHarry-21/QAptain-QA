@@ -10,11 +10,10 @@ export default function Footer() {
           <p className="font-semibold">Sponsored by TYNYBAY Pvt. Ltd.</p>
           <p>Your one-stop solution for Automation Testing</p>
           <div className="mt-2 space-x-4">
-            <Link href="#" className="hover:underline">Learn More</Link>
-            <Link href="#" className="hover:underline">Our Products</Link>
-            <Link href="#" className="hover:underline">Contact Us</Link>
+            <p className="font-bold">Write less. Test more. Ship faster with QAptain.</p>
+           
           </div>
-          <p className="mt-4 text-xs">&copy; {new Date().getFullYear()} QAptain. All rights reserved.</p>
+          <p className="mt-4 text-xs">&copy; {new Date().getFullYear()} Crafted with 🤖 + ❤️ by QAptain</p>
         </div>
       </div>
     </footer>

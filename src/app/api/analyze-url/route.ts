@@ -33,7 +33,7 @@ export async function POST(request: NextRequest) {
 
     // Navigate to URL with timeout
     await page.goto(url, { 
-      waitUntil: 'networkidle2',
+      waitUntil: 'load',
       timeout: 30000 
     });
 
@@ -147,7 +147,7 @@ export async function POST(request: NextRequest) {
     const screenshot = await page.screenshot({ 
       type: 'jpeg', 
       quality: 80,
-      fullPage: true 
+      fullPage: false 
     });
 
     await browser.close();

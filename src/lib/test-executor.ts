@@ -127,6 +127,7 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
     passedSteps: 0,
     failedSteps: 0
   };
+  let completedSteps = 0;
 
   try {
     emitLog({ level: 'info', message: `Initializing test session...` });
@@ -158,11 +159,12 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
 
       for (let j = 0; j < scenario.steps.length; j++) {
         const stepDescription = scenario.steps[j];
+        completedSteps++;
         io.to(sessionRoom).emit('test-progress', {
           currentScenario: i + 1,
           totalScenarios: scenarios.length,
-          currentStep: j + 1,
-          totalSteps: scenario.steps.length,
+          currentStep: completedSteps,
+          totalSteps: sessionResults.totalSteps,
           currentScenarioTitle: scenario.title,
           currentStepDescription: stepDescription,
           status: 'running',
@@ -238,14 +240,15 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
       failed_steps: sessionResults.failedSteps
     });
 
-    emitLog({ level: 'success', message: '🎉 All test scenarios completed successfully!' });
-
     // Generate AI analysis and create report
     await azureAIService.generateTestAnalysis(
       { ...sessionResults, status: 'completed', startTime: startTime.toISOString(), endTime: endTime.toISOString(), duration },
       [], // logs will be fetched by the service
       []  // scenarios will be fetched by the service
     );
+
+    emitLog({ level: 'success', message: '🎉 All test scenarios completed successfully!' });
+    io.to(sessionRoom).emit('test-completed', { sessionId, results: sessionResults });
 
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';

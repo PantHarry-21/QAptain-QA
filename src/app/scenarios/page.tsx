@@ -42,6 +42,10 @@ export default function ScenariosPage() {
     description: "",
     steps: ""
   });
+  const [aiStepDescription, setAiStepDescription] = useState("");
+  const [isGeneratingSteps, setIsGeneratingSteps] = useState(false);
+  const [generatedSteps, setGeneratedSteps] = useState<string[]>([]);
+
   const [editingScenarioData, setEditingScenarioData] = useState<Scenario | null>(null);
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
@@ -115,6 +119,28 @@ export default function ScenariosPage() {
     );
   };
 
+  const handleGenerateSteps = async () => {
+    if (!aiStepDescription.trim()) return;
+    setIsGeneratingSteps(true);
+    try {
+      const response = await fetch('/api/ai-generate-steps', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description: aiStepDescription, url }),
+      });
+      if (!response.ok) {
+        throw new Error('Failed to generate steps with AI');
+      }
+      const data = await response.json();
+      setGeneratedSteps(data.data.steps);
+      setNewCustomScenario(prev => ({ ...prev, steps: data.data.steps.join('\n') }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to generate steps');
+    } finally {
+      setIsGeneratingSteps(false);
+    }
+  };
+
   const handleAddCustomScenario = () => {
     if (!newCustomScenario.title.trim() || !newCustomScenario.steps.trim()) {
       return;
@@ -136,6 +162,8 @@ export default function ScenariosPage() {
     setSelectedScenarios(prev => [...prev, customScenario.id]);
     
     setNewCustomScenario({ title: "", description: "", steps: "" });
+    setAiStepDescription("");
+    setGeneratedSteps([]);
   };
 
   const handleStartEdit = (scenario: Scenario) => {
@@ -419,32 +447,42 @@ export default function ScenariosPage() {
                   Add Custom Scenario
                 </CardTitle>
                 <CardDescription>
-                  Create your own test scenario in plain English
+                  Describe a scenario and let AI generate the steps, or write them manually.
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
                 <div>
                   <label className="text-sm font-medium mb-2 block">Title</label>
                   <Input
-                    placeholder="Enter scenario title"
+                    placeholder="e.g., Test successful login"
                     value={newCustomScenario.title}
                     onChange={(e) => setNewCustomScenario(prev => ({ ...prev, title: e.target.value }))}
                   />
                 </div>
                 
                 <div>
-                  <label className="text-sm font-medium mb-2 block">Description (Optional)</label>
-                  <Input
-                    placeholder="Brief description"
-                    value={newCustomScenario.description}
-                    onChange={(e) => setNewCustomScenario(prev => ({ ...prev, description: e.target.value }))}
+                  <label className="text-sm font-medium mb-2 block">Scenario Description (for AI)</label>
+                  <Textarea
+                    placeholder="Describe the test scenario in plain English..."
+                    value={aiStepDescription}
+                    onChange={(e) => setAiStepDescription(e.target.value)}
+                    rows={3}
                   />
+                  <Button onClick={handleGenerateSteps} disabled={isGeneratingSteps || !aiStepDescription.trim()} className="mt-2 w-full">
+                    {isGeneratingSteps ? (
+                      <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Generating...</>
+                    ) : (
+                      'Generate Steps with AI'
+                    )}
+                  </Button>
                 </div>
-                
+
+                <Separator />
+
                 <div>
                   <label className="text-sm font-medium mb-2 block">Steps (one per line)</label>
                   <Textarea
-                    placeholder="Enter test steps&#10;One step per line&#10;e.g., Navigate to login page&#10;Enter username&#10;Enter password&#10;Click login button"
+                    placeholder="Or enter test steps manually...\nOne step per line\ne.g., Navigate to login page\nEnter username\nEnter password\nClick login button"
                     value={newCustomScenario.steps}
                     onChange={(e) => setNewCustomScenario(prev => ({ ...prev, steps: e.target.value }))}
                     rows={6}
