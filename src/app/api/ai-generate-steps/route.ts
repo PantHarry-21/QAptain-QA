@@ -23,10 +23,13 @@ You MUST generate steps that conform ONLY to the following allowed actions. Use 
 Allowed Step Actions:
 - "Navigate to the homepage"
 - "Navigate to the login page"
-- "Click the button with text \"[button_text]\""
-- "Click the link with text \"[link_text]\""
+- "Navigate to the contact page"
+- "Navigate to the register page"
+- "Click \"[text_to_click]\"" (for buttons or links by visible text)
+- "Click the [button|link] with text \"[text_to_click]\""
 - "Enter \"[text_to_enter]\" into the input field with placeholder \"[placeholder_text]\""
 - "Enter \"[text_to_enter]\" into the input field with name \"[name_attribute]\""
+- "Enter \"[text_to_enter]\" into the input field with label \"[label_text]\""
 - "Verify the page title contains \"[text_to_verify]\""
 - "Verify the page contains the text \"[text_to_verify]\""
 - "Wait for [number] seconds"

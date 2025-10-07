@@ -208,9 +208,13 @@ export default function TestExecutionPage() {
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-4">
                 {testStatus === 'idle' && (
-                  <Button onClick={handleStartTest} disabled={!isConnected}>
-                    <Play className="w-4 h-4 mr-2" />
-                    Start Test
+                  <Button onClick={handleStartTest} disabled={!isConnected || testStatus === 'running'}>
+                    {testStatus === 'running' ? (
+                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    ) : (
+                      <Play className="w-4 h-4 mr-2" />
+                    )}
+                    {testStatus === 'running' ? 'Starting...' : 'Start Test'}
                   </Button>
                 )}
                 {(testStatus === 'completed' || testStatus === 'failed') && (

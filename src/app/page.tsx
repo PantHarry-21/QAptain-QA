@@ -8,6 +8,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Label } from "@/components/ui/label";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Loader2, Globe, Zap, BarChart3, Play } from "lucide-react";
+import Image from 'next/image';
+
 
 export default function Home() {
   const [url, setUrl] = useState("");
@@ -60,7 +62,7 @@ export default function Home() {
       <div className="container mx-auto px-4 py-16">
         {/* Hero Section */}
         <div className="text-center mb-12">
-          <h1 className="text-4xl md:text-6xl font-bold text-slate-900 dark:text-slate-100 mb-6">
+          <h1 className="text-4xl md:text-5xl font-bold text-slate-800 dark:text-slate-100 mb-4">
             AI Test Runner
           </h1>
           <p className="text-xl text-slate-600 dark:text-slate-400 mb-8 max-w-3xl mx-auto">

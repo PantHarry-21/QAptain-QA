@@ -16,7 +16,7 @@ export async function GET(
     // Fetch Test Session
     const { data: session, error: sessionError } = await supabase
       .from('test_sessions')
-      .select('*, test_reports(*)') // Select session and join with test_reports
+      .select('*, test_reports(*), selected_scenario_ids') // Select session and join with test_reports
       .eq('id', sessionId)
       .single();
 
@@ -26,7 +26,7 @@ export async function GET(
     }
 
     // Fetch Test Scenarios
-    const { data: scenarios, error: scenariosError } = await supabase
+    let { data: scenarios, error: scenariosError } = await supabase
       .from('test_scenarios')
       .select('*')
       .eq('session_id', sessionId)
@@ -34,7 +34,12 @@ export async function GET(
 
     if (scenariosError) {
       console.error('Error fetching scenarios:', scenariosError);
-      // Continue even if scenarios fail, as session data might still be useful
+      scenarios = []; // Ensure scenarios is an empty array on error
+    }
+
+    // Filter scenarios based on selected_scenario_ids if available
+    if (session.selected_scenario_ids && scenarios) {
+      scenarios = scenarios.filter(scenario => session.selected_scenario_ids.includes(scenario.id));
     }
 
     // Fetch Test Logs
@@ -49,6 +54,17 @@ export async function GET(
       // Continue even if logs fail
     }
 
+    // Fetch Scenario Reports
+    const { data: scenarioReports, error: scenarioReportsError } = await supabase
+      .from('scenario_reports')
+      .select('*')
+      .eq('session_id', sessionId);
+
+    if (scenarioReportsError) {
+      console.error('Error fetching scenario reports:', scenarioReportsError);
+      // Continue even if reports fail
+    }
+
     // The report is already joined with the session, so it's in session.test_reports
     const report = session.test_reports?.[0] || null; // Assuming one report per session
     delete session.test_reports; // Remove the joined report from the session object
@@ -60,6 +76,7 @@ export async function GET(
         scenarios: scenarios || [],
         logs: logs || [],
         report,
+        scenarioReports: scenarioReports || [],
       },
     });
   } catch (error) {

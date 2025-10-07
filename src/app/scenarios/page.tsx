@@ -29,6 +29,25 @@ interface CustomScenario {
   steps: string[];
 }
 
+import { supabase } from '@/lib/supabase';
+
+interface Scenario {
+  id: string;
+  title: string;
+  description: string;
+  priority: 'high' | 'medium' | 'low';
+  category: string;
+  steps: string[];
+  estimatedTime: string;
+}
+
+interface CustomScenario {
+  id: string;
+  title: string;
+  description: string;
+  steps: string[];
+}
+
 import { v4 as uuidv4 } from 'uuid';
 
 export default function ScenariosPage() {

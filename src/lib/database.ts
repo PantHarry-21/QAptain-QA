@@ -1,5 +1,5 @@
 import { supabase } from './supabase';
-import { TestSession, TestScenario, TestStep, TestLog, TestReport } from './supabase';
+import { TestSession, TestScenario, TestStep, TestLog, TestReport, ScenarioReport } from './supabase';
 
 export class DatabaseService {
   // Test Session Operations
@@ -117,6 +117,21 @@ export class DatabaseService {
     return data;
   }
 
+  async getTestScenario(scenarioId: string): Promise<TestScenario | null> {
+    const { data, error } = await supabase
+      .from('test_scenarios')
+      .select('*')
+      .eq('id', scenarioId)
+      .single();
+
+    if (error) {
+      console.error('Error fetching test scenario:', error);
+      return null;
+    }
+
+    return data;
+  }
+
   // Test Step Operations
   async createTestStep(stepData: Partial<TestStep>): Promise<TestStep | null> {
     const { data, error } = await supabase
@@ -221,6 +236,22 @@ export class DatabaseService {
 
     if (error) {
       console.error('Error fetching test report:', error);
+      return null;
+    }
+
+    return data;
+  }
+
+  // Scenario Report Operations
+  async createScenarioReport(reportData: Partial<ScenarioReport>): Promise<ScenarioReport | null> {
+    const { data, error } = await supabase
+      .from('scenario_reports')
+      .insert([reportData])
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error creating scenario report:', error);
       return null;
     }
 

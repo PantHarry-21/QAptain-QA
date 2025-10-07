@@ -1,10 +1,12 @@
+
 import { NextRequest, NextResponse } from 'next/server';
-import puppeteer from 'puppeteer';
+import { chromium, Browser } from 'playwright';
 import { supabase } from '@/lib/supabase';
 import { azureAIService } from '@/lib/azure-ai';
 import { TestSession } from '@/lib/supabase';
 
 export async function POST(request: NextRequest) {
+  let browser: Browser | null = null;
   try {
     const { url } = await request.json();
 
@@ -20,16 +22,17 @@ export async function POST(request: NextRequest) {
     }
 
     // Launch browser
-    const browser = await puppeteer.launch({
+    browser = await chromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
     });
 
-    const page = await browser.newPage();
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36'
+    });
+    const page = await context.newPage();
     
     // Set viewport and user agent
-    await page.setViewport({ width: 1920, height: 1080 });
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+    await page.setViewportSize({ width: 1920, height: 1080 });
 
     // Navigate to URL with timeout
     await page.goto(url, { 
@@ -93,8 +96,8 @@ export async function POST(request: NextRequest) {
         id: `img_${index}`,
         src: img.getAttribute('src') || '',
         alt: img.getAttribute('alt') || '',
-        width: img.naturalWidth,
-        height: img.naturalHeight
+        width: (img as HTMLImageElement).naturalWidth,
+        height: (img as HTMLImageElement).naturalHeight
       })).filter(img => img.src);
 
       // Extract headings
@@ -149,8 +152,6 @@ export async function POST(request: NextRequest) {
       quality: 80,
       fullPage: false 
     });
-
-    await browser.close();
 
     // Convert screenshot to base64
     const screenshotBase64 = `data:image/jpeg;base64,${screenshot.toString('base64')}`;
@@ -213,5 +214,9 @@ export async function POST(request: NextRequest) {
       },
       { status: 500 }
     );
+  } finally {
+    if (browser) {
+      await browser.close();
+    }
   }
 }
