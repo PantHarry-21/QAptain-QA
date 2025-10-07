@@ -8,11 +8,12 @@ async function findSubmitButton(page: Page, contextSelector: string) {
     const buttonSelectors = [
         'button[type="submit"]',
         'input[type="submit"]',
+        'button:has-text("Add Agent")', // More specific
         'button:has-text("Submit")',
         'button:has-text("Save")',
         'button:has-text("Continue")',
         'button:has-text("Next")',
-        'button:has-text("Add")'
+        'button:has-text("Add")' // Fallback
     ];
 
     for (const selector of buttonSelectors) {
@@ -117,7 +118,7 @@ export async function skillFillFormHappyPath(page: Page, contextSelector: string
     // 5. Find and click the submit button
     const submitButton = await findSubmitButton(page, contextSelector);
     if (submitButton) {
-        await submitButton.click({ force: true });
+        await submitButton.evaluate(element => element.click()); // Use evaluate to click
 
         if (contextSelector !== 'body') {
             const modalLocator = page.locator(contextSelector);
