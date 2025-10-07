@@ -162,78 +162,27 @@ Now, generate the full JSON response containing the "scenarios" array.
     }
   }
 
-  async generateFormFillSteps(formData: any): Promise<{ steps: Array<{ action: string; target: string; value: string }> }> {
-    const prompt = `
-    You are an expert QA automation engineer specializing in web forms. Your task is to analyze the structure of an HTML form and generate the necessary steps to fill it with realistic and valid data.
-
-    Here is the form structure, provided as a JSON object:
-    ${JSON.stringify(formData, null, 2)}
-
-    Based on the input attributes (name, id, placeholder, label, type), infer the purpose of each field and generate a realistic, random value for it.
-
-    **IMPORTANT INSTRUCTIONS**:
-    - Generate creative and varied data. For a name field, do not use common placeholders.
-    - **Adhere strictly to the field's label.** If a field is 'First Name', provide *only* a single first name (e.g., "Alex"). If a field is 'Last Name', provide *only* a single last name (e.g., "Garcia"). If a field is 'Full Name', you can provide a full name (e.g., "Alex Garcia").
-    - **Crucially, DO NOT use the placeholder value from the input as the fill value.** For example, if an input has a placeholder of "Enter your name", the value should be a random name, not "Enter your name".
-    - Do not fill disabled or read-only fields.
-
-    You MUST NOT generate any steps with an 'action' other than 'fill'. Do not generate 'click' steps.
-
-    Your final output MUST be a JSON object containing an array named "steps". Each object in the array should represent an action to fill a field and have three properties:
-
-    Example output:
-    {
-      "steps": [
-        { "action": "fill", "target": "First Name", "value": "Alex" },
-        { "action": "fill", "target": "Last Name", "value": "Garcia" }
-      ]
-    }
-    `;
-
-    const response = await this.generateCompletion(prompt, { maxTokens: 2000 });
-    
-    try {
-      const parsed = JSON.parse(response);
-      if (!parsed.steps || !Array.isArray(parsed.steps)) {
-        throw new Error('Invalid AI response format: "steps" array not found.');
-      }
-      return parsed;
-    } catch (error) {
-      console.error('Failed to parse AI response for form fill steps:', response);
-      throw new Error('Invalid AI response format for form fill steps');
-    }
-  }
-
   async generateFakerMappings(formData: any): Promise<any> {
     const prompt = `
-    You are a data mapping expert for the faker-js library. Your task is to analyze the structure of an HTML form and map each field to a specific faker-js method to generate realistic data.
+    You are a data mapping expert for the faker-js library. Your task is to analyze a simplified list of form inputs and map each field to a specific faker-js method.
 
-    Here is the form structure, provided as a JSON object:
+    Here is the simplified form structure:
     ${JSON.stringify(formData, null, 2)}
 
-    For each input field, provide a JSON object with the faker-js \
-namespace\
-, \
-method\
-, and an array of \
-options\
- if any are needed. Choose the most appropriate and specific method available.
-
-    **IMPORTANT INSTRUCTIONS**:
-    - For phone numbers, use the format '##########' to ensure it's a plain number string.
-    - For names, distinguish between 'firstName', 'lastName', and 'fullName'.
-    - For states, use the abbreviated form.
-
-    Your final output MUST be a JSON object where keys are the field targets (label, name, or placeholder) and values are the mapping objects.
+    **CRITICAL INSTRUCTIONS**:
+    1.  You MUST return a JSON object.
+    2.  The keys of the JSON object MUST EXACTLY MATCH the 'label', 'name', or 'placeholder' of the corresponding input. Prioritize the 'label'.
+    3.  The value for each key MUST be a JSON object with a 'namespace', 'method', and optional 'options' array.
+    4.  For phone numbers, you MUST use the format '##########'.
+    5.  If you are uncertain about a field, map it to { "namespace": "lorem", "method": "word" }. DO NOT leave any field unmapped.
 
     Example Input:
-    { "inputs": [ { "label": "First Name" }, { "label": "Home Phone" }, { "label": "State"} ] }
+    { "inputs": [ { "label": "First Name", "name": "fname" }, { "label": "Contact Phone", "name": "phone" } ] }
 
     Example Output:
     {
       "First Name": { "namespace": "person", "method": "firstName" },
-      "Home Phone": { "namespace": "phone", "method": "number", "options": ["##########"] },
-      "State": { "namespace": "location", "method": "state", "options": [{ "abbreviated": true }] }
+      "Contact Phone": { "namespace": "phone", "method": "number", "options": ["##########"] }
     }
     `;
 
@@ -322,6 +271,11 @@ options\
     - 'TEST_FORM_VALIDATION': Intelligently run a full validation test suite on a form on the current page.
 
     Based on the user's command AND the current page context, generate a JSON object containing an array named "plan" of steps.
+
+    **CRITICAL PLANNING RULES**:
+    1.  If the user's intent is to add, create, or submit data (e.g., "Add an agent") AND a form is visible (isFormVisible is true), your primary goal is to fill that form. You MUST use the FILL_FORM_HAPPY_PATH or TEST_FORM_VALIDATION skill.
+    2.  Do NOT choose to CLICK a button if a form is already visible and the intent is to fill it, even if the button's name matches the user command. The click will happen inside the form-filling skill.
+    3.  If a form is NOT visible, your plan should be to CLICK the button or link that would reveal the form.
 
     Example 1:
     User Command: "Add an agent"
