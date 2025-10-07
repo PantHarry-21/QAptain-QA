@@ -20,6 +20,11 @@ export const metadata: Metadata = {
   description: "Transform your web testing with AI-powered automation, real-time execution, and comprehensive reporting.",
   keywords: ["AI Test Runner", "Automated Testing", "Selenium", "AI", "Web Testing", "Quality Assurance"],
   authors: [{ name: "Himanshu Pant" }],
+  icons: {
+    icon: "/favicon.ico", // or /favicon.png if you prefer PNG
+    shortcut: "/favicon.ico",
+    apple: "/favicon.ico",
+  },
   openGraph: {
     title: "AI Test Runner",
     description: "AI-powered automated testing with real-time execution and comprehensive reporting",

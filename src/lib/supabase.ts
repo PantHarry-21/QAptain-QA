@@ -34,6 +34,7 @@ export interface TestSession {
   duration?: number;
   page_analysis?: any;
   ai_analysis?: any;
+  selected_scenario_ids?: string[];
 }
 
 export interface TestScenario {
@@ -89,6 +90,7 @@ export interface TestReport {
   key_findings: string[];
   recommendations: string[];
   risk_level: 'low' | 'medium' | 'high';
+  risk_assessment_issues: string[];
   performance_metrics: any;
   created_at: string;
   updated_at: string;

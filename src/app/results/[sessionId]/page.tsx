@@ -28,6 +28,11 @@ import Link from 'next/link';
 import Image from 'next/image';
 
 import { io, Socket } from "socket.io-client";
+import dynamic from 'next/dynamic';
+
+const DynamicPDFGenerator = dynamic(() => import('@/lib/pdf-generator').then(mod => mod.generatePDFReportClient), {
+  ssr: false,
+});
 
 interface TestSession {
   id: string;
@@ -93,6 +98,7 @@ export default function ResultsPage() {
   const [scenarios, setScenarios] = useState<TestScenario[]>([]);
   const [logs, setLogs] = useState<TestLog[]>([]);
   const [report, setReport] = useState<TestReport | null>(null);
+  const [scenarioReports, setScenarioReports] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
@@ -112,8 +118,23 @@ export default function ResultsPage() {
       setLogs(prev => [...prev, log]);
     });
 
+    newSocket.on('test-scenario-update', (updatedScenario: TestScenario) => {
+      setScenarios(prevScenarios =>
+        prevScenarios.map(scenario =>
+          scenario.id === updatedScenario.id ? updatedScenario : scenario
+        )
+      );
+    });
+
+    newSocket.on('test-report-update', (updatedReport: TestReport) => {
+      setReport(updatedReport);
+    });
+
     newSocket.on('test-completed', (data: { results: TestSession }) => {
-      fetchResults();
+      setSession(prev => ({ ...prev, ...data.results, status: 'completed' }));
+      setTimeout(() => {
+        fetchResults(); // Re-fetch all data to ensure final consistency
+      }, 500); // Add a small delay to allow database updates to propagate
     });
 
     setSocket(newSocket);
@@ -127,9 +148,10 @@ export default function ResultsPage() {
         }
         const { data } = await response.json();
         setSession(data.session);
-        setScenarios(data.scenarios);
-        setLogs(data.logs);
+        setScenarios(Array.isArray(data.scenarios) ? data.scenarios : []);
+        setLogs(Array.isArray(data.logs) ? data.logs : []);
         setReport(data.report);
+        setScenarioReports(data.scenarioReports);
       } catch (err) {
         setError(err instanceof Error ? err.message : 'An unknown error occurred');
       } finally {
@@ -144,39 +166,41 @@ export default function ResultsPage() {
     };
   }, [sessionId]);
 
+  const handleViewResults = () => {
+    router.push(`/results/${sessionId}`);
+  };
+
   const handleDownloadReport = async () => {
     if (!session) return;
     setIsDownloading(true);
     try {
-      const response = await fetch('/api/generate-pdf', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId: session.id,
-          testResult: {
-            status: session.status,
-            startTime: session.started_at,
-            endTime: session.completed_at,
-            duration: session.duration,
-            totalScenarios: session.total_scenarios,
-            passedScenarios: session.passed_scenarios,
-            failedScenarios: session.failed_scenarios,
-            totalSteps: (session.passed_steps || 0) + (session.failed_steps || 0),
-            passedSteps: session.passed_steps,
-            failedSteps: session.failed_steps,
-          },
-          logs,
-          scenarioResults: scenarios,
-          aiAnalysis: report,
-          url: session.url,
-        }),
+      const pdfBuffer = await DynamicPDFGenerator({
+        sessionId: session.id,
+        testResult: {
+          status: session.status,
+          startTime: session.started_at || '',
+          endTime: session.completed_at || '',
+          duration: session.duration || 0,
+          totalScenarios: session.total_scenarios || 0,
+          passedScenarios: session.passed_scenarios || 0,
+          failedScenarios: session.failed_scenarios || 0,
+          totalSteps: (session.passed_steps || 0) + (session.failed_steps || 0),
+          passedSteps: session.passed_steps || 0,
+          failedSteps: session.failed_steps || 0,
+        },
+        logs,
+        scenarioResults: scenarios.map(s => ({
+          id: s.id,
+          title: s.title,
+          status: s.status as 'passed' | 'failed', // Cast to correct type
+          duration: s.duration || 0,
+          steps: s.steps,
+        })),
+        aiAnalysis: report,
+        url: session.url,
       });
 
-      if (!response.ok) {
-        throw new Error('Failed to generate PDF');
-      }
-
-      const blob = await response.blob();
+      const blob = new Blob([pdfBuffer], { type: 'application/pdf' });
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -200,6 +224,8 @@ export default function ResultsPage() {
     if (!dateString) return 'N/A';
     return new Date(dateString).toLocaleDateString();
   };
+
+
 
   const getLogIcon = (level: string) => {
     switch (level) {
@@ -262,7 +288,7 @@ export default function ResultsPage() {
     );
   }
 
-  const totalScenarios = session.total_scenarios || 0;
+  const totalScenarios = scenarios.length;
   const passedScenarios = session.passed_scenarios || 0;
   const failedScenarios = session.failed_scenarios || 0;
   const totalSteps = (session.passed_steps || 0) + (session.failed_steps || 0);
@@ -308,7 +334,7 @@ export default function ResultsPage() {
         <Tabs defaultValue="overview" className="w-full">
           <TabsList className="grid w-full grid-cols-4">
             <TabsTrigger value="overview">Overview</TabsTrigger>
-            <TabsTrigger value="screenshots">Screenshots</TabsTrigger>
+<TabsTrigger value="library">Library</TabsTrigger>
             <TabsTrigger value="logs">Test Logs</TabsTrigger>
             <TabsTrigger value="ai-analysis">AI Analysis</TabsTrigger>
           </TabsList>
@@ -370,29 +396,49 @@ export default function ResultsPage() {
             </Card>
           </TabsContent>
 
-          <TabsContent value="screenshots" className="mt-4">
+          <TabsContent value="library" className="mt-4">
             <Card>
-              <CardHeader><CardTitle className="flex items-center gap-2"><Camera className="w-5 h-5" />Screenshots</CardTitle></CardHeader>
+              <CardHeader><CardTitle className="flex items-center gap-2"><Camera className="w-5 h-5" />Library</CardTitle></CardHeader>
               <CardContent>
-                {screenshotLogs.length === 0 ? (
-                  <p className="text-center text-slate-500">No screenshots available for this session.</p>
-                ) : (
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                    {screenshotLogs.map((log) => (
-                      <div key={log.id} className="border rounded-lg overflow-hidden">
-                        <Image 
-                          src={log.metadata!.screenshot!} 
-                          alt={`Screenshot from log ${log.id}`} 
-                          width={800} 
-                          height={600} 
-                          layout="responsive"
-                          className="w-full h-auto"
-                        />
-                        <p className="p-2 text-sm text-slate-600 dark:text-slate-400">{log.message} ({formatTime(log.timestamp)})</p>
+                <Tabs defaultValue="screenshots" className="w-full">
+                  <TabsList className="grid w-full grid-cols-2">
+                    <TabsTrigger value="screenshots">Screenshots</TabsTrigger>
+                    <TabsTrigger value="videos">Videos</TabsTrigger>
+                  </TabsList>
+                  <TabsContent value="screenshots" className="mt-4">
+                    {screenshotLogs.length === 0 ? (
+                      <p className="text-center text-slate-500">No screenshots available for this session.</p>
+                    ) : (
+                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                        {screenshotLogs.map((log) => (
+                          <div key={log.id} className="border rounded-lg overflow-hidden">
+                            <Image 
+                              src={log.metadata!.screenshot!} 
+                              alt={`Screenshot from log ${log.id}`} 
+                              width={800} 
+                              height={600} 
+                              layout="responsive"
+                              className="w-full h-auto"
+                            />
+                            <p className="p-2 text-sm text-slate-600 dark:text-slate-400">{log.message} ({formatTime(log.timestamp)})</p>
+                          </div>
+                        ))}
                       </div>
-                    ))}
-                  </div>
-                )}
+                    )}
+                  </TabsContent>
+                  <TabsContent value="videos" className="mt-4">
+                    {session.video_url ? (
+                      <div className="border rounded-lg overflow-hidden">
+                        <video controls className="w-full h-auto rounded-lg">
+                          <source src={`/api/videos/${session.video_url}`} type="video/webm" />
+                          Your browser does not support the video tag.
+                        </video>
+                      </div>
+                    ) : (
+                      <p className="text-center text-slate-500">No video available for this session.</p>
+                    )}
+                  </TabsContent>
+                </Tabs>
               </CardContent>
             </Card>
           </TabsContent>
@@ -434,9 +480,9 @@ export default function ResultsPage() {
 
           <TabsContent value="ai-analysis" className="mt-4">
             {/* AI Analysis & Report */}
-            {report ? (
-              <Card>
-                <CardHeader><CardTitle className="flex items-center gap-2"><BarChart3 className="w-5 h-5" />AI Test Report</CardTitle></CardHeader>
+            {report && (
+              <Card className="mb-6">
+                <CardHeader><CardTitle className="flex items-center gap-2"><BarChart3 className="w-5 h-5" />Overall AI Test Report</CardTitle></CardHeader>
                 <CardContent className="space-y-4">
                   <div>
                     <h3 className="text-lg font-semibold mb-2">Summary</h3>
@@ -445,7 +491,7 @@ export default function ResultsPage() {
                   <div>
                     <h3 className="text-lg font-semibold mb-2 flex items-center gap-2"><Lightbulb className="w-5 h-5" />Key Findings</h3>
                     <ul className="list-disc pl-5 space-y-1 text-slate-700 dark:text-slate-300">
-                      {report.key_findings.map((finding, index) => (
+                      {(report.key_findings ?? []).map((finding: string, index: number) => (
                         <li key={index}>{finding}</li>
                       ))}
                     </ul>
@@ -453,7 +499,7 @@ export default function ResultsPage() {
                   <div>
                     <h3 className="text-lg font-semibold mb-2 flex items-center gap-2"><ShieldAlert className="w-5 h-5" />Recommendations</h3>
                     <ul className="list-disc pl-5 space-y-1 text-slate-700 dark:text-slate-300">
-                      {report.recommendations.map((rec, index) => (
+                      {(report.recommendations ?? []).map((rec: string, index: number) => (
                         <li key={index}>{rec}</li>
                       ))}
                     </ul>
@@ -472,12 +518,52 @@ export default function ResultsPage() {
                   </div>
                 </CardContent>
               </Card>
-            ) : (
-              <Alert>
-                <AlertTitle>No AI Analysis Available</AlertTitle>
-                <AlertDescription>The AI report could not be generated or is not available for this session.</AlertDescription>
-              </Alert>
             )}
+
+            <h3 className="text-2xl font-bold mb-4">Per-Scenario AI Analysis</h3>
+            {scenarios.map(scenario => {
+              const scenarioReport = scenarioReports.find(r => r.scenario_id === scenario.id);
+              return (
+                <Card key={scenario.id} className="mb-4">
+                  <CardHeader>
+                    <CardTitle>{scenario.title}</CardTitle>
+                    <CardDescription>Status: {scenario.status}</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    {scenarioReport ? (
+                      <div className="space-y-4">
+                        <div>
+                          <h4 className="font-semibold">Summary</h4>
+                          <p>{scenarioReport.summary}</p>
+                        </div>
+                        <div>
+                          <h4 className="font-semibold">Issues</h4>
+                          {scenarioReport.issues.length > 0 ? (
+                            <ul className="list-disc pl-5">
+                              {Array.isArray(scenarioReport.issues) ? scenarioReport.issues.map((issue: string, i: number) => <li key={i}>{issue}</li>) : <p>No issues found.</p>}
+                            </ul>
+                          ) : (
+                            <p>No issues found.</p>
+                          )}
+                        </div>
+                        <div>
+                          <h4 className="font-semibold">Recommendations</h4>
+                          {Array.isArray(scenarioReport.recommendations) && scenarioReport.recommendations.length > 0 ? (
+                            <ul className="list-disc pl-5">
+                              {scenarioReport.recommendations.map((rec: string, i: number) => <li key={i}>{rec}</li>)}
+                            </ul>
+                          ) : (
+                            <p>No recommendations.</p>
+                          )}
+                        </div>
+                      </div>
+                    ) : (
+                      <p>No AI analysis available for this scenario.</p>
+                    )}
+                  </CardContent>
+                </Card>
+              );
+            })}
           </TabsContent>
         </Tabs>
       </div>

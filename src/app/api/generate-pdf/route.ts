@@ -29,12 +29,7 @@ interface ScenarioResult {
   title: string;
   status: 'passed' | 'failed';
   duration: number;
-  steps: {
-    description: string;
-    status: 'passed' | 'failed';
-    timestamp: string;
-    screenshot?: string;
-  }[];
+  steps: string[];
 }
 
 interface AIAnalysis {
@@ -153,7 +148,7 @@ async function generatePDFReport(data: {
 
   pdf.setFontSize(12);
   pdf.setFont('helvetica', 'normal');
-  pdf.text(`Generated: ${new Date().toLocaleString()}`, pageWidth / 2, yPosition, { align: 'center' });
+  pdf.text(`Generated: ${new Date(data.testResult.endTime).toLocaleString()}`, pageWidth / 2, yPosition, { align: 'center' });
   yPosition += 15;
 
   pdf.text(`Target URL: ${data.url}`, pageWidth / 2, yPosition, { align: 'center' });
@@ -164,13 +159,13 @@ async function generatePDFReport(data: {
   addText('Executive Summary', 20, 18, true);
   yPosition += 10;
 
-  const successRate = Math.round((data.testResult.passedScenarios / data.testResult.totalScenarios) * 100);
-  addText(`Overall Status: ${data.testResult.status.toUpperCase()}`, 20, 14, true);
+  const successRate = data.testResult.totalScenarios > 0 ? Math.round((data.testResult.passedScenarios / data.testResult.totalScenarios) * 100) : 0;
+  addText(`Overall Status: ${data.testResult.status?.toUpperCase() || 'N/A'}`, 20, 14, true);
   addText(`Success Rate: ${successRate}%`, 20, 12);
-  addText(`Total Scenarios: ${data.testResult.totalScenarios}`, 20, 12);
-  addText(`Passed: ${data.testResult.passedScenarios}`, 20, 12);
-  addText(`Failed: ${data.testResult.failedScenarios}`, 20, 12);
-  addText(`Duration: ${formatDuration(data.testResult.duration)}`, 20, 12);
+  addText(`Total Scenarios: ${data.testResult.totalScenarios || 0}`, 20, 12);
+  addText(`Passed: ${data.testResult.passedScenarios || 0}`, 20, 12);
+  addText(`Failed: ${data.testResult.failedScenarios || 0}`, 20, 12);
+  addText(`Duration: ${formatDuration(data.testResult.duration || 0)}`, 20, 12);
   addText(`Execution Time: ${formatTime(data.testResult.startTime)}`, 20, 12);
 
   yPosition += 20;
@@ -233,17 +228,16 @@ async function generatePDFReport(data: {
     checkPageSpace(40);
     
     addText(`${index + 1}. ${scenario.title}`, 20, 14, true);
-    addText(`Status: ${scenario.status.toUpperCase()}`, 25, 12);
-    addText(`Duration: ${formatDuration(scenario.duration)}`, 25, 12);
-    addText(`Steps: ${scenario.steps.length}`, 25, 12);
+    addText(`Status: ${scenario.status?.toUpperCase() || 'N/A'}`, 25, 12);
+    addText(`Duration: ${formatDuration(scenario.duration || 0)}`, 25, 12);
+    addText(`Steps: ${scenario.steps.length || 0}`, 25, 12);
     
     yPosition += 10;
     
     // Add step details
     scenario.steps.forEach((step, stepIndex) => {
       checkPageSpace(20);
-      addText(`Step ${stepIndex + 1}: ${step.description}`, 30, 10);
-      addText(`Status: ${step.status.toUpperCase()}`, 35, 9);
+      addText(`Step ${stepIndex + 1}: ${step}`, 30, 10);
       yPosition += 5;
     });
     

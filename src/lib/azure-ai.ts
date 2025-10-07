@@ -4,6 +4,7 @@ import OpenAI from 'openai';
 // OpenAI configuration
 const apiKey = process.env.OPENAI_API_KEY!;
 const modelName = process.env.OPENAI_MODEL_NAME || 'gpt-4-turbo';
+const scenarioGenerationModelName = process.env.SCENARIO_GENERATION_MODEL_NAME || modelName;
 
 if (!apiKey) {
   throw new Error('Missing OPENAI_API_KEY environment variable');
@@ -38,7 +39,7 @@ export class AzureAIService {
     
     try {
       const completion = await client.chat.completions.create({
-        model: modelName,
+        model: scenarioGenerationModelName,
         messages: [
           { role: 'system', content: 'You are a helpful AI assistant designed to output JSON.' },
           { role: 'user', content: prompt }
@@ -319,6 +320,52 @@ Respond in JSON format:
     } catch (error) {
       console.error('Failed to parse AI analysis response:', response);
       throw new Error('Invalid AI response format for analysis');
+    }
+  }
+
+  async analyzeScenario(
+    scenario: any,
+    logs: any[]
+  ): Promise<{
+    summary: string;
+    issues: string[];
+    recommendations: string[];
+  }> {
+    const scenarioLogs = logs.filter(log => log.scenario_id === scenario.id);
+    const prompt = `
+You are an expert test analyst. Analyze the following test scenario execution and provide insights.
+
+Scenario Details:
+- Title: ${scenario.title}
+- Description: ${scenario.description}
+- Status: ${scenario.status}
+- Duration: ${scenario.duration}ms
+- Steps:
+${scenario.steps.map((step: string) => `- ${step}`).join('\n')}
+
+Logs for this scenario:
+${scenarioLogs.map(log => `[${log.level}] ${log.message}`).join('\n')}
+
+Please provide:
+1. A brief summary of the scenario execution.
+2. Any issues or errors that occurred.
+3. Actionable recommendations for improvement, if any.
+
+Respond in JSON format:
+{
+  "summary": "Brief summary of the scenario execution.",
+  "issues": ["issue1", "issue2", ...],
+  "recommendations": ["recommendation1", "recommendation2", ...]
+}
+`;
+
+    const response = await this.generateCompletion(prompt);
+
+    try {
+      return JSON.parse(response);
+    } catch (error) {
+      console.error('Failed to parse AI scenario analysis response:', response);
+      throw new Error('Invalid AI response format for scenario analysis');
     }
   }
 }
