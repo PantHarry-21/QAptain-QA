@@ -1,9 +1,13 @@
 import { chromium, Page, Browser, Locator } from 'playwright';
 import { v4 as uuidv4 } from 'uuid';
 import { databaseService } from '@/lib/database';
-import { azureAIService } from '@/lib/azure-ai';
+import { azureAIService } from './azure-ai';
 import { TestLog } from '@/lib/supabase';
 import { Server } from 'socket.io';
+
+import { skillFillFormHappyPath } from './skills/fill-form';
+import { skillTestFormValidation } from './skills/test-form-validation';
+import { getDomContextSelector } from './utils';
 
 // --- Interfaces ---
 
@@ -27,51 +31,89 @@ interface CommandDefinition {
 
 // --- Helper Functions ---
 
-async function findLocator(page: Page, identifier: string): Promise<Locator> {
-  // 1. CSS Selector (if it looks like one)
-  if(identifier.startsWith('#') || identifier.startsWith('.')){
-    const loc = page.locator(identifier);
-    if(await loc.count() > 0) return loc.first();
-  }
+async function findLocator(page: Page, identifier: string, elementType?: string): Promise<Locator> {
+    // Escape special characters for regex
+    const searchIdentifier = new RegExp(identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
 
-  // 2. By Role (for buttons, links, etc. - good for clicks)
-  let locator = page.getByRole('button', { name: new RegExp(identifier, 'i') });
-  if (await locator.count() > 0 && await locator.first().isVisible()) {
-    return locator.first();
-  }
-  locator = page.getByRole('link', { name: new RegExp(identifier, 'i') });
-  if (await locator.count() > 0 && await locator.first().isVisible()) {
-    return locator.first();
-  }
+    const locators: Locator[] = [];
 
-  // 3. By Label (great for form inputs)
-  locator = page.getByLabel(new RegExp(identifier, 'i'));
-  if (await locator.count() > 0) {
-    return locator.first();
-  }
+    // 1. Role-based locators (most resilient)
+    if (elementType === 'button' || !elementType) {
+        locators.push(page.getByRole('button', { name: searchIdentifier }));
+    }
+    if (elementType === 'link' || !elementType) {
+        locators.push(page.getByRole('link', { name: searchIdentifier }));
+    }
+    if (elementType === 'checkbox' || !elementType) {
+        locators.push(page.getByRole('checkbox', { name: searchIdentifier }));
+    }
+    if (elementType === 'radio' || !elementType) {
+        locators.push(page.getByRole('radio', { name: searchIdentifier }));
+    }
 
-  // 4. By Placeholder (great for form inputs)
-  locator = page.getByPlaceholder(new RegExp(identifier, 'i'));
-  if (await locator.count() > 0) {
-    return locator.first();
-  }
-  
-  // 5. By Text (general fallback)
-  locator = page.getByText(new RegExp(identifier, 'i'));
-  if (await locator.count() > 0 && await locator.first().isVisible()) {
-    return locator.first();
-  }
+    // 2. Form-specific locators
+    locators.push(page.getByLabel(searchIdentifier));
+    locators.push(page.getByPlaceholder(searchIdentifier));
 
-  throw new Error(`Element with identifier "${identifier}" not found.`);
+    // 3. Text-based locators
+    locators.push(page.getByText(searchIdentifier));
+
+    // 4. Test ID
+    locators.push(page.getByTestId(identifier));
+
+    // 5. CSS Selector (if it looks like one)
+    if (identifier.startsWith('#') || identifier.startsWith('.')) {
+        locators.push(page.locator(identifier));
+    }
+
+    // Find the first visible locator
+    for (const locator of locators) {
+        try {
+            if (await locator.first().isVisible({ timeout: 1000 })) {
+                return locator.first();
+            }
+        } catch (e) {
+            // Ignore errors from locators that don't match or are not visible
+        }
+    }
+
+    throw new Error(`Element with identifier \"${identifier}\" not found or not visible.`);
 }
+
+function getLevenshteinDistance(a: string, b: string): number {
+    const matrix = Array(b.length + 1).fill(null).map(() => Array(a.length + 1).fill(null));
+    for (let i = 0; i <= a.length; i += 1) {
+        matrix[0][i] = i;
+    }
+    for (let j = 0; j < b.length; j += 1) {
+        matrix[j + 1][0] = j + 1;
+    }
+    for (let j = 0; j < b.length; j += 1) {
+        for (let i = 0; i < a.length; i += 1) {
+            const substitutionCost = a[i] === b[j] ? 0 : 1;
+            matrix[j + 1][i + 1] = Math.min(
+                matrix[j][i + 1] + 1, // deletion
+                matrix[j + 1][i] + 1, // insertion
+                matrix[j][i] + substitutionCost // substitution
+            );
+        }
+    }
+    return matrix[b.length][a.length];
+}
+
 
 // --- Command Definitions ---
 
 const commandDefinitions: CommandDefinition[] = [
-    // FILL WITH ATTRIBUTE (placeholder, label, name)
+    // FILL command with specific attribute (placeholder, label, etc.)
     {
-        regex: /^(?:Enter|Type|Fill|Input|Write)\s+['"]?(.+?)['"]?\s+(?:in|into|at)?\s*(?:the)?\s*(?:input|field|textbox|textarea)?\s*(?:with\s+(placeholder|label|name|aria-label))\s+['"]?(.+?)['"]?$/i,
-        parser: m => ({ type: 'fill', value: m[1], attribute: m[2], target: m[3] })
+        regex: /^(?:Enter|Type|Fill|Input|Write)\s+['"]?(.+?)['"]?\s+into\s(?:the\s*)?.*?\s(?:with|for)\s(?:the\s*)?(placeholder|label|name|aria-label)\s+['"]?(.+?)['"]?$/i,
+        parser: m => ({ type: 'fill', value: m[1], attribute: m[2].toLowerCase(), target: m[3] })
+    },
+    // FILL command (generic) - This now uses a negative lookahead to avoid being too greedy
+    {
+        regex: /^(?:Enter|Type|Fill|Input|Write)\s+['"]?(.+?)['"]?\s+into\s(?:the\s*)?(?!.*?\s(?:with|for)\s(?:placeholder|label|name|aria-label))['"]?(.+?)['"]?$/i,
+        parser: m => ({ type: 'fill', value: m[1], target: m[2] })
     },
 
     // CONDITIONAL LOGIC
@@ -79,7 +121,7 @@ const commandDefinitions: CommandDefinition[] = [
         regex: /^If\s+(?:the\s+)?(?:text\s+)?['"]?(.+?)['"]?\s+(?:is\s+visible|appears|exists|is\s+present),?\s*(?:then\s+)?(.+)$/i,
         parser: m => ({
             type: 'conditional',
-            target: { step: `Verify text "${m[1]}" is visible` },
+            target: { step: `Verify text \"${m[1]}\" is visible` },
             value: { step: m[2] }
         })
     },
@@ -98,20 +140,34 @@ const commandDefinitions: CommandDefinition[] = [
 
     // CLICK / PRESS / TAP / SELECT
     {
-        regex: /^(?:Click|Press|Tap|Select)\s*(?:the)?\s*(?:button|link|element)?\s*(?:named|called|with\s+text|with\s+label|with\s+selector)?\s*['"]?(.+?)['"]?$/i,
+        regex: /^(?:Click|Press|Tap|Select)\s*(?:the)?\s*(?:button|link|element)?\s*(?:named|called|with\s+text|with\s+label|with\s+selector)?\s*['"]?(.+?)['"]?(?:\s+button|\s+link|\s+element|\s+tab|\s+option|\s+item)?$/i,
         parser: m => ({ type: 'click', target: m[1].trim() })
     },
 
     // LOGIN / SIGN-IN
     {
-        regex: /^(?:Login|Log in|Sign in|Sign-in)\s*(?:with|using)?\s*['"]?([^'"+]+)['"]?\s*(?:and|\/)?\s*(?:password|pass|pwd)?\s*['"]?([^'"+]+)['"]?$/i,
+        regex: /^(?:Login|Log in|Sign in|Sign-in)\s*(?:with|using)?\s*['"]?([^'"]+)['"]?\s*(?:and|\/)?\s*(?:password|pass|pwd)?\s*['"]?([^'"]+)['"]?$/i,
         parser: m => ({ type: 'login', username: m[1], password: m[2] })
     },
 
-    // FILL / TYPE / INPUT (GENERIC)
+    // WAIT / PAUSE
     {
-        regex: /^(?:Type|Enter|Fill|Input|Write)\s+['"]?(.+?)['"]?\s+(?:in|into|to|at)?\s*(?:the)?\s*(?:input\s+field|input|field|textbox|textarea)?\s*(?:named|called|with\s+(?:label|placeholder|name))?\s*['"]?(.+?)['"]?$/i,
-        parser: m => ({ type: 'fill', value: m[1], target: m[2] })
+        regex: /^(?:Wait|Pause)\s*(?:for)?\s*(\d+)\s*seconds?$/i,
+        parser: m => ({ type: 'wait', value: parseInt(m[1], 10) })
+    },
+
+    // --- ASSERTIONS (ORDER IS CRITICAL) ---
+
+    // ASSERTIONS — URL (Most specific)
+    {
+        regex: /^(?:Verify|Assert|Check)\s+(?:that\s+)?(?:the\s+)?page\s+(?:url|address)\s+contains\s+['"]?(.+?)['"]?$/i,
+        parser: m => ({ type: 'assertUrlContains', value: m[1] })
+    },
+
+    // ASSERTIONS — PAGE CONTENT (Specific)
+    {
+        regex: /^(?:Verify|Assert|Check)\s+(?:that\s+)?(?:the\s+)?page\s+contains(?:\s+the\s+text)?\s+['"]?(.+?)['"]?$/i,
+        parser: m => ({ type: 'assertPageContains', value: m[1] })
     },
 
     // ASSERTIONS — VISIBILITY
@@ -120,14 +176,10 @@ const commandDefinitions: CommandDefinition[] = [
         parser: m => ({ type: 'assertVisible', target: m[1] })
     },
 
-    // ASSERTIONS — CONTENT
+    // ASSERTIONS — ELEMENT CONTENT (Generic - must be after page/url checks)
     {
-        regex: /^(?:Verify|Assert|Check)\s*(?:that\s+)?(?:element|text|page)?\s*['"]?(.+?)['"]?\s*contains(?:\s+text)?\s*['"]?(.+?)['"]?$/i,
-        parser: m => (
-            m[1].toLowerCase() === 'page'
-                ? { type: 'assertPageContains', value: m[2] }
-                : { type: 'assertTextContains', target: m[1], value: m[2] }
-        )
+        regex: /^(?:Verify|Assert|Check)\s+(?:that\s+)?(?:the\s*)?(?:element\s*)?['"]?(.+?)['"]?\s+contains(?:\s+the\s+text)?\s+['"]?(.+?)['"]?$/i,
+        parser: m => ({ type: 'assertTextContains', target: m[1], value: m[2] })
     },
 
     // ASSERTIONS — INPUT VALUE
@@ -143,19 +195,20 @@ const commandDefinitions: CommandDefinition[] = [
     },
 ];
 
-function parseSingleCommand(step: string): ParsedCommand {
-    const trimmedStep = step.trim();
+function parseSingleCommand(step: string): ParsedCommand | null {
+    const trimmedStep = step.trim().replace(/^\d+\.\s*/, ''); // Remove leading "1. ", "2. ", etc.
     for (const def of commandDefinitions) {
         const matches = trimmedStep.match(def.regex);
         if (matches) {
             return def.parser(matches);
         }
     }
-    throw new Error(`QAPTAIN PARSER FAILED ON STEP: "${trimmedStep}"`);
+    return null;
 }
 
 function parseStep(step: string): ParsedCommand[] {
     const commands: ParsedCommand[] = [];
+    // Split command string by 'then' or 'and then'
     const subSteps = step.split(/\s*,\s*then\s*|\s+and then\s+|\s*;\s*/i);
 
     for (const subStep of subSteps) {
@@ -166,7 +219,10 @@ function parseStep(step: string): ParsedCommand[] {
     return commands;
 }
 
-async function executeSingleCommand(command: ParsedCommand, page: Page, baseUrl: string, sessionId: string, scenarioId: string): Promise<void> {
+export async function executeSingleCommand(command: ParsedCommand, page: Page, baseUrl: string, sessionId: string, scenarioId: string): Promise<void> {
+  // Add a small delay before each command
+  await page.waitForTimeout(250);
+
   switch (command.type) {
     case 'navigateSpecific':
       const pageName = command.target!.toLowerCase();
@@ -184,22 +240,62 @@ async function executeSingleCommand(command: ParsedCommand, page: Page, baseUrl:
 
     case 'click':
       const locator = await findLocator(page, command.target!); 
-      await locator.click();
+      await locator.click({ timeout: 10000 });
       break;
 
     case 'fill':
-      let targetLocator;
-      const locatorType = command.attribute;
-      const identifier = command.target!;
+      let filled = false;
+      // First, try the specific locator type if provided by the parser
+      if (command.attribute) {
+        try {
+          let specificLocator;
+          if (command.attribute === 'placeholder') {
+            specificLocator = page.getByPlaceholder(command.target!);
+          } else if (command.attribute === 'label') {
+            specificLocator = page.getByLabel(command.target!);
+          } else if (command.attribute === 'name') {
+            specificLocator = page.locator(`[name="${command.target!}"]`);
+          } else if (command.attribute === 'aria-label') {
+            specificLocator = page.getByLabel(command.target!); // getByLabel also works for aria-label
+          }
 
-      if (locatorType === 'placeholder') {
-        targetLocator = page.getByPlaceholder(new RegExp(identifier, 'i'));
-      } else if (locatorType === 'label' || locatorType === 'name') {
-        targetLocator = page.getByLabel(new RegExp(identifier, 'i'));
-      } else {
-        targetLocator = await findLocator(page, identifier);
+          if (specificLocator) {
+            await specificLocator.fill(command.value!, { timeout: 5000 }); // Short timeout for the specific attempt
+            filled = true;
+          }
+        } catch (e) {
+          // The specific locator failed. We will now fall back to the general one.
+        }
       }
-      await targetLocator.fill(command.value!);
+
+      // If the specific locator failed, wasn't provided, or was unsuccessful, use the general-purpose findLocator
+      if (!filled) {
+          const fallbackLocator = await findLocator(page, command.target!);
+          await fallbackLocator.fill(command.value!); 
+      }
+      break;
+
+    case 'wait':
+      // command.value is in seconds, convert to milliseconds
+      await page.waitForTimeout(command.value! * 1000);
+      break;
+
+    case 'assertUrlContains':
+      const currentUrl = page.url();
+      const expectedText = command.value!;
+      if (!currentUrl.includes(expectedText)) {
+        // Typo detection logic
+        const urlParts = currentUrl.split('/').filter(p => p.length > 2);
+        const cleanExpectedText = expectedText.replace(/\//g, '');
+
+        for (const part of urlParts) {
+            const distance = getLevenshteinDistance(part, cleanExpectedText);
+            if (distance > 0 && distance <= 2) { // Threshold of 2 for typos
+                throw new Error(`Expected URL to contain "${expectedText}" but it was not found. Did you mean "${part}"?`);
+            }
+        }
+        throw new Error(`Expected URL "${currentUrl}" to contain "${expectedText}"`);
+      }
       break;
 
     case 'assertVisible':
@@ -338,7 +434,6 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
 
       emitLog({ level: 'info', message: `Starting scenario: "${scenario.title}"`, scenario_id: scenario.id });
 
-      emitLog({ level: 'info', message: `Resetting to base URL: ${url}` });
       await page.goto(url, { waitUntil: 'load' });
       await saveScreenshotToDatabase(page, sessionId, scenario.id, undefined, `Initial state for scenario: ${scenario.title}`);
       await emitScreenshot(page);
@@ -366,7 +461,63 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
               emitLog({ level: 'warning', message: `Retrying step: ${stepDescription} (Attempt ${retry + 1}/${MAX_STEP_RETRIES + 1})`, scenario_id: scenario.id });
               await page.waitForTimeout(1000);
             }
-            await executeStep(page, stepDescription, url, sessionId, scenario.id);
+
+            // --- SMART DISPATCHER LOGIC ---
+            const parsedCommand = parseSingleCommand(stepDescription);
+
+            if (parsedCommand) {
+              // It's a basic, low-level command
+              await executeStep(page, stepDescription, url, sessionId, scenario.id);
+            } else {
+              // It's a high-level, abstract command
+              emitLog({ level: 'info', message: `High-level command detected: "${stepDescription}". Analyzing page context...`, scenario_id: scenario.id });
+
+              // Determine the active DOM context (main page or modal)
+              const activeContextSelector = await getDomContextSelector(page);
+
+              // Analyze the current page to provide context to the AI planner
+              const pageContext = await page.evaluate((selector) => {
+                  const activeContext = document.querySelector(selector) || document.body;
+                  
+                  // More robust form detection: look for inputs, not just <form> tags.
+                  const formInputs = activeContext.querySelectorAll('input:not([type="hidden"]), textarea, select');
+                  const isFormVisible = formInputs.length > 2; // Heuristic: more than 2 inputs suggests a form is present.
+
+                  const visibleButtons = Array.from(activeContext.querySelectorAll('button')).map(btn => btn.textContent?.trim() || '').filter(text => text.length > 0);
+                  const visibleLinks = Array.from(activeContext.querySelectorAll('a')).map(a => a.textContent?.trim() || '').filter(text => text.length > 0);
+                  
+                  return { isFormVisible, visibleButtons, visibleLinks, contextType: selector === 'body' ? 'document' : 'modal' };
+              }, activeContextSelector);
+
+              emitLog({ level: 'info', message: `Engaging AI orchestrator with context: ${JSON.stringify(pageContext)}`, scenario_id: scenario.id });
+              const plan = await azureAIService.createWorkflowPlan(stepDescription, pageContext);
+              emitLog({ level: 'info', message: `AI has generated a sub-plan: ${JSON.stringify(plan.plan)}`, scenario_id: scenario.id });
+
+              for (const subStep of plan.plan) {
+                emitLog({ level: 'info', message: `Executing sub-step: ${subStep.skill} -> ${subStep.target || ''}`, scenario_id: scenario.id });
+                switch (subStep.skill) {
+                  case 'CLICK':
+                    await executeSingleCommand({ type: 'click', target: subStep.target }, page, url, sessionId, scenario.id);
+                    break;
+                  case 'NAVIGATE':
+                    await executeSingleCommand({ type: 'navigateUrl', target: subStep.url }, page, url, sessionId, scenario.id);
+                    break;
+                  case 'FILL_FORM_HAPPY_PATH':
+                    await skillFillFormHappyPath(page);
+                    break;
+                  case 'TEST_FORM_VALIDATION':
+                    await skillTestFormValidation(page);
+                    break;
+                  default:
+                    throw new Error(`Unknown AI skill in sub-plan: ${subStep.skill}`);
+                }
+                await emitScreenshot(page);
+              }
+            }
+            // --- END SMART DISPATCHER LOGIC ---
+
+            await saveScreenshotToDatabase(page, sessionId, scenario.id, undefined, `Screenshot after: ${stepDescription}`);
+
             await emitScreenshot(page);
             emitLog({ level: 'success', message: `✅ Step completed: ${stepDescription}`, scenario_id: scenario.id });
             sessionResults.passedSteps++;

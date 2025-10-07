@@ -71,22 +71,6 @@ You are an expert web testing AI assistant. Analyze the following webpage inform
 Page Information:
 - Title: ${pageInfo.title}
 - URL: ${pageInfo.url}
-- Description: ${pageInfo.metaDescription}
-- Forms: ${JSON.stringify(pageInfo.forms, null, 2)}
-- Navigation Links: ${pageInfo.navLinks.length} found
-- Buttons: ${pageInfo.buttons.length} found
-- Links: ${pageInfo.links.length} found
-- Images: ${pageInfo.images.length} found
-- Headings: ${pageInfo.headings.length} found
-- Has Login Form: ${pageInfo.hasLoginForm}
-- Has Contact Form: ${pageInfo.hasContactForm}
-- Has Search Form: ${pageInfo.hasSearchForm}
-
-Please provide:
-1. A brief summary of what this webpage appears to be
-2. Key interactive elements that should be tested
-3. Suggested test scenarios that would be valuable
-4. Complexity assessment (simple/medium/complex)
 
 Respond in JSON format:
 {
@@ -124,50 +108,47 @@ Respond in JSON format:
       : '';
 
     const prompt = `
-You are an expert test automation engineer. Generate comprehensive, executable test scenarios for the following webpage.
+You are an expert test automation engineer. Your task is to generate a comprehensive set of executable test scenarios based on the provided webpage information.
 
 ${existingScenariosText}Page Information:
 - Title: ${pageInfo.title}
 - URL: ${pageInfo.url}
-- Description: ${pageInfo.metaDescription}
-- Forms: ${JSON.stringify(pageInfo.forms, null, 2)}
-- Navigation Links: ${pageInfo.navLinks.length} found
-- Buttons: ${pageInfo.buttons.length} found
+- Page Features:
+  - Has Login Form: ${pageInfo.hasLoginForm}
+  - Has Contact Form: ${pageInfo.hasContactForm}
+  - Has Search Form: ${pageInfo.hasSearchForm}
+  - Number of Forms: ${pageInfo.forms.length}
+  - Number of Navigation Links: ${pageInfo.navLinks.length}
 
-IMPORTANT: You MUST generate steps that conform ONLY to the following allowed actions. Use the exact phrasing and structure provided.
+Please generate 5-7 test scenarios. Prioritize critical user journeys like authentication, form submissions, and core feature interactions.
 
-Allowed Step Actions:
-- "Navigate to the homepage"
-- "Navigate to the login page"
-- "Click the button with text \"[button_text]\""
-- "Click the link with text \"[link_text]\""
-- "Enter \"[text_to_enter]\" into the input field with placeholder \"[placeholder_text]\""
-- "Enter \"[text_to_enter]\" into the input field with name \"[name_attribute]\""
-- "Verify the page title contains \"[text_to_verify]\""
-- "Verify the page contains the text \"[text_to_verify]\""
-- "Wait for [number] seconds"
+**IMPORTANT**: You MUST respond in a valid JSON format. The root object should contain a single key, "scenarios", which is an array of scenario objects. Each scenario object MUST have the following structure and keys:
+- "title": (string) A short, descriptive title for the test case. THIS IS REQUIRED AND CANNOT BE EMPTY.
+- "description": (string) A brief explanation of what the test case covers. THIS IS REQUIRED AND CANNOT BE EMPTY.
+- "priority": (string) The priority of the test, which must be one of 'high', 'medium', or 'low'.
+- "category": (string) A relevant category for the test (e.g., 'authentication', 'forms', 'navigation', 'search', 'usability').
+- "steps": (array of strings) A list of simple, clear, and executable steps for the test.
+- "estimatedTime": (string) A rough estimate of how long the test will take (e.g., "30 seconds", "1 minute").
+- "reasoning": (string) A brief justification for why this scenario is important to test.
 
-Generate 5-7 test scenarios that would be most valuable for this webpage. Each scenario should:
-1. Be specific and actionable, using ONLY the allowed step actions.
-2. Prioritize critical user journeys like login, search, or form submissions.
-3. Include clear, step-by-step instructions.
-
-Do NOT generate steps for performance, SEO, accessibility, or other non-functional tests. Only generate steps that can be executed through direct browser interaction based on the allowed actions above.
-
-Respond in JSON format:
+Example of a single scenario object:
 {
-  "scenarios": [
-    {
-      "title": "Scenario title",
-      "description": "Brief description of what this test verifies",
-      "priority": "high|medium|low",
-      "category": "authentication|forms|navigation|usability",
-      "steps": ["Step 1 using allowed actions", "Step 2 using allowed actions", ...],
-      "estimatedTime": "30 seconds|1 minute|2 minutes",
-      "reasoning": "Why this scenario is important for testing the web application's functionality."
-    }
-  ]
+  "title": "User Login with Valid Credentials",
+  "description": "This test verifies that a user can successfully log in with a correct username and password.",
+  "priority": "high",
+  "category": "authentication",
+  "steps": [
+    "Navigate to the login page",
+    "Enter a valid username in the username field",
+    "Enter a valid password in the password field",
+    "Click the 'Login' button",
+    "Verify that the user is redirected to the dashboard"
+  ],
+  "estimatedTime": "45 seconds",
+  "reasoning": "Login is a critical path for all authenticated user flows."
 }
+
+Now, generate the full JSON response containing the "scenarios" array.
 `;
 
     const response = await this.generateCompletion(prompt, { maxTokens: 3000 });
@@ -181,68 +162,193 @@ Respond in JSON format:
     }
   }
 
-  async translateNaturalLanguageToSelenium(
-    scenarios: Array<{
-      title: string;
-      steps: string[];
-    }>,
-    url: string,
-    language: 'javascript' | 'python' = 'javascript'
-  ): Promise<Array<{
-    scenarioId: string;
-    scenarioTitle: string;
-    script: string;
-    dependencies: string[];
-    setupCode: string;
-    teardownCode: string;
-    explanation: string;
-  }>> {
-    const scenariosText = scenarios.map(s => 
-      `Title: ${s.title}\nSteps:\n${s.steps.map((step, i) => `${i + 1}. ${step}`).join('\n')}`
-    ).join('\n\n---\n\n');
-
+  async generateFormFillSteps(formData: any): Promise<{ steps: Array<{ action: string; target: string; value: string }> }> {
     const prompt = `
-You are an expert Selenium test automation engineer. Convert the following natural language test scenarios into executable Selenium WebDriver scripts.
+    You are an expert QA automation engineer specializing in web forms. Your task is to analyze the structure of an HTML form and generate the necessary steps to fill it with realistic and valid data.
 
-Target URL: ${url}
-Programming Language: ${language}
+    Here is the form structure, provided as a JSON object:
+    ${JSON.stringify(formData, null, 2)}
 
-Test Scenarios:
-${scenariosText}
+    Based on the input attributes (name, id, placeholder, label, type), infer the purpose of each field and generate a realistic, random value for it.
 
-For each scenario, generate:
-1. Complete, executable Selenium WebDriver code
-2. All necessary imports and dependencies
-3. Setup and teardown code
-4. Clear comments explaining each step
-5. Proper error handling and waits
+    **IMPORTANT INSTRUCTIONS**:
+    - Generate creative and varied data. For a name field, do not use common placeholders.
+    - **Adhere strictly to the field's label.** If a field is 'First Name', provide *only* a single first name (e.g., "Alex"). If a field is 'Last Name', provide *only* a single last name (e.g., "Garcia"). If a field is 'Full Name', you can provide a full name (e.g., "Alex Garcia").
+    - **Crucially, DO NOT use the placeholder value from the input as the fill value.** For example, if an input has a placeholder of "Enter your name", the value should be a random name, not "Enter your name".
+    - Do not fill disabled or read-only fields.
 
-The code should be production-ready and follow best practices.
+    You MUST NOT generate any steps with an 'action' other than 'fill'. Do not generate 'click' steps.
 
-Respond in JSON format:
-{
-  "scripts": [
+    Your final output MUST be a JSON object containing an array named "steps". Each object in the array should represent an action to fill a field and have three properties:
+
+    Example output:
     {
-      "scenarioId": "unique_identifier",
-      "scenarioTitle": "Scenario title",
-      "script": "complete executable code",
-      "dependencies": ["dependency1", "dependency2"],
-      "setupCode": "setup code snippet",
-      "teardownCode": "teardown code snippet",
-      "explanation": "Brief explanation of how the script works"
+      "steps": [
+        { "action": "fill", "target": "First Name", "value": "Alex" },
+        { "action": "fill", "target": "Last Name", "value": "Garcia" }
+      ]
     }
-  ]
-}
-`;
+    `;
 
-    const response = await this.generateCompletion(prompt, { maxTokens: 4000 });
+    const response = await this.generateCompletion(prompt, { maxTokens: 2000 });
     
     try {
       const parsed = JSON.parse(response);
-      return parsed.scripts || [];
+      if (!parsed.steps || !Array.isArray(parsed.steps)) {
+        throw new Error('Invalid AI response format: "steps" array not found.');
+      }
+      return parsed;
     } catch (error) {
-      console.error('Failed to parse AI translation response:', response);
-      throw new Error('Invalid AI response format for translation');
+      console.error('Failed to parse AI response for form fill steps:', response);
+      throw new Error('Invalid AI response format for form fill steps');
+    }
+  }
+
+  async generateFakerMappings(formData: any): Promise<any> {
+    const prompt = `
+    You are a data mapping expert for the faker-js library. Your task is to analyze the structure of an HTML form and map each field to a specific faker-js method to generate realistic data.
+
+    Here is the form structure, provided as a JSON object:
+    ${JSON.stringify(formData, null, 2)}
+
+    For each input field, provide a JSON object with the faker-js \
+namespace\
+, \
+method\
+, and an array of \
+options\
+ if any are needed. Choose the most appropriate and specific method available.
+
+    **IMPORTANT INSTRUCTIONS**:
+    - For phone numbers, use the format '##########' to ensure it's a plain number string.
+    - For names, distinguish between 'firstName', 'lastName', and 'fullName'.
+    - For states, use the abbreviated form.
+
+    Your final output MUST be a JSON object where keys are the field targets (label, name, or placeholder) and values are the mapping objects.
+
+    Example Input:
+    { "inputs": [ { "label": "First Name" }, { "label": "Home Phone" }, { "label": "State"} ] }
+
+    Example Output:
+    {
+      "First Name": { "namespace": "person", "method": "firstName" },
+      "Home Phone": { "namespace": "phone", "method": "number", "options": ["##########"] },
+      "State": { "namespace": "location", "method": "state", "options": [{ "abbreviated": true }] }
+    }
+    `;
+
+    const response = await this.generateCompletion(prompt, { maxTokens: 2000 });
+    
+    try {
+      return JSON.parse(response);
+    } catch (error) {
+      console.error('Failed to parse AI response for faker mappings:', response);
+      throw new Error('Invalid AI response format for faker mappings');
+    }
+  }
+
+  async generateFormValidationScenarios(formData: any): Promise<any> {
+    const prompt = `
+    You are a senior QA automation engineer. Your task is to create a comprehensive set of validation test scenarios for an HTML form.
+
+    Here is the form structure, provided as a JSON object:
+    ${JSON.stringify(formData, null, 2)}
+
+    Generate a list of test scenarios to verify its validation rules. You MUST generate the following scenarios:
+    1.  An empty submission to check for required field validation.
+    2.  Invalid data scenarios for fields with specific formats (like email or phone).
+    3.  A happy path scenario with all valid data.
+
+    For each scenario, provide a title, a brief description, and a list of steps. Each step should be an object with an action, target, and value.
+
+    Your final output MUST be a JSON object containing an array named "scenarios".
+
+    Example output:
+    {
+      "scenarios": [
+        {
+          "title": "Empty Submission",
+          "description": "Tests required field validation by submitting the form with no data.",
+          "steps": []
+        },
+        {
+          "title": "Invalid Email Scenario",
+          "description": "Tests email format validation by submitting with an invalid email address.",
+          "steps": [
+            { "action": "fill", "target": "Email Address", "value": "not-an-email" }
+          ]
+        },
+        {
+          "title": "Happy Path",
+          "description": "Tests the successful submission of the form with all valid data.",
+          "steps": [
+            { "action": "fill", "target": "First Name", "value": "Jane" },
+            { "action": "fill", "target": "Email Address", "value": "jane.doe@example.com" }
+          ]
+        }
+      ]
+    }
+    `;
+
+    const response = await this.generateCompletion(prompt, { maxTokens: 3500 });
+    
+    try {
+      const parsed = JSON.parse(response);
+      if (!parsed.scenarios || !Array.isArray(parsed.scenarios)) {
+        throw new Error('Invalid AI response format: "scenarios" array not found.');
+      }
+      return parsed;
+    } catch (error) {
+      console.error('Failed to parse AI response for validation scenarios:', response);
+      throw new Error('Invalid AI response format for validation scenarios');
+    }
+  }
+
+  async createWorkflowPlan(userCommand: string, context: any): Promise<any> {
+    const prompt = `
+    You are an AI Test Automation Orchestrator. Your job is to convert a high-level user command into a structured, step-by-step execution plan in JSON format.
+
+    User Command: "${userCommand}"
+
+    Current Page Context:
+    - Is a form visible on the page? ${context.isFormVisible}
+    - Visible buttons: [${context.visibleButtons.slice(0, 20).join(', ')}]
+    - Visible links: [${context.visibleLinks.slice(0, 20).join(', ')}]
+
+    Available Skills:
+    - 'CLICK': Clicks a button, link, or tab. Requires a 'target'.
+    - 'NAVIGATE': Go to a specific URL. Requires a 'url'.
+    - 'FILL_FORM_HAPPY_PATH': Intelligently analyze and fill a form on the current page with valid data.
+    - 'TEST_FORM_VALIDATION': Intelligently run a full validation test suite on a form on the current page.
+
+    Based on the user's command AND the current page context, generate a JSON object containing an array named "plan" of steps.
+
+    Example 1:
+    User Command: "Add an agent"
+    Current Page Context: { "isFormVisible": false, "visibleButtons": ["Add New Agent", "Delete Agent"] }
+    Your Output: {"plan":[{ "skill": "CLICK", "target": "Add New Agent" }]}
+    (Rationale: The user wants to add an agent, no form is visible, but an "Add New Agent" button is. The plan is to click the button to reveal the form. The next step will handle filling it.)
+
+    Example 2:
+    User Command: "Add an agent"
+    Current Page Context: { "isFormVisible": true, "visibleButtons": ["Save Agent", "Cancel"] }
+    Your Output: {"plan":[{ "skill": "FILL_FORM_HAPPY_PATH" }]}
+    (Rationale: The user wants to add an agent and a form is already visible. The plan is to fill the form directly.)
+
+    Now, generate the plan for the user command and context above.
+    `;
+
+    const response = await this.generateCompletion(prompt, { maxTokens: 2000 });
+    
+    try {
+      const parsed = JSON.parse(response);
+      if (!parsed.plan || !Array.isArray(parsed.plan)) {
+        throw new Error('Invalid AI response format: "plan" array not found.');
+      }
+      return parsed;
+    } catch (error) {
+      console.error('Failed to parse AI response for workflow plan:', response);
+      throw new Error('Invalid AI response format for workflow plan');
     }
   }
 
@@ -250,122 +356,43 @@ Respond in JSON format:
     testResults: any,
     logs: any[],
     scenarios: any[]
-  ): Promise<{
-    summary: string;
-    keyFindings: string[];
-    recommendations: string[];
-    riskAssessment: {
-      level: 'low' | 'medium' | 'high';
-      issues: string[];
-    };
-    performanceMetrics: {
-      averageStepTime: number;
-      fastestStep: string;
-      slowestStep: string;
-      totalExecutionTime: number;
-    };
-    qualityScore: number;
-  }> {
+  ): Promise<any> {
     const prompt = `
-You are an expert test analyst. Analyze the following test execution results and provide comprehensive insights.
+    You are an expert test analyst. Analyze the following test execution results and provide comprehensive insights.
 
-Test Results:
-- Status: ${testResults.status}
-- Total Scenarios: ${testResults.totalScenarios}
-- Passed Scenarios: ${testResults.passedScenarios}
-- Failed Scenarios: ${testResults.failedScenarios}
-- Total Steps: ${testResults.totalSteps}
-- Passed Steps: ${testResults.passedSteps}
-- Failed Steps: ${testResults.failedSteps}
-- Duration: ${testResults.duration}ms
+    Test Results:
+    - Status: ${testResults.status}
+    - Total Scenarios: ${testResults.totalScenarios}
+    - Passed Scenarios: ${testResults.passedScenarios}
+    - Failed Scenarios: ${testResults.failedScenarios}
 
-Sample Logs:
-${logs.slice(0, 10).map(log => `[${log.level}] ${log.message}`).join('\n')}
+    Please provide:
+    1. Executive summary of the test execution
+    2. Key findings and patterns
+    3. Actionable recommendations
+    4. Risk assessment with specific issues
+    5. Overall quality score (0-100)
 
-Failed Scenarios:
-${scenarios.filter(s => s.status === 'failed').map(s => `- ${s.title}`).join('\n')}
-
-Please provide:
-1. Executive summary of the test execution
-2. Key findings and patterns
-3. Actionable recommendations
-4. Risk assessment with specific issues
-5. Performance analysis
-6. Overall quality score (0-100)
-
-Respond in JSON format:
-{
-  "summary": "Executive summary",
-  "keyFindings": ["finding1", "finding2", ...],
-  "recommendations": ["recommendation1", "recommendation2", ...],
-  "riskAssessment": {
-    "level": "low|medium|high",
-    "issues": ["issue1", "issue2", ...]
-  },
-  "performanceMetrics": {
-    "averageStepTime": number,
-    "fastestStep": "step description",
-    "slowestStep": "step description",
-    "totalExecutionTime": number
-  },
-  "qualityScore": number
-}
-`;
+    Respond in JSON format:
+    {
+      "summary": "Executive summary",
+      "keyFindings": ["finding1", "finding2", ...],
+      "recommendations": ["recommendation1", "recommendation2", ...],
+      "riskAssessment": {
+        "level": "low|medium|high",
+        "issues": ["issue1", "issue2", ...]
+      },
+      "qualityScore": number
+    }
+    `;
 
     const response = await this.generateCompletion(prompt, { maxTokens: 3000 });
     
     try {
-      const parsed = JSON.parse(response);
-      return parsed;
+      return JSON.parse(response);
     } catch (error) {
       console.error('Failed to parse AI analysis response:', response);
       throw new Error('Invalid AI response format for analysis');
-    }
-  }
-
-  async analyzeScenario(
-    scenario: any,
-    logs: any[]
-  ): Promise<{
-    summary: string;
-    issues: string[];
-    recommendations: string[];
-  }> {
-    const scenarioLogs = logs.filter(log => log.scenario_id === scenario.id);
-    const prompt = `
-You are an expert test analyst. Analyze the following test scenario execution and provide insights.
-
-Scenario Details:
-- Title: ${scenario.title}
-- Description: ${scenario.description}
-- Status: ${scenario.status}
-- Duration: ${scenario.duration}ms
-- Steps:
-${scenario.steps.map((step: string) => `- ${step}`).join('\n')}
-
-Logs for this scenario:
-${scenarioLogs.map(log => `[${log.level}] ${log.message}`).join('\n')}
-
-Please provide:
-1. A brief summary of the scenario execution.
-2. Any issues or errors that occurred.
-3. Actionable recommendations for improvement, if any.
-
-Respond in JSON format:
-{
-  "summary": "Brief summary of the scenario execution.",
-  "issues": ["issue1", "issue2", ...],
-  "recommendations": ["recommendation1", "recommendation2", ...]
-}
-`;
-
-    const response = await this.generateCompletion(prompt);
-
-    try {
-      return JSON.parse(response);
-    } catch (error) {
-      console.error('Failed to parse AI scenario analysis response:', response);
-      throw new Error('Invalid AI response format for scenario analysis');
     }
   }
 }

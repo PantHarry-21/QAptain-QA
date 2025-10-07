@@ -367,9 +367,7 @@ export default function ResultsPage() {
             <Card className="mb-8">
               <CardHeader><CardTitle className="flex items-center gap-2"><Activity className="w-5 h-5" />Scenarios Details</CardTitle></CardHeader>
               <CardContent className="space-y-4">
-                {scenarios.length === 0 ? (
-                  <p className="text-center text-slate-500">No scenarios found for this session.</p>
-                ) : (
+                {scenarios.length > 0 ? (
                   scenarios.map((scenario) => (
                     <Card key={scenario.id} className="border-slate-200 dark:border-slate-700">
                       <CardContent className="p-4">
@@ -391,6 +389,21 @@ export default function ResultsPage() {
                       </CardContent>
                     </Card>
                   ))
+                ) : logs.length > 0 ? (
+                  <div className="text-sm text-slate-600 dark:text-slate-400">
+                    <p className="mb-4">This was a dynamic workflow run. The execution log below contains the step-by-step details.</p>
+                    <ScrollArea className="h-64 w-full">
+                      <div className="space-y-2 font-mono">
+                        {logs.filter(l => l.level !== 'info').map(log => (
+                          <div key={log.id} className={`p-2 rounded-md ${getLogColor(log.level)}`}>
+                            <span className="font-bold">{log.level.toUpperCase()}:</span> {log.message}
+                          </div>
+                        ))}
+                      </div>
+                    </ScrollArea>
+                  </div>
+                ) : (
+                  <p className="text-center text-slate-500">No scenarios or logs found for this session.</p>
                 )}
               </CardContent>
             </Card>
