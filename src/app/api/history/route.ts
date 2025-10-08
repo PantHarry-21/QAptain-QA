@@ -60,3 +60,74 @@ export async function GET(request: NextRequest) {
     );
   }
 }
+
+export async function POST(request: NextRequest) {
+  try {
+    const { sessionId, url, scenarios } = await request.json();
+
+    if (!sessionId || !url || !scenarios) {
+      return NextResponse.json({ error: 'sessionId, url, and scenarios are required' }, { status: 400 });
+    }
+
+    const newSession = {
+      id: sessionId,
+      url: url,
+      status: 'pending',
+      total_scenarios: scenarios.length,
+      passed_scenarios: 0,
+      failed_scenarios: 0,
+      total_steps: scenarios.reduce((sum: number, scenario: any) => sum + scenario.steps.length, 0),
+      passed_steps: 0,
+      failed_steps: 0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabase
+      .from('test_sessions')
+      .insert([newSession])
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(error.message);
+    }
+
+    // Insert scenarios
+    const newScenarios = scenarios.map((scenario: any) => ({
+      id: scenario.id,
+      session_id: sessionId,
+      title: scenario.title,
+      description: scenario.description || '',
+      priority: scenario.priority || 'medium',
+      category: scenario.category || 'custom',
+      steps: scenario.steps,
+      estimated_time: scenario.estimatedTime || 'unknown',
+      status: 'pending',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      is_custom: true,
+    }));
+
+    const { error: scenariosError } = await supabase
+      .from('test_scenarios')
+      .insert(newScenarios);
+
+    if (scenariosError) {
+      throw new Error(scenariosError.message);
+    }
+
+    return NextResponse.json({ success: true, session: data });
+
+  } catch (error) {
+    console.error('Error creating test session:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return NextResponse.json(
+      { 
+        error: 'Failed to create test session',
+        details: errorMessage
+      },
+      { status: 500 }
+    );
+  }
+}
