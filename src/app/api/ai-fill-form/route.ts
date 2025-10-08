@@ -59,7 +59,7 @@ export async function POST(request: NextRequest) {
     const firstForm = formsData[0];
 
     // Call the AI service to generate the form filling steps
-    const result = await azureAIService.generateFormFillSteps(firstForm);
+    const result = await azureAIService.generateFakerMappings(firstForm);
 
     return NextResponse.json({
       success: true,
