@@ -56,7 +56,7 @@ export async function generatePDFReportClient({
   scenarioResults,
   aiAnalysis,
   url,
-}: PDFRequest) {
+}: PDFRequest): Promise<void> {
   // Create PDF document
   const pdf = new jsPDF();
   const pageWidth = pdf.internal.pageSize.getWidth();
@@ -273,13 +273,6 @@ export async function generatePDFReportClient({
     );
   }
 
-  // Return PDF as buffer
-  const pdfBlob = pdf.output('blob');
-  return new Promise<Buffer>((resolve) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      resolve(Buffer.from(reader.result as ArrayBuffer));
-    };
-    reader.readAsArrayBuffer(pdfBlob);
-  });
+  // Save the PDF directly, letting jsPDF handle the download
+  pdf.save(`test-report-${sessionId}.pdf`);
 }

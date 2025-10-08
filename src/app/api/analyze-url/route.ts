@@ -1,6 +1,6 @@
 
 import { NextRequest, NextResponse } from 'next/server';
-import { chromium as playwrightCore, Browser } from 'playwright-core';
+import playwright, { Browser } from 'playwright-core';
 import chromium from '@sparticuz/chromium';
 import { supabase } from '@/lib/supabase';
 import { azureAIService } from '@/lib/azure-ai';
@@ -23,11 +23,22 @@ export async function POST(request: NextRequest) {
     }
 
     // Launch browser
-    browser = await playwrightCore.launch({
-      args: chromium.args,
-      executablePath: await chromium.executablePath(),
-      headless: chromium.headless,
-    });
+    const isVercel = process.env.VERCEL || process.env.LAMBDA_TASK_ROOT;
+    console.log(`[analyze-url] Environment detected as ${isVercel ? 'Vercel' : 'Local'}.`);
+
+    if (isVercel) {
+      console.log('[analyze-url] Launching browser with @sparticuz/chromium for serverless environment.');
+      browser = await playwright.chromium.launch({
+        args: chromium.args,
+        executablePath: await chromium.executablePath(),
+        headless: chromium.headless,
+      });
+    } else {
+      console.log('[analyze-url] Launching browser with local Playwright installation.');
+      browser = await playwright.chromium.launch({
+        headless: true
+      });
+    }
 
     const context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36'

@@ -321,7 +321,8 @@ async function generatePDFReport(data: {
   }
 
   // Return PDF as buffer
-  return pdf.output('arraybuffer') as Buffer;
+  const arrayBuffer = pdf.output('arraybuffer');
+  return Buffer.from(arrayBuffer);
 }
 
 // Helper functions
