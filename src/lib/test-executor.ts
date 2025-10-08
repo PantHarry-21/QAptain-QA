@@ -243,44 +243,52 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
       await locator.click({ timeout: 10000 });
       break;
 
-    case 'fill':
-      let filled = false;
-      // First, try the specific locator type if provided by the parser
-      if (command.attribute) {
-        try {
-          let specificLocator;
-          if (command.attribute === 'placeholder') {
-            specificLocator = page.getByPlaceholder(command.target!);
-          } else if (command.attribute === 'label') {
-            specificLocator = page.getByLabel(command.target!);
-          } else if (command.attribute === 'name') {
-            specificLocator = page.locator(`[name="${command.target!}"]`);
-          } else if (command.attribute === 'aria-label') {
-            specificLocator = page.getByLabel(command.target!); // getByLabel also works for aria-label
-          }
+    case 'fill': {
+      // This logic is specific to form inputs to avoid ambiguity with labels.
+      const { target, value } = command;
+      
+      // Prioritized list of locators for input fields
+      const inputLocators = [
+          page.getByLabel(target!),
+          page.getByPlaceholder(target!),
+          page.locator(`[name="${target!}"]`),
+          page.locator(`[id="${target!}"]`)
+      ];
 
-          if (specificLocator) {
-            await specificLocator.fill(command.value!, { timeout: 5000 }); // Short timeout for the specific attempt
-            filled = true;
+      let inputFilled = false;
+      for (const locator of inputLocators) {
+          try {
+              if (await locator.first().isVisible({ timeout: 1000 })) {
+                  await locator.first().focus(); // Add focus before filling
+                  await locator.first().fill(value!); 
+                  inputFilled = true;
+                  break; // Exit loop once filled
+              }
+          } catch (e) {
+              // Locator not found or visible, try the next one
           }
-        } catch (e) {
-          // The specific locator failed. We will now fall back to the general one.
-        }
       }
 
-      // If the specific locator failed, wasn't provided, or was unsuccessful, use the general-purpose findLocator
-      if (!filled) {
-          const fallbackLocator = await findLocator(page, command.target!);
-          await fallbackLocator.fill(command.value!); 
+      if (!inputFilled) {
+          throw new Error(`Could not find a visible input field with label, placeholder, name, or id matching "${target!}"`);
       }
       break;
+    }
 
-    case 'wait':
+    case 'select': {
+      const { target, value } = command;
+      const locator = await findLocator(page, target!); 
+      await locator.selectOption(value!); 
+      break;
+    }
+
+    case 'wait': {
       // command.value is in seconds, convert to milliseconds
       await page.waitForTimeout(command.value! * 1000);
       break;
+    }
 
-    case 'assertUrlContains':
+    case 'assertUrlContains': {
       const currentUrl = page.url();
       const expectedText = command.value!;
       if (!currentUrl.includes(expectedText)) {
@@ -297,43 +305,50 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
         throw new Error(`Expected URL "${currentUrl}" to contain "${expectedText}"`);
       }
       break;
+    }
 
-    case 'assertVisible':
+    case 'assertVisible': {
         await findLocator(page, command.target!); 
         break;
+    }
 
-    case 'assertPageContains':
+    case 'assertPageContains': {
         await page.locator(`body:has-text("${command.value}")`).waitFor();
         break;
+    }
 
-    case 'assertTextContains':
+    case 'assertTextContains': {
         const element = await findLocator(page, command.target!)
         await element.filter({ hasText: new RegExp(command.value, 'i') }).waitFor();
         break;
+    }
 
-    case 'assertValue':
+    case 'assertValue': {
         const input = await findLocator(page, command.target!)
         const value = await input.inputValue();
         if (value !== command.value) {
             throw new Error(`Expected input "${command.target}" to have value "${command.value}", but it was "${value}"`);
         }
         break;
+    }
 
-    case 'checkUncheck':
+    case 'checkUncheck': {
       const checkbox = await findLocator(page, command.target!); 
       if (command.action.startsWith('check') || command.action.startsWith('tick')) await checkbox.check();
       else await checkbox.uncheck();
       break;
+    }
 
-    case 'login':
+    case 'login': {
         const emailField = await findLocator(page, 'email');
         await emailField.fill(command.username!); 
         const passwordField = await findLocator(page, 'password');
         await passwordField.fill(command.password!);
         await page.getByRole('button', { name: /sign in|login/i }).click();
         break;
+    }
 
-    case 'conditional':
+    case 'conditional': {
         try {
             await executeStep(page, command.target.step, baseUrl, sessionId, scenarioId);
             await executeStep(page, command.value.step, baseUrl, sessionId, scenarioId);
@@ -341,6 +356,7 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
             console.log(`Conditional step skipped: ${command.target.step}`);
         }
         break;
+    }
 
     default:
       throw new Error(`Unknown command type: "${command.type}"`);
