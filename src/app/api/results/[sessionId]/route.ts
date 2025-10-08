@@ -37,6 +37,42 @@ export async function GET(
       scenarios = []; // Ensure scenarios is an empty array on error
     }
 
+    // Retry logic to handle potential DB replication delay
+    let retries = 5;
+    if (scenarios) {
+        const hasRunningScenarios = scenarios.some(s => s.status === 'running');
+
+        if (session.status === 'completed' && hasRunningScenarios) {
+            console.log(`[Results API] Stale data detected for session ${sessionId}. Retrying...`);
+            
+            while (retries > 0) {
+                await new Promise(resolve => setTimeout(resolve, 1500)); // Wait for 1.5 seconds
+
+                const { data: refetchedScenarios, error: refetchError } = await supabase
+                    .from('test_scenarios')
+                    .select('*')
+                    .eq('session_id', sessionId)
+                    .order('created_at', { ascending: true });
+
+                if (refetchError) {
+                    break; // If refetch fails, break and use the data we have
+                }
+
+                scenarios = refetchedScenarios;
+                const stillHasRunning = scenarios?.some(s => s.status === 'running');
+                if (!stillHasRunning) {
+                    console.log(`[Results API] Fresh data found for session ${sessionId}.`);
+                    break; // Exit loop if data is fresh
+                }
+                
+                retries--;
+                console.log(`[Results API] Data still stale. Retries left: ${retries}`);
+            }
+        }
+    }
+
+
+
     // Filter scenarios based on selected_scenario_ids if available
     if (session.selected_scenario_ids && scenarios) {
       scenarios = scenarios.filter(scenario => session.selected_scenario_ids.includes(scenario.id));

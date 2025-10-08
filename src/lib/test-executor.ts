@@ -1,4 +1,4 @@
-import { chromium as playwrightCore, Page, Browser, Locator } from 'playwright-core';
+import playwright, { Page, Browser, Locator } from 'playwright-core';
 import chromium from '@sparticuz/chromium';
 import { v4 as uuidv4 } from 'uuid';
 import { databaseService } from '@/lib/database';
@@ -396,6 +396,7 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
   const sessionRoom = `session-${sessionId}`;
   const MAX_STEP_RETRIES = 1;
   let completedSteps = 0;
+  const finalScenarios: TestScenario[] = [];
 
   const logs: TestLog[] = [];
   const emitLog = (log: Partial<TestLog>) => {
@@ -426,11 +427,22 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
   try {
     emitLog({ level: 'info', message: `Initializing test session with Playwright...` });
 
-    browser = await playwrightCore.launch({
-      args: chromium.args,
-      executablePath: await chromium.executablePath(),
-      headless: chromium.headless,
-    });
+    const isVercel = process.env.VERCEL || process.env.LAMBDA_TASK_ROOT;
+    emitLog({ level: 'info', message: `Environment detected as ${isVercel ? 'Vercel' : 'Local'}.` });
+
+    if (isVercel) {
+      emitLog({ level: 'info', message: 'Launching browser with @sparticuz/chromium for serverless environment.' });
+      browser = await playwright.chromium.launch({
+        args: chromium.args,
+        executablePath: await chromium.executablePath(),
+        headless: chromium.headless,
+      });
+    } else {
+      emitLog({ level: 'info', message: 'Launching browser with local Playwright installation.' });
+      browser = await playwright.chromium.launch({
+        headless: true
+      });
+    }
     const context = await browser.newContext({
       recordVideo: { dir: `videos/${sessionId}` }
     });
@@ -562,50 +574,51 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
         await page.waitForTimeout(500);
       }
 
-      const scenarioDuration = new Date().getTime() - scenarioStartTime.getTime();
-      if (scenarioPassed) {
-        sessionResults.passedScenarios++;
-        const updatedScenario = await databaseService.updateTestScenario(scenario.id, {
-          status: 'passed',
-          completed_at: new Date().toISOString(),
-          duration: scenarioDuration
-        });
-        if (updatedScenario) {
-          io.to(sessionRoom).emit('test-scenario-update', updatedScenario);
-        }
-        emitLog({ level: 'success', message: `✅ Scenario completed: "${scenario.title}"`, scenario_id: scenario.id });
-      } else {
-        sessionResults.failedScenarios++;
-        const updatedScenario = await databaseService.updateTestScenario(scenario.id, {
-          status: 'failed',
-          completed_at: new Date().toISOString(),
-          duration: scenarioDuration,
-          error_message: `Scenario failed due to step error.`
-        });
-        if (updatedScenario) {
-          io.to(sessionRoom).emit('test-scenario-update', updatedScenario);
-        }
-        emitLog({ level: 'error', message: `❌ Scenario failed: "${scenario.title}"`, scenario_id: scenario.id });
-      }
-
-      // AI Analysis per scenario
-      try {
-        const scenarioLogs = logs.filter(log => log.scenario_id === scenario.id);
-        const scenarioAnalysis = await azureAIService.analyzeScenario(scenario, scenarioLogs);
-
-        await databaseService.createScenarioReport({
-          scenario_id: scenario.id,
-          session_id: sessionId,
-          summary: scenarioAnalysis.summary,
-          issues: scenarioAnalysis.issues || [],
-          recommendations: scenarioAnalysis.recommendations || [],
-        });
-      } catch (aiError) {
-        console.error(`AI analysis failed for scenario ${scenario.id}:`, aiError);
-        emitLog({ level: 'warning', message: `AI analysis failed for scenario: "${scenario.title}"`, scenario_id: scenario.id });
-      }
-
-    }
+            const scenarioDuration = new Date().getTime() - scenarioStartTime.getTime();
+            let updatePayload: Partial<TestScenario>;
+      
+            if (scenarioPassed) {
+              sessionResults.passedScenarios++;
+              updatePayload = {
+                status: 'passed',
+                completed_at: new Date().toISOString(),
+                duration: scenarioDuration
+              };
+              emitLog({ level: 'success', message: `✅ Scenario completed: "${scenario.title}"`, scenario_id: scenario.id });
+            } else {
+              sessionResults.failedScenarios++;
+              updatePayload = {
+                status: 'failed',
+                completed_at: new Date().toISOString(),
+                duration: scenarioDuration,
+                error_message: `Scenario failed due to step error.`
+              };
+              emitLog({ level: 'error', message: `❌ Scenario failed: "${scenario.title}"`, scenario_id: scenario.id });
+            }
+      
+            const updatedScenario = await databaseService.updateTestScenario(scenario.id, updatePayload);
+            if (updatedScenario) {
+              finalScenarios.push(updatedScenario);
+              io.to(sessionRoom).emit('test-scenario-update', updatedScenario);
+            }        
+              // AI Analysis per scenario
+              try {
+                const scenarioLogs = logs.filter(log => log.scenario_id === scenario.id);
+                const scenarioAnalysis = await azureAIService.analyzeScenario(scenario, scenarioLogs);
+        
+                await databaseService.createScenarioReport({
+                  scenario_id: scenario.id,
+                  session_id: sessionId,
+                  summary: scenarioAnalysis.summary,
+                  issues: scenarioAnalysis.issues || [],
+                  recommendations: scenarioAnalysis.recommendations || [],
+                });
+              } catch (aiError) {
+                console.error(`AI analysis failed for scenario ${scenario.id}:`, aiError);
+                emitLog({ level: 'warning', message: `AI analysis failed for scenario: "${scenario.title}"`, scenario_id: scenario.id });
+              }
+        
+            }
 
     const endTime = new Date();
     const duration = endTime.getTime() - startTime.getTime();
@@ -644,7 +657,7 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
     }
 
     emitLog({ level: 'success', message: '🎉 All test scenarios completed successfully!' });
-    io.to(sessionRoom).emit('test-completed', { sessionId, results: sessionResults });
+    io.to(sessionRoom).emit('test-completed', { sessionId, results: sessionResults, scenarios: finalScenarios });
 
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';

@@ -320,14 +320,52 @@ Now, generate the full JSON response containing the "scenarios" array.
     const response = await this.generateCompletion(prompt, { maxTokens: 2000 });
     
     try {
-      const parsed = JSON.parse(response);
-      if (!parsed.plan || !Array.isArray(parsed.plan)) {
-        throw new Error('Invalid AI response format: "plan" array not found.');
-      }
-      return parsed;
+      return JSON.parse(response);
     } catch (error) {
       console.error('Failed to parse AI response for workflow plan:', response);
       throw new Error('Invalid AI response format for workflow plan');
+    }
+  }
+
+  async analyzeScenario(scenario: any, logs: any[]): Promise<any> {
+    const prompt = `
+    You are an expert test analyst. Analyze the following single test scenario execution and its logs to provide a concise analysis.
+
+    Scenario Details:
+    - Title: ${scenario.title}
+    - Description: ${scenario.description}
+    - Status: ${scenario.status}
+    - Duration: ${scenario.duration}ms
+    - Steps:
+      ${scenario.steps.join('\n      ')}
+
+    Execution Logs for this Scenario:
+    ${logs.map(l => `- [${l.level.toUpperCase()}] ${l.message}`).join('\n    ')}
+
+    Please provide a brief analysis in JSON format with the following keys:
+    - "summary": A one-sentence summary of what happened in the scenario.
+    - "issues": An array of strings, listing any specific errors or unexpected behaviors found in the logs. If no issues, return an empty array.
+    - "recommendations": An array of strings, suggesting any improvements or next steps based on the outcome. If no recommendations, return an empty array.
+
+    Example Output:
+    {
+      "summary": "The user login succeeded but took longer than expected.",
+      "issues": [
+        "Step 'Click Login' took 3500ms, which is above the performance threshold."
+      ],
+      "recommendations": [
+        "Investigate the backend response time for the login authentication."
+      ]
+    }
+    `;
+
+    const response = await this.generateCompletion(prompt, { maxTokens: 1000 });
+    
+    try {
+      return JSON.parse(response);
+    } catch (error) {
+      console.error('Failed to parse AI response for scenario analysis:', response);
+      throw new Error('Invalid AI response format for scenario analysis');
     }
   }
 

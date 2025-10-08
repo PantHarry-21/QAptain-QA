@@ -30,9 +30,7 @@ import Image from 'next/image';
 import { io, Socket } from "socket.io-client";
 import dynamic from 'next/dynamic';
 
-const DynamicPDFGenerator = dynamic(() => import('@/lib/pdf-generator').then(mod => mod.generatePDFReportClient), {
-  ssr: false,
-});
+
 
 interface TestSession {
   id: string;
@@ -114,6 +112,17 @@ export default function ResultsPage() {
       newSocket.emit('join-session', { sessionId });
     });
 
+    newSocket.on('session-data', (data) => {
+      if (data) {
+        setSession(data.session);
+        setScenarios(Array.isArray(data.scenarios) ? data.scenarios : []);
+        setLogs(Array.isArray(data.logs) ? data.logs : []);
+        setReport(data.report);
+        setScenarioReports(data.scenarioReports || []);
+      }
+      setLoading(false);
+    });
+
     newSocket.on('test-log', (log: TestLog) => {
       setLogs(prev => [...prev, log]);
     });
@@ -130,36 +139,16 @@ export default function ResultsPage() {
       setReport(updatedReport);
     });
 
-    newSocket.on('test-completed', (data: { results: TestSession }) => {
+    newSocket.on('test-completed', (data: { results: TestSession, scenarios: TestScenario[] }) => {
       setSession(prev => ({ ...prev, ...data.results, status: 'completed' }));
-      setTimeout(() => {
-        fetchResults(); // Re-fetch all data to ensure final consistency
-      }, 500); // Add a small delay to allow database updates to propagate
+      if (data.scenarios) {
+        setScenarios(data.scenarios);
+      }
     });
 
     setSocket(newSocket);
 
-    const fetchResults = async () => {
-      try {
-        const response = await fetch(`/api/results/${sessionId}`);
-        if (!response.ok) {
-          const errorData = await response.json();
-          throw new Error(errorData.error || 'Failed to fetch test results');
-        }
-        const { data } = await response.json();
-        setSession(data.session);
-        setScenarios(Array.isArray(data.scenarios) ? data.scenarios : []);
-        setLogs(Array.isArray(data.logs) ? data.logs : []);
-        setReport(data.report);
-        setScenarioReports(data.scenarioReports);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'An unknown error occurred');
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    fetchResults();
+    // Initial data is now fetched via the 'session-data' websocket event.
 
     return () => {
       newSocket.disconnect();
@@ -174,40 +163,52 @@ export default function ResultsPage() {
     if (!session) return;
     setIsDownloading(true);
     try {
-      const pdfBuffer = await DynamicPDFGenerator({
-        sessionId: session.id,
-        testResult: {
-          status: session.status,
-          startTime: session.started_at || '',
-          endTime: session.completed_at || '',
-          duration: session.duration || 0,
-          totalScenarios: session.total_scenarios || 0,
-          passedScenarios: session.passed_scenarios || 0,
-          failedScenarios: session.failed_scenarios || 0,
-          totalSteps: (session.passed_steps || 0) + (session.failed_steps || 0),
-          passedSteps: session.passed_steps || 0,
-          failedSteps: session.failed_steps || 0,
+      const response = await fetch('/api/generate-pdf', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
         },
-        logs,
-        scenarioResults: scenarios.map(s => ({
-          id: s.id,
-          title: s.title,
-          status: s.status as 'passed' | 'failed', // Cast to correct type
-          duration: s.duration || 0,
-          steps: s.steps,
-        })),
-        aiAnalysis: report,
-        url: session.url,
+        body: JSON.stringify({
+          sessionId: session.id,
+          testResult: {
+            status: session.status,
+            startTime: session.started_at || '',
+            endTime: session.completed_at || '',
+            duration: session.duration || 0,
+            totalScenarios: session.total_scenarios || 0,
+            passedScenarios: session.passed_scenarios || 0,
+            failedScenarios: session.failed_scenarios || 0,
+            totalSteps: (session.passed_steps || 0) + (session.failed_steps || 0),
+            passedSteps: session.passed_steps || 0,
+            failedSteps: session.failed_steps || 0,
+          },
+          logs,
+          scenarioResults: scenarios.map(s => ({
+            id: s.id,
+            title: s.title,
+            status: s.status as 'passed' | 'failed',
+            duration: s.duration || 0,
+            steps: s.steps,
+          })),
+          aiAnalysis: report,
+          url: session.url,
+        }),
       });
 
-      const blob = new Blob([pdfBuffer], { type: 'application/pdf' });
-      const url = window.URL.createObjectURL(blob);
+      if (!response.ok) {
+        throw new Error('Failed to generate PDF from server.');
+      }
+
+      const pdfBlob = await response.blob();
+      const url = window.URL.createObjectURL(pdfBlob);
       const a = document.createElement('a');
       a.href = url;
       a.download = `test-report-${sessionId}.pdf`;
       document.body.appendChild(a);
       a.click();
       a.remove();
+      window.URL.revokeObjectURL(url);
+
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to download report');
     } finally {

@@ -12,13 +12,25 @@ export const setupSocket = (io: Server) => {
     console.log(`Client connected: ${socket.id}`);
 
     // Join a room for a specific test session
-    socket.on('join-session', ({ sessionId }: { sessionId: string }) => {
+    socket.on('join-session', async ({ sessionId }: { sessionId: string }) => {
       if (sessionId) {
         const sessionRoom = `session-${sessionId}`;
         socket.join(sessionRoom);
         console.log(`Socket ${socket.id} joined room ${sessionRoom}`);
-        // You can optionally send a confirmation back to the client
-        socket.emit('session-joined', { sessionId });
+        
+        // Fetch initial data and send to the client
+        try {
+          const apiUrl = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/api/results/${sessionId}`;
+          const response = await fetch(apiUrl);
+          if (response.ok) {
+            const { data } = await response.json();
+            socket.emit('session-data', data);
+          } else {
+            console.error(`Failed to fetch initial session data for ${sessionId}:`, await response.text());
+          }
+        } catch (error) {
+          console.error(`Error fetching initial session data for ${sessionId}:`, error);
+        }
       }
     });
 
