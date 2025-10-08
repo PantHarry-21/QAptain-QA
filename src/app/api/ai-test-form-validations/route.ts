@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { chromium, Browser, Page } from 'playwright';
+import { chromium as playwrightCore, Browser, Page } from 'playwright-core';
+import chromium from '@sparticuz/chromium';
 import { azureAIService } from '@/lib/azure-ai';
 import { executeSingleCommand } from '@/lib/test-executor'; // We might need to refactor this
 
@@ -33,7 +34,11 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'URL is required' }, { status: 400 });
     }
 
-    browser = await chromium.launch({ headless: true });
+    browser = await playwrightCore.launch({
+      args: chromium.args,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+    });
     const page = await browser.newPage();
     
     // 1. Analyze the form

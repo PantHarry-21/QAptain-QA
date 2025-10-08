@@ -1,4 +1,5 @@
-import { chromium, Page, Browser, Locator } from 'playwright';
+import { chromium as playwrightCore, Page, Browser, Locator } from 'playwright-core';
+import chromium from '@sparticuz/chromium';
 import { v4 as uuidv4 } from 'uuid';
 import { databaseService } from '@/lib/database';
 import { azureAIService } from './azure-ai';
@@ -425,7 +426,11 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
   try {
     emitLog({ level: 'info', message: `Initializing test session with Playwright...` });
 
-    browser = await chromium.launch({ headless: true });
+    browser = await playwrightCore.launch({
+      args: chromium.args,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+    });
     const context = await browser.newContext({
       recordVideo: { dir: `videos/${sessionId}` }
     });

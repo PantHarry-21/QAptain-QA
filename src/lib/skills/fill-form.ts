@@ -1,4 +1,4 @@
-import { Page } from 'playwright';
+import { Page } from 'playwright-core';
 import { faker } from '@faker-js/faker';
 import { azureAIService } from '@/lib/azure-ai';
 import { executeSingleCommand } from '@/lib/test-executor';

@@ -1,6 +1,7 @@
 
 import { NextRequest, NextResponse } from 'next/server';
-import { chromium, Browser } from 'playwright';
+import { chromium as playwrightCore, Browser } from 'playwright-core';
+import chromium from '@sparticuz/chromium';
 import { supabase } from '@/lib/supabase';
 import { azureAIService } from '@/lib/azure-ai';
 import { TestSession } from '@/lib/supabase';
@@ -22,8 +23,10 @@ export async function POST(request: NextRequest) {
     }
 
     // Launch browser
-    browser = await chromium.launch({
-      headless: true,
+    browser = await playwrightCore.launch({
+      args: chromium.args,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
     });
 
     const context = await browser.newContext({
