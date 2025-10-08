@@ -1,6 +1,6 @@
 import { type ClassValue, clsx } from "clsx"
 import { twMerge } from "tailwind-merge"
-import { Page } from 'playwright';
+import { Page } from 'playwright-core';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
