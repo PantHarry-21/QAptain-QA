@@ -103,3 +103,12 @@ export interface User {
   updated_at: string;
   subscription_tier: 'free' | 'pro' | 'enterprise';
 }
+
+export interface SavedScenario {
+  id: string;
+  created_at: string;
+  url: string;
+  title: string;
+  user_story: string;
+  steps: string[];
+}

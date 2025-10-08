@@ -366,6 +366,51 @@ export class DatabaseService {
 
     return true;
   }
+
+  // Saved Scenario Operations
+  async createSavedScenario(scenarioData: Partial<SavedScenario>): Promise<SavedScenario | null> {
+    // Avoid duplicates: Check if a scenario with the same user_story and url already exists
+    const { data: existing, error: existingError } = await supabase
+      .from('saved_scenarios')
+      .select('id')
+      .eq('url', scenarioData.url)
+      .eq('user_story', scenarioData.user_story)
+      .limit(1);
+
+    if (existingError) {
+      console.error('Error checking for existing saved scenarios:', existingError);
+      // Decide not to block creation, just log the error
+    } else if (existing && existing.length > 0) {
+      console.log('Not saving scenario, as it already exists.');
+      return null; // Or return the existing one if needed
+    }
+
+    const { data, error } = await supabase
+      .from('saved_scenarios')
+      .insert([scenarioData])
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error creating saved scenario:', error);
+      return null;
+    }
+    return data;
+  }
+
+  async getSavedScenariosByUrl(url: string): Promise<SavedScenario[]> {
+    const { data, error } = await supabase
+      .from('saved_scenarios')
+      .select('*')
+      .eq('url', url)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('Error fetching saved scenarios:', error);
+      return [];
+    }
+    return data || [];
+  }
 }
 
 export const databaseService = new DatabaseService();

@@ -45,13 +45,27 @@ export default function Home() {
     try {
       const formattedUrl = url.startsWith('http') ? url : `https://${url}`;
       
-      // Store URL in sessionStorage for the next page
+      const response = await fetch('/api/analyze-url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: formattedUrl }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.details || 'Failed to analyze URL.');
+      }
+
+      const analysis = await response.json();
+
+      // Store URL and analysis in sessionStorage for the next page
       sessionStorage.setItem('targetUrl', formattedUrl);
+      sessionStorage.setItem('pageAnalysis', JSON.stringify(analysis));
       
       // Navigate to scenarios page
       router.push('/scenarios');
     } catch (err) {
-      setError("Failed to process URL. Please try again.");
+      setError(err instanceof Error ? err.message : "Failed to process URL. Please try again.");
     } finally {
       setIsSubmitting(false);
     }
@@ -101,7 +115,7 @@ export default function Home() {
                       ) : (
                         <Play className="w-4 h-4" />
                       )}
-                      Start Test
+                      Analyze URL
                     </Button>
                   </div>
                 </div>

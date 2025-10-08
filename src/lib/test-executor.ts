@@ -33,52 +33,45 @@ interface CommandDefinition {
 // --- Helper Functions ---
 
 async function findLocator(page: Page, identifier: string, elementType?: string): Promise<Locator> {
-    // Escape special characters for regex
-    const searchIdentifier = new RegExp(identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    // Clean the identifier to make it more robust against AI verbosity (e.g., "submit button" -> "submit")
+    const cleanedIdentifier = identifier.replace(/\b(tab|button|link|page|the|field|input)\b/gi, '').trim();
 
-    const locators: Locator[] = [];
+    // Use a regex that matches the cleaned identifier, which is more flexible
+    const searchRegex = new RegExp(cleanedIdentifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
 
-    // 1. Role-based locators (most resilient)
-    if (elementType === 'button' || !elementType) {
-        locators.push(page.getByRole('button', { name: searchIdentifier }));
-    }
-    if (elementType === 'link' || !elementType) {
-        locators.push(page.getByRole('link', { name: searchIdentifier }));
-    }
-    if (elementType === 'checkbox' || !elementType) {
-        locators.push(page.getByRole('checkbox', { name: searchIdentifier }));
-    }
-    if (elementType === 'radio' || !elementType) {
-        locators.push(page.getByRole('radio', { name: searchIdentifier }));
-    }
+    const locators: Locator[] = [
+        // Prioritize roles for robustness
+        page.getByRole('button', { name: searchRegex }),
+        page.getByRole('link', { name: searchRegex }),
+        page.getByRole('tab', { name: searchRegex }), // Added tab role
+        page.getByRole('checkbox', { name: searchRegex }),
+        page.getByRole('radio', { name: searchRegex }),
 
-    // 2. Form-specific locators
-    locators.push(page.getByLabel(searchIdentifier));
-    locators.push(page.getByPlaceholder(searchIdentifier));
+        // Other common locators
+        page.getByLabel(searchRegex),
+        page.getByPlaceholder(searchRegex),
+        page.getByText(searchRegex),
+        
+        // Finally, try test IDs with both cleaned and original identifiers
+        page.getByTestId(cleanedIdentifier),
+        page.getByTestId(identifier),
+    ];
 
-    // 3. Text-based locators
-    locators.push(page.getByText(searchIdentifier));
-
-    // 4. Test ID
-    locators.push(page.getByTestId(identifier));
-
-    // 5. CSS Selector (if it looks like one)
+    // Add CSS selector if it looks like one (and prioritize it)
     if (identifier.startsWith('#') || identifier.startsWith('.')) {
-        locators.push(page.locator(identifier));
+        locators.unshift(page.locator(identifier));
     }
 
-    // Find the first visible locator
+    // Find the first locator that exists in the DOM
     for (const locator of locators) {
-        try {
-            if (await locator.first().isVisible({ timeout: 1000 })) {
-                return locator.first();
-            }
-        } catch (e) {
-            // Ignore errors from locators that don't match or are not visible
+        // Check if any element matches the locator
+        if (await locator.count() > 0) {
+            // Return the first matching element. The action (.click, .fill) will handle visibility and scrolling.
+            return locator.first();
         }
     }
 
-    throw new Error(`Element with identifier \"${identifier}\" not found or not visible.`);
+    throw new Error(`Element with identifier \"${identifier}\" not found in the DOM.`);
 }
 
 function getLevenshteinDistance(a: string, b: string): number {
@@ -245,7 +238,6 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
       break;
 
     case 'fill': {
-      // This logic is specific to form inputs to avoid ambiguity with labels.
       const { target, value } = command;
       
       // Prioritized list of locators for input fields
@@ -259,19 +251,18 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
       let inputFilled = false;
       for (const locator of inputLocators) {
           try {
-              if (await locator.first().isVisible({ timeout: 1000 })) {
-                  await locator.first().focus(); // Add focus before filling
-                  await locator.first().fill(value!); 
-                  inputFilled = true;
-                  break; // Exit loop once filled
-              }
+              // Let Playwright's auto-scrolling handle visibility.
+              // The fill action will wait for the element, scroll it into view, and then fill it.
+              await locator.first().fill(value!, { timeout: 5000 });
+              inputFilled = true;
+              break; // Success, exit the loop
           } catch (e) {
-              // Locator not found or visible, try the next one
+              // This locator failed, so we'll just continue to the next one in the list.
           }
       }
 
       if (!inputFilled) {
-          throw new Error(`Could not find a visible input field with label, placeholder, name, or id matching "${target!}"`);
+        throw new Error(`Could not find a fillable input field matching "${target!}"`);
       }
       break;
     }
@@ -456,13 +447,12 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
       const scenarioStartTime = new Date();
       let scenarioPassed = true;
 
-      await databaseService.updateTestScenario(scenario.id, {
+      const updatedScenarioWithRunningStatus = await databaseService.updateTestScenario(scenario.id, {
         status: 'running',
         started_at: scenarioStartTime.toISOString()
       });
-      const updatedScenario = await databaseService.getTestScenarios(scenario.id);
-      if (updatedScenario) {
-        io.to(sessionRoom).emit('test-scenario-update', updatedScenario);
+      if (updatedScenarioWithRunningStatus) {
+        io.to(sessionRoom).emit('test-scenario-update', updatedScenarioWithRunningStatus);
       }
 
       emitLog({ level: 'info', message: `Starting scenario: "${scenario.title}"`, scenario_id: scenario.id });
@@ -509,26 +499,36 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
               const activeContextSelector = await getDomContextSelector(page);
 
               // Analyze the current page to provide context to the AI planner
-              const pageContext = await page.evaluate((selector) => {
+              let pageContext = await page.evaluate((selector) => {
                   const activeContext = document.querySelector(selector) || document.body;
                   
-                  // More robust form detection: look for inputs, not just <form> tags.
-                  const formInputs = activeContext.querySelectorAll('input:not([type="hidden"]), textarea, select');
-                  const isFormVisible = formInputs.length > 2; // Heuristic: more than 2 inputs suggests a form is present.
+                  const formInputs = activeContext.querySelectorAll('input:not([type="hidden"]):not([type="submit"]), textarea, select');
+                  const isFormVisible = formInputs.length > 2;
 
-                  const visibleButtons = Array.from(activeContext.querySelectorAll('button')).map(btn => btn.textContent?.trim() || '').filter(text => text.length > 0);
-                  const visibleLinks = Array.from(activeContext.querySelectorAll('a')).map(a => a.textContent?.trim() || '').filter(text => text.length > 0);
+                  const visibleButtons = Array.from(activeContext.querySelectorAll('button')).map(btn => btn.textContent?.trim() || '').filter(text => text.length > 0 && text.length < 100);
+                  const visibleLinks = Array.from(activeContext.querySelectorAll('a')).map(a => a.textContent?.trim() || '').filter(text => text.length > 0 && text.length < 100);
                   
                   return { isFormVisible, visibleButtons, visibleLinks, contextType: selector === 'body' ? 'document' : 'modal' };
               }, activeContextSelector);
+
+              // Pre-process context to remove distracting buttons before sending to AI
+              if (pageContext.isFormVisible && /add|create|submit|fill/i.test(stepDescription)) {
+                pageContext.visibleButtons = pageContext.visibleButtons.filter(btnText => {
+                  // Remove buttons that closely match the command to prevent the AI from just clicking the submit button
+                  const commandWords = stepDescription.toLowerCase().split(' ');
+                  const btnWords = btnText.toLowerCase().split(' ');
+                  return !btnWords.some(word => commandWords.includes(word));
+                });
+              }
 
               emitLog({ level: 'info', message: `Engaging AI orchestrator with context: ${JSON.stringify(pageContext)}`, scenario_id: scenario.id });
               const plan = await azureAIService.createWorkflowPlan(stepDescription, pageContext);
               emitLog({ level: 'info', message: `AI has generated a sub-plan: ${JSON.stringify(plan.plan)}`, scenario_id: scenario.id });
 
               for (const subStep of plan.plan) {
-                emitLog({ level: 'info', message: `Executing sub-step: ${subStep.skill} -> ${subStep.target || ''}`, scenario_id: scenario.id });
-                switch (subStep.skill) {
+                const skill = subStep.skill || subStep.action;
+                emitLog({ level: 'info', message: `Executing sub-step: ${skill} -> ${subStep.target || subStep.url || ''}`, scenario_id: scenario.id });
+                switch (skill) {
                   case 'CLICK':
                     await executeSingleCommand({ type: 'click', target: subStep.target }, page, url, sessionId, scenario.id);
                     break;
@@ -542,7 +542,7 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
                     await skillTestFormValidation(page);
                     break;
                   default:
-                    throw new Error(`Unknown AI skill in sub-plan: ${subStep.skill}`);
+                    throw new Error(`Unknown AI skill in sub-plan: ${skill}`);
                 }
                 await emitScreenshot(page);
               }
@@ -644,6 +644,7 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
     );
     const createdReport = await databaseService.createTestReport({
       session_id: sessionId,
+      title: `Test Report for ${url} - ${new Date().toLocaleString()}`,
       summary: aiReport.summary,
       key_findings: aiReport.keyFindings,
       recommendations: aiReport.recommendations,
