@@ -13,7 +13,8 @@ async function findSubmitButton(page: Page, contextSelector: string) {
         'button:has-text("Save")',
         'button:has-text("Continue")',
         'button:has-text("Next")',
-        'button:has-text("Add")' // Fallback
+        'button:has-text("Add")', // Fallback
+        'button:text-matches(/(create|add|save|submit|next|continue)/i)' // Generic regex
     ];
 
     for (const selector of buttonSelectors) {
@@ -53,26 +54,35 @@ export async function skillFillFormHappyPath(page: Page, contextSelector: string
       const context = document.querySelector(selector) || document;
       
       const inputs = Array.from(context.querySelectorAll('input, textarea, select')).map((input) => {
-        const labelEl = input.closest('label');
+        const el = input as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+
+        const labelEl = el.closest('label');
         let labelText = '';
         if (labelEl) {
           labelText = labelEl.textContent || '';
         } else {
-          const labels = input.labels;
+          const labels = el.labels;
           if (labels && labels.length > 0) {
             labelText = Array.from(labels).map(l => l.textContent).join(' ');
           }
         }
-        return {
-          tagName: input.tagName.toLowerCase(),
-          type: input.getAttribute('type') || 'text',
-          name: input.getAttribute('name') || '',
-          id: input.id || '',
-          placeholder: input.getAttribute('placeholder') || '',
+
+        const inputData: any = {
+          tagName: el.tagName.toLowerCase(),
+          type: el.getAttribute('type') || (el.tagName.toLowerCase() === 'select' ? 'select' : 'text'),
+          name: el.getAttribute('name') || '',
+          id: el.id || '',
+          placeholder: el.getAttribute('placeholder') || '',
           label: labelText.trim(),
-          isDisabled: (input as HTMLInputElement).disabled,
-          isReadOnly: (input as HTMLInputElement).readOnly,
+          isDisabled: (el as HTMLInputElement).disabled,
+          isReadOnly: (el as HTMLInputElement).readOnly,
         };
+
+        if (el.tagName.toLowerCase() === 'select') {
+          inputData.options = Array.from((el as HTMLSelectElement).options).map(opt => opt.value || opt.text).filter(val => val);
+        }
+
+        return inputData;
       });
 
       const usefulInputs = inputs.filter(input => !input.isDisabled && !input.isReadOnly && input.type !== 'hidden');
@@ -92,17 +102,25 @@ export async function skillFillFormHappyPath(page: Page, contextSelector: string
     const fakerMappings = await azureAIService.generateFakerMappings(formToFill);
 
     // 3. Generate fill steps using the AI-Faker mapping
-    const fillSteps = formToFill.inputs.map(input => {
+    const fillSteps = formToFill.inputs
+      .filter(input => input.type !== 'file')
+      .map(input => {
         const fieldName = input.label || input.name || input.placeholder;
         const mapping = fakerMappings[fieldName];
         const value = mapping ? getFakerData(mapping) : faker.lorem.words(2); // Fallback
         
+        const action = input.tagName === 'select' ? 'select' : 'fill';
+
         return { 
-            action: 'fill', 
+            action: action, 
             target: fieldName, 
             value: value 
         };
     });
+
+    if (fillSteps.length === 0) {
+        throw new Error("Happy Path skill failed: No input fields were identified to be filled in the form.");
+    }
 
     // 4. Execute fill steps
     for (const step of fillSteps) {
@@ -113,6 +131,12 @@ export async function skillFillFormHappyPath(page: Page, contextSelector: string
             const errorMessage = e instanceof Error ? e.message : 'Unknown error';
             executionLog.push({ action: 'fill', target: step.target, value: step.value, status: 'Failed', error: errorMessage });
         }
+    }
+
+    const failedFills = executionLog.filter(log => log.status === 'Failed');
+    if (failedFills.length > 0) {
+        const errorDetails = failedFills.map(f => `${f.target}: ${f.error}`).join(', ');
+        throw new Error(`Happy Path skill failed to fill fields: ${errorDetails}`);
     }
 
     // 5. Find and click the submit button

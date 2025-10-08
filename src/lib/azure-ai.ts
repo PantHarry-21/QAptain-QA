@@ -164,25 +164,50 @@ Now, generate the full JSON response containing the "scenarios" array.
 
   async generateFakerMappings(formData: any): Promise<any> {
     const prompt = `
-    You are a data mapping expert for the faker-js library. Your task is to analyze a simplified list of form inputs and map each field to a specific faker-js method.
+    You are an expert data mapping assistant for the faker-js library. Your primary goal is to intelligently map form input fields to the most appropriate faker-js method based on all available context.
 
-    Here is the simplified form structure:
+    Analyze the following list of form inputs:
     ${JSON.stringify(formData, null, 2)}
 
-    **CRITICAL INSTRUCTIONS**:
-    1.  You MUST return a JSON object.
-    2.  The keys of the JSON object MUST EXACTLY MATCH the 'label', 'name', or 'placeholder' of the corresponding input. Prioritize the 'label'.
-    3.  The value for each key MUST be a JSON object with a 'namespace', 'method', and optional 'options' array.
-    4.  For phone numbers, you MUST use the format '##########'.
-    5.  If you are uncertain about a field, map it to { "namespace": "lorem", "method": "word" }. DO NOT leave any field unmapped.
+    **CRITICAL INSTRUCTIONS FOR MAPPING:**
 
-    Example Input:
-    { "inputs": [ { "label": "First Name", "name": "fname" }, { "label": "Contact Phone", "name": "phone" } ] }
+    1.  **Analyze Context:** For each input, carefully consider its \`label\`, \`name\`, \`placeholder\`, and \`type\` to infer the type of data required.
+        *   Look for keywords in the \`label\` or \`name\` (e.g., 'email', 'phone', 'name', 'city', 'zip').
+        *   Examine the \`placeholder\` for examples of the required format (e.g., 'Enter a number', 'yourname@example.com').
+        *   Use the \`type\` attribute (e.g., 'email', 'number', 'tel', 'select') as a strong hint.
 
-    Example Output:
+    2.  **Data Type Matching:**
+        *   **Names:** For fields related to names (e.g., 'First Name', 'Full Name'), use the \`person\` namespace (e.g., \`firstName\`, \`lastName\`, \`fullName\`).
+        *   **Contact:**
+            *   For emails, use { "namespace": "internet", "method": "email" }.
+            *   For phone numbers, you MUST use { "namespace": "phone", "method": "number", "options": ["##########"] }.
+        *   **Addresses:** Use the \`location\` namespace (e.g., \`streetAddress\`, \`city\`, \`zipCode\`).
+        *   **Dropdowns/Selects:** If an input has an \`options\` array, it is a dropdown. You MUST choose one of the provided options. Your output should be { "namespace": "helpers", "method": "arrayElement", "options": [ [/* original options array */] ] }.
+        *   **Numeric Ranges:** If a field's label or placeholder suggests a numeric range (e.g., "Rating (0-5)", "Score (1-100)"), you MUST use { "namespace": "number", "method": "int", "options": [{ "min": MIN, "max": MAX }] }, where MIN and MAX are the parsed range values.
+        *   **Numbers:** If a field clearly expects a number (e.g., \`type: 'number'\`), use the \`number\` namespace.
+        *   **Dates:** For date fields, use the \`date\` namespace (e.g., \`future\`, \`past\`).
+        *   **Default/Uncertain:** If you cannot determine a specific type, fall back to { "namespace": "lorem", "method": "words", "options": [3] }.
+
+    3.  **Output Format:**
+        *   You MUST return a single JSON object.
+        *   The keys of the JSON object MUST EXACTLY MATCH the field's \`label\` (if available), otherwise its \`name\`, otherwise its \`placeholder\`.
+        *   The value for each key MUST be a JSON object containing \`namespace\`, \`method\`, and an optional \`options\` array.
+        *   Ensure every input field from the provided list is mapped.
+
+    **Example Input:**
     {
-      "First Name": { "namespace": "person", "method": "firstName" },
-      "Contact Phone": { "namespace": "phone", "method": "number", "options": ["##########"] }
+      "inputs": [
+        { "label": "Full Name", "name": "fullName", "placeholder": "John Doe", "type": "text" },
+        { "label": "Role", "name": "role", "type": "select", "options": ["Admin", "Editor", "Viewer"] },
+        { "label": "Rating (0-5)", "name": "rating", "type": "number" }
+      ]
+    }
+
+    **Example Output:**
+    {
+      "Full Name": { "namespace": "person", "method": "fullName" },
+      "Role": { "namespace": "helpers", "method": "arrayElement", "options": [ ["Admin", "Editor", "Viewer"] ] },
+      "Rating (0-5)": { "namespace": "number", "method": "int", "options": [{ "min": 0, "max": 5 }] }
     }
     `;
 
