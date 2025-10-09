@@ -1,13 +1,13 @@
-"use client";
+'use client';
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Card, CardContent } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Label } from "@/components/ui/label";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Loader2, Play } from "lucide-react";
-import { HeroBackground } from "@/components/ui/hero-background";
+import { Loader2, Globe, Zap, BarChart3, Play } from "lucide-react";
 
 export default function Home() {
   const [url, setUrl] = useState("");
@@ -68,50 +68,103 @@ export default function Home() {
   };
 
   return (
-    <>
-      <HeroBackground />
-      <div className="container mx-auto px-4 py-16 flex flex-col items-center justify-center text-center min-h-[80vh]">
-        {/* New Hero Section */}
-        <h1 className="text-5xl md:text-7xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-slate-100 to-slate-400 pb-4">
+    <div className="container mx-auto px-4 py-16">
+      <div className="text-center mb-12">
+        <h1 className="text-4xl md:text-5xl font-bold mb-4">
           AI Test Runner
         </h1>
-        <p className="text-lg md:text-xl text-slate-400 mb-12 max-w-3xl mx-auto">
-          Transform web testing with AI-powered automation. Enter a URL to instantly generate and run comprehensive test scenarios.
+        <p className="text-xl text-muted-foreground mb-8 max-w-3xl mx-auto">
+          Transform your web testing with AI-powered automation, real-time execution, and comprehensive reporting.
         </p>
+      </div>
 
-        {/* Main Form in a Frosted Card */}
-        <div className="w-full max-w-2xl">
-          <Card>
-            <CardContent className="p-6">
-              <form onSubmit={handleSubmit} className="space-y-4">
-                <div className="flex flex-col sm:flex-row gap-2">
+      <div className="max-w-2xl mx-auto mb-12">
+        <Card>
+          <CardHeader className="text-center">
+            <CardTitle className="text-2xl flex items-center justify-center gap-2">
+              <Zap className="w-6 h-6 text-primary" />
+              Start Your Test
+            </CardTitle>
+            <CardDescription>
+              Enter a website URL to begin AI-powered automated testing
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <form onSubmit={handleSubmit} className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="url">Website URL</Label>
+                <div className="flex gap-2">
                   <Input
                     id="url"
                     type="text"
-                    placeholder="Enter a website URL to begin..."
+                    placeholder="https://example.com"
                     value={url}
                     onChange={(e) => setUrl(e.target.value)}
-                    className="flex-1 text-base py-6 bg-transparent" // Adjusted for new design
+                    className="flex-1"
                   />
-                  <Button type="submit" disabled={isSubmitting} size="lg" className="flex items-center gap-2 text-base">
+                  <Button type="submit" disabled={isSubmitting} className="flex items-center gap-2">
                     {isSubmitting ? (
-                      <Loader2 className="w-5 h-5 animate-spin" />
+                      <Loader2 className="w-4 h-4 animate-spin" />
                     ) : (
-                      <Play className="w-5 h-5" />
+                      <Play className="w-4 h-4" />
                     )}
-                    Analyze
+                    Analyze URL
                   </Button>
                 </div>
-                {error && (
-                  <Alert variant="destructive" className="bg-red-500/10 border-red-500/30 text-red-400">
-                    <AlertDescription>{error}</AlertDescription>
-                  </Alert>
-                )}
-              </form>
-            </CardContent>
-          </Card>
-        </div>
+              </div>
+              {error && (
+                <Alert variant="destructive">
+                  <AlertDescription>{error}</AlertDescription>
+                </Alert>
+              )}
+            </form>
+          </CardContent>
+        </Card>
       </div>
-    </>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-8 max-w-6xl mx-auto">
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Globe className="w-5 h-5 text-blue-500" />
+              AI-Powered Analysis
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-muted-foreground">
+              Our AI analyzes your website structure and generates intelligent test scenarios automatically.
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Zap className="w-5 h-5 text-yellow-500" />
+              Real-time Execution
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-muted-foreground">
+              Watch your tests run in real-time with live updates and detailed execution logs.
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <BarChart3 className="w-5 h-5 text-green-500" />
+              Comprehensive Reports
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-muted-foreground">
+              Get detailed reports with insights, recommendations, and performance metrics.
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
   );
 }

@@ -166,40 +166,39 @@ export default function SavedScenariosPage() {
             <div className="flex items-center justify-center h-40"><Loader2 className="w-8 h-8 animate-spin text-slate-400" /></div>
           ) : savedScenarios.length > 0 ? (
             <motion.div
-              as={Accordion}
-              type="multiple"
-              className="w-full"
               variants={containerVariants}
               initial="hidden"
               animate="visible"
             >
-              {savedScenarios.map((scenario) => (
-                <motion.div key={scenario.id} variants={itemVariants}>
-                  <AccordionItem value={scenario.id}>
-                    <AccordionTrigger>
-                      <div className="flex items-center gap-2">
-                        <Bot className="w-5 h-5 text-primary"/>
-                        <span className="font-semibold text-left">{scenario.title}</span>
-                      </div>
-                    </AccordionTrigger>
-                    <AccordionContent className="pl-8 pb-2 text-slate-400">
-                      <p className="text-sm mb-3 italic">Original story: "{scenario.user_story}"</p>
-                      <div className="space-y-2">
-                        {scenario.steps.map((step, index) => (
-                          <div key={index} className="flex items-center gap-2">
-                            <Input type="text" value={step} onChange={(e) => handleStepChange(scenario.id, index, e.target.value)} placeholder="Enter a test step" className="flex-grow font-mono text-sm h-9 bg-transparent"/>
-                            <Button variant="ghost" size="icon" onClick={() => handleDeleteStep(scenario.id, index)} aria-label="Delete step"><Trash2 className="w-4 h-4 text-red-500" /></Button>
-                          </div>
-                        ))}
-                        <div className="flex items-center gap-2 pt-2">
-                          <Button variant="outline" size="sm" onClick={() => handleAddStep(scenario.id)}><PlusCircle className="w-4 h-4 mr-2"/> Add Step</Button>
-                          <Button size="sm" onClick={() => handleUpdateScenario(scenario)}><Save className="w-4 h-4 mr-2"/> Save Changes</Button>
+              <Accordion type="multiple" className="w-full">
+                {savedScenarios.map((scenario) => (
+                  <motion.div key={scenario.id} variants={itemVariants}>
+                    <AccordionItem value={scenario.id}>
+                      <AccordionTrigger>
+                        <div className="flex items-center gap-2">
+                          <Bot className="w-5 h-5 text-primary"/>
+                          <span className="font-semibold text-left">{scenario.title}</span>
                         </div>
-                      </div>
-                    </AccordionContent>
-                  </AccordionItem>
-                </motion.div>
-              ))}
+                      </AccordionTrigger>
+                      <AccordionContent className="pl-8 pb-2 text-slate-400">
+                        <p className="text-sm mb-3 italic">Original story: "{scenario.user_story}"</p>
+                        <div className="space-y-2">
+                          {scenario.steps.map((step, index) => (
+                            <div key={index} className="flex items-center gap-2">
+                              <Input type="text" value={step} onChange={(e) => handleStepChange(scenario.id, index, e.target.value)} placeholder="Enter a test step" className="flex-grow font-mono text-sm h-9 bg-transparent"/>
+                              <Button variant="ghost" size="icon" onClick={() => handleDeleteStep(scenario.id, index)} aria-label="Delete step"><Trash2 className="w-4 h-4 text-red-500" /></Button>
+                            </div>
+                          ))}
+                          <div className="flex items-center gap-2 pt-2">
+                            <Button variant="outline" size="sm" onClick={() => handleAddStep(scenario.id)}><PlusCircle className="w-4 h-4 mr-2"/> Add Step</Button>
+                            <Button size="sm" onClick={() => handleUpdateScenario(scenario)}><Save className="w-4 h-4 mr-2"/> Save Changes</Button>
+                          </div>
+                        </div>
+                      </AccordionContent>
+                    </AccordionItem>
+                  </motion.div>
+                ))}
+              </Accordion>
             </motion.div>
           ) : (
             <p className="text-sm text-slate-500 text-center py-10">You haven't saved any scenarios yet.</p>
