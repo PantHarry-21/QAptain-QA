@@ -6,7 +6,7 @@ import { ThemeToggle } from "@/components/ThemeToggle";
 
 export default function Header() {
   return (
-    <header className="bg-transparent">
+    <header className="bg-card shadow-sm">
       <div className="container mx-auto px-4 py-3">
         <div className="flex items-center justify-between">
           <Link href="/" className="flex items-center gap-2">
@@ -17,12 +17,12 @@ export default function Header() {
             <nav>
               <ul className="flex items-center gap-6">
                 <li>
-                  <Link href="/saved-scenarios" className="text-base font-medium text-slate-300 hover:text-white transition-colors">
+                  <Link href="/saved-scenarios" className="text-base font-medium text-muted-foreground hover:text-foreground transition-colors">
                     Saved Scenarios
                   </Link>
                 </li>
                 <li>
-                  <Link href="/history" className="text-base font-medium text-slate-300 hover:text-white transition-colors">
+                  <Link href="/history" className="text-base font-medium text-muted-foreground hover:text-foreground transition-colors">
                     History
                   </Link>
                 </li>

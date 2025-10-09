@@ -85,7 +85,8 @@ export default function ScenariosPage() {
         }));
         
         setScenarios(scenariosWithIds);
-        setSelectedScenarioIds(new Set(scenariosWithIds.map(sc => sc.id)));
+        // Change: Scenarios are now unselected by default.
+        setSelectedScenarioIds(new Set());
 
       } catch (err) {
         setError(err instanceof Error ? err.message : 'An unknown error occurred while generating scenarios.');
@@ -145,15 +146,26 @@ export default function ScenariosPage() {
   };
 
   const handleStartTest = async () => {
-    const scenariosToRun = scenarios.filter(sc => selectedScenarioIds.has(sc.id));
-    if (scenariosToRun.length === 0) {
+    // 1. Get the scenarios that are currently selected.
+    const selectedScenarios = scenarios.filter(sc => selectedScenarioIds.has(sc.id));
+
+    if (selectedScenarios.length === 0) {
       setError("Please select at least one scenario to run.");
       return;
     }
-    if (scenariosToRun.some(sc => sc.steps.some(s => !s.trim()))) {
-        setError("Cannot start test with empty steps. Please fill in or remove any empty steps.");
-        return;
+
+    // 2. Create a new, clean list of scenarios by filtering out any empty steps from each one.
+    const scenariosToRun = selectedScenarios.map(sc => ({
+      ...sc,
+      steps: sc.steps.filter(s => s.trim() !== '')
+    }));
+
+    // 3. Check if any of the selected scenarios are now empty after filtering.
+    if (scenariosToRun.some(sc => sc.steps.length === 0)) {
+      setError("One of your selected scenarios has no valid steps. Please add steps or unselect it.");
+      return;
     }
+
     setIsLoading(true);
     setError("");
     const newSessionId = uuidv4();
@@ -195,6 +207,23 @@ export default function ScenariosPage() {
     setSelectedScenarioIds(prev => new Set([...prev, ...scenariosToAdd.map(s => s.id)]));
     setSelectedSaved(new Set());
     toast({ title: 'Scenarios Added', description: `${scenariosToAdd.length} saved scenarios have been added to the current test run.` });
+  };
+
+  const handleSaveSingleScenario = async (scenario: Scenario) => {
+    try {
+      const response = await fetch('/api/saved-scenarios', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // Use the scenario title as the user_story for saving
+        body: JSON.stringify({ user_story: scenario.title, steps: scenario.steps }),
+      });
+      if (!response.ok) {
+        throw new Error('Failed to save scenario.');
+      }
+      toast({ title: "Scenario Saved", description: `"${scenario.title}" has been added to your library.` });
+    } catch (err) {
+      toast({ variant: 'destructive', title: 'Error', description: err instanceof Error ? err.message : 'Could not save scenario.' });
+    }
   };
 
   const handleStepChange = (scenarioId: string, stepIndex: number, newValue: string) => {
@@ -299,7 +328,7 @@ export default function ScenariosPage() {
                 <Checkbox id="select-all" checked={allSelected} indeterminate={isIndeterminate} onCheckedChange={handleSelectAll} />
                 <Label htmlFor="select-all" className="font-semibold">{allSelected ? 'Unselect All' : 'Select All'}</Label>
               </div>
-              <Accordion type="multiple" className="w-full" defaultValue={scenarios.map(s => s.id)}>
+              <Accordion type="multiple" className="w-full">
                 {scenarios.map((scenario) => (
                   <AccordionItem value={scenario.id} key={scenario.id}>
                     <div className="flex items-center gap-3 p-2 hover:bg-white/5 rounded-lg">
@@ -314,6 +343,9 @@ export default function ScenariosPage() {
                           </div>
                         </AccordionTrigger>
                       </Label>
+                      <Button variant="ghost" size="icon" onClick={() => handleSaveSingleScenario(scenario)}>
+                        <Bookmark className="w-5 h-5 text-slate-400 hover:text-accent"/>
+                      </Button>
                     </div>
                     <AccordionContent className="pl-12 pb-2 text-slate-400">
                       <p className="text-sm mb-2">{scenario.description}</p>

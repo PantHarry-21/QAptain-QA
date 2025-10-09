@@ -66,6 +66,7 @@
     "ffmpeg-static": "^5.2.0",
     "flv.js": "^1.6.2",
     "framer-motion": "^12.23.2",
+    "geist": "^1.5.1",
     "html2canvas": "^1.4.1",
     "input-otp": "^1.4.2",
     "jspdf": "^3.0.3",

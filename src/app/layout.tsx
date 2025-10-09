@@ -19,25 +19,6 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "AI Test Runner - Automated Testing Powered by AI",
   description: "Transform your web testing with AI-powered automation, real-time execution, and comprehensive reporting.",
-  keywords: ["AI Test Runner", "Automated Testing", "Selenium", "AI", "Web Testing", "Quality Assurance"],
-  authors: [{ name: "Himanshu Pant" }],
-  icons: {
-    icon: "/favicon.ico", // or /favicon.png if you prefer PNG
-    shortcut: "/favicon.ico",
-    apple: "/favicon.ico",
-  },
-  openGraph: {
-    title: "AI Test Runner",
-    description: "AI-powered automated testing with real-time execution and comprehensive reporting",
-    url: "https://your-domain.com",
-    siteName: "AI Test Runner",
-    type: "website",
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "AI Test Runner",
-    description: "AI-powered automated testing with real-time execution",
-  },
 };
 
 export default function RootLayout({
@@ -48,10 +29,10 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased text-foreground`}
+        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
         <Providers>
-          <div className="flex flex-col min-h-screen bg-background">
+          <div className="flex flex-col min-h-screen">
             <Header />
             <main className="flex-grow">
               {children}

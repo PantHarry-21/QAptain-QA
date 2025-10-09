@@ -109,12 +109,13 @@ export class OpenAIService {
     config: Partial<AICompletionConfig> = {}
   ): Promise<T> {
     const finalConfig = { ...this.defaultConfig, ...config };
+    let rawContent: string | null = null;
 
     try {
       const completion = await client.chat.completions.create({
         model: modelName,
         messages: [
-          { role: 'system', content: 'You are a helpful AI assistant designed to output JSON.' },
+          { role: 'system', content: 'You are a helpful AI assistant designed to output JSON. You must respond with only the JSON object, without any surrounding text, markdown, or explanations.' },
           { role: 'user', content: prompt },
         ],
         response_format: { type: 'json_object' },
@@ -123,14 +124,25 @@ export class OpenAIService {
         top_p: finalConfig.topP,
       });
 
-      const content = completion.choices[0]?.message?.content;
-      if (!content) {
+      rawContent = completion.choices[0]?.message?.content;
+      if (!rawContent) {
         throw new Error('AI returned an empty response.');
       }
 
-      return JSON.parse(content) as T;
+      // Find the first '{' and the last '}' to extract the JSON object
+      const jsonStartIndex = rawContent.indexOf('{');
+      const jsonEndIndex = rawContent.lastIndexOf('}');
+
+      if (jsonStartIndex === -1 || jsonEndIndex === -1) {
+        throw new Error('No valid JSON object found in the AI response.');
+      }
+
+      const jsonString = rawContent.substring(jsonStartIndex, jsonEndIndex + 1);
+      return JSON.parse(jsonString) as T;
+
     } catch (error) {
       console.error('OpenAI API or JSON parsing error:', error);
+      console.error('Problematic AI response content:', rawContent);
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       throw new Error(`Failed to generate or parse AI completion: ${errorMessage}`);
     }

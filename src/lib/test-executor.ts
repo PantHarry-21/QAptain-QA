@@ -7,7 +7,6 @@ import { TestLog } from '@/lib/supabase';
 import { Server } from 'socket.io';
 
 import { skillFillFormHappyPath } from './skills/fill-form';
-import { skillTestFormValidation } from './skills/test-form-validation';
 import { getDomContextSelector } from './utils';
 
 // --- Interfaces ---
@@ -33,11 +32,19 @@ interface CommandDefinition {
 // --- Helper Functions ---
 
 async function findLocator(page: Page, identifier: string, elementType?: string): Promise<Locator> {
+    // If the identifier looks like a generic submission command, prioritize finding a button with type="submit"
+    if (/^(submit|sign in|log in|login|save|continue|next|go)$/i.test(identifier.trim())) {
+        const submitButton = page.locator('[type="submit"]');
+        if (await submitButton.count() > 0) {
+            return submitButton.first();
+        }
+    }
+
     // Clean the identifier to make it more robust against AI verbosity (e.g., "submit button" -> "submit")
     const cleanedIdentifier = identifier.replace(/\b(tab|button|link|page|the|field|input)\b/gi, '').trim();
 
     // Use a regex that matches the cleaned identifier, which is more flexible
-    const searchRegex = new RegExp(cleanedIdentifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    const searchRegex = new RegExp(cleanedIdentifier.replace(/[.*+?^${}()|[\\]/g, '\\$&'), 'i');
 
     const locators: Locator[] = [
         // Prioritize roles for robustness
@@ -72,27 +79,6 @@ async function findLocator(page: Page, identifier: string, elementType?: string)
     }
 
     throw new Error(`Element with identifier \"${identifier}\" not found in the DOM.`);
-}
-
-function getLevenshteinDistance(a: string, b: string): number {
-    const matrix = Array(b.length + 1).fill(null).map(() => Array(a.length + 1).fill(null));
-    for (let i = 0; i <= a.length; i += 1) {
-        matrix[0][i] = i;
-    }
-    for (let j = 0; j < b.length; j += 1) {
-        matrix[j + 1][0] = j + 1;
-    }
-    for (let j = 0; j < b.length; j += 1) {
-        for (let i = 0; i < a.length; i += 1) {
-            const substitutionCost = a[i] === b[j] ? 0 : 1;
-            matrix[j + 1][i + 1] = Math.min(
-                matrix[j][i + 1] + 1, // deletion
-                matrix[j + 1][i] + 1, // insertion
-                matrix[j][i] + substitutionCost // substitution
-            );
-        }
-    }
-    return matrix[b.length][a.length];
 }
 
 
@@ -138,9 +124,15 @@ const commandDefinitions: CommandDefinition[] = [
         parser: m => ({ type: 'click', target: m[1].trim() })
     },
 
+    // KEYBOARD PRESS
+    {
+        regex: /^Press(?: the)?\s*['"]?(.+?)['"]?\s*key$/i,
+        parser: m => ({ type: 'press', target: m[1] })
+    },
+
     // LOGIN / SIGN-IN
     {
-        regex: /^(?:Login|Log in|Sign in|Sign-in)\s*(?:with|using)?\s*['"]?([^'"]+)['"]?\s*(?:and|\/)?\s*(?:password|pass|pwd)?\s*['"]?([^'"]+)['"]?$/i,
+        regex: /^(?:Login|Log in|Sign in|Sign-in)\s*(?:with|using)?\s*['"]?([^'" ]+)['"]?\s*(?:and|\/)?\s*(?:password|pass|pwd)?\s*['"]?([^'" ]+)['"]?$/i,
         parser: m => ({ type: 'login', username: m[1], password: m[2] })
     },
 
@@ -200,14 +192,15 @@ function parseSingleCommand(step: string): ParsedCommand | null {
     return null;
 }
 
-function parseStep(step: string): ParsedCommand[] {
-    const commands: ParsedCommand[] = [];
+function parseStep(step: string): (ParsedCommand | null)[] {
+    const commands: (ParsedCommand | null)[] = [];
     // Split command string by 'then' or 'and then'
     const subSteps = step.split(/\s*,\s*then\s*|\s+and then\s+|\s*;\s*/i);
 
     for (const subStep of subSteps) {
-        if (subStep.trim()) {
-            commands.push(parseSingleCommand(subStep));
+        const trimmedSubStep = subStep.trim();
+        if (trimmedSubStep) {
+            commands.push(parseSingleCommand(trimmedSubStep));
         }
     }
     return commands;
@@ -229,7 +222,11 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
       break;
 
     case 'navigateUrl':
-      await page.goto(command.target!, { waitUntil: 'networkidle' });
+      const urlToNavigate = command.target!;
+      if (!urlToNavigate.startsWith('http')) {
+        throw new Error(`Invalid URL for navigation: "${urlToNavigate}". URL must start with http:// or https://.`);
+      }
+      await page.goto(urlToNavigate, { waitUntil: 'networkidle' });
       break;
 
     case 'click':
@@ -237,28 +234,42 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
       await locator.click({ timeout: 10000 });
       break;
 
+    case 'press':
+      await page.keyboard.press(command.target!);
+      break;
+
     case 'fill': {
       const { target, value } = command;
-      
-      // Prioritized list of locators for input fields
-      const inputLocators = [
-          page.getByLabel(target!),
-          page.getByPlaceholder(target!),
-          page.locator(`[name="${target!}"]`),
-          page.locator(`[id="${target!}"]`)
-      ];
+      const cleanedTarget = target!.replace(/['"’]/g, '').replace(/\s+(field|input)$/i, '').trim();
+
+      let potentialTargets: string[] = [cleanedTarget];
+
+      // Based on user feedback, expand common concepts into multiple potential labels
+      if (/username|email/i.test(cleanedTarget)) {
+        potentialTargets = ['Email', 'Username', 'email address', 'user name', 'login id'];
+      } else if (/password/i.test(cleanedTarget)) {
+        potentialTargets = ['Password', 'pass'];
+      }
 
       let inputFilled = false;
-      for (const locator of inputLocators) {
-          try {
-              // Let Playwright's auto-scrolling handle visibility.
-              // The fill action will wait for the element, scroll it into view, and then fill it.
-              await locator.first().fill(value!, { timeout: 5000 });
-              inputFilled = true;
-              break; // Success, exit the loop
-          } catch (e) {
-              // This locator failed, so we'll just continue to the next one in the list.
-          }
+      for (const pTarget of potentialTargets) {
+        const inputLocators = [
+            page.getByLabel(pTarget, { exact: true }),
+            page.getByLabel(pTarget, { exact: false }),
+            page.getByPlaceholder(pTarget),
+            page.locator(`[name="${pTarget}"]`),
+            page.locator(`[id="${pTarget}"]`)
+        ];
+        for (const locator of inputLocators) {
+            try {
+                await locator.first().fill(value!, { timeout: 1000 }); // Use a shorter timeout for each attempt
+                inputFilled = true;
+                break;
+            } catch (e) {
+                // This locator failed, continue to the next one
+            }
+        }
+        if (inputFilled) break;
       }
 
       if (!inputFilled) {
@@ -358,7 +369,10 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
 async function executeStep(page: Page, step: string, baseUrl: string, sessionId: string, scenarioId: string): Promise<void> {
   const commands = parseStep(step);
   for (const command of commands) {
-      await executeSingleCommand(command, page, baseUrl, sessionId, scenarioId);
+    if (!command) {
+      throw new Error(`Unrecognized command in step: "${step}"`);
+    }
+    await executeSingleCommand(command, page, baseUrl, sessionId, scenarioId);
   }
 }
 
@@ -502,13 +516,12 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
               let pageContext = await page.evaluate((selector) => {
                   const activeContext = document.querySelector(selector) || document.body;
                   
-                  const formInputs = activeContext.querySelectorAll('input:not([type="hidden"]):not([type="submit"]), textarea, select');
-                  const isFormVisible = formInputs.length > 2;
+                  const formInputs = Array.from(activeContext.querySelectorAll('input:not([type="hidden"]):not([type="submit"]), textarea, select')).map(input => ({ name: (input as any).name, type: (input as any).type, placeholder: (input as any).placeholder, label: (input as any).labels?.[0]?.textContent }));
 
                   const visibleButtons = Array.from(activeContext.querySelectorAll('button')).map(btn => btn.textContent?.trim() || '').filter(text => text.length > 0 && text.length < 100);
                   const visibleLinks = Array.from(activeContext.querySelectorAll('a')).map(a => a.textContent?.trim() || '').filter(text => text.length > 0 && text.length < 100);
                   
-                  return { isFormVisible, visibleButtons, visibleLinks, contextType: selector === 'body' ? 'document' : 'modal' };
+                  return { isFormVisible: formInputs.length > 2, visibleButtons, visibleLinks, formInputs, contextType: selector === 'body' ? 'document' : 'modal' };
               }, activeContextSelector);
 
               // Pre-process context to remove distracting buttons before sending to AI

@@ -98,6 +98,8 @@ Navigate to
  ONLY for navigating to a new URL. For example, "go to agents tab" should be 
 Click the "agents tab"
 .
+    8.  **No Placeholders:** You MUST NOT use placeholder values like '[URL]' or 'the specified URL'. If a valid URL is not provided in the user story, do not generate a 'Navigate' command.
+    9.  **Search Workflow:** For search actions, the correct workflow is to first \`Fill\` the search term into a search input, and then \`Press "Enter"\`. Do NOT generate a step to click a search button.
 
     ---
     **EXAMPLES:**
@@ -140,6 +142,16 @@ Click the "agents tab"
         "Fill \"testuser\" into the \"Username\""
       ]
     }
+
+    **Example 4: Simple Button Click**
+    User Story: "Sign in Button Click"
+    Page Context: { "visibleButtons": ["Sign in"] }
+    Expected Output:
+    {
+      "steps": [
+        "Click the \"Sign in\" button"
+      ]
+    }
     ---
 
     Now, generate the JSON object for the provided User Story and Page Context.
@@ -174,6 +186,7 @@ Click the "agents tab"
       '    -   An array of strings called `steps`, where each string is a single, precise, executable command.\n' +
       '5.  **Step Generation Rules:** For the `steps` array, you MUST follow these rules:\n' +
       '    -   Use precise command formats: \\`Click the "..."\\`, \\`Fill "..." into the "..."\\`, \\`Verify that the page contains "..."\\`.\n' +
+      '    -   **CRITICAL:** Do NOT generate abstract, non-executable steps like "Check keyboard navigation" or "Ensure responsiveness". Every step MUST be a concrete, executable command.\n' +
       '    -   Use realistic fake data (e.g., "John Doe", "test@example.com", "Password123"). For invalid data, use clearly invalid data (e.g., "not-an-email").\n' +
       '    -   For validation tests, the final step should almost always be a \\`Verify that the page contains "[error message]"\\` step.\n\n' +
       '**Example Output for a Login Page:**\n' +
