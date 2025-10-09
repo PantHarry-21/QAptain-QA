@@ -15,7 +15,9 @@ const apiKey = process.env.OPENAI_API_KEY;
 const modelName = process.env.OPENAI_MODEL_NAME || 'gpt-4-turbo';
 
 if (!apiKey) {
-  throw new Error('Missing OPENAI_API_KEY environment variable');
+  const errorMessage = 'The OPENAI_API_KEY environment variable is missing. Please add it to your Vercel project environment variables. The application cannot function without it.';
+  console.error(errorMessage);
+  throw new Error(errorMessage);
 }
 
 const client = new OpenAI({ apiKey });

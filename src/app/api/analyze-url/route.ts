@@ -27,7 +27,7 @@ export async function POST(request: Request) {
     }
 
     const page = await browser.newPage();
-    await page.goto(url, { waitUntil: 'networkidle' });
+    await page.goto(url, { waitUntil: 'load', timeout: 60000 });
 
     const pageInfo = await page.evaluate(() => {
       const forms = Array.from(document.querySelectorAll('form')).map(form => ({

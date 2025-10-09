@@ -435,7 +435,7 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
       });
     }
     const context = await browser.newContext({
-      recordVideo: { dir: `videos/${sessionId}` }
+      recordVideo: { dir: isVercel ? `/tmp/videos/${sessionId}` : `videos/${sessionId}` }
     });
     const page = await context.newPage();
 
@@ -538,8 +538,25 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
                   case 'FILL_FORM_HAPPY_PATH':
                     await skillFillFormHappyPath(page);
                     break;
-                  case 'TEST_FORM_VALIDATION':
-                    await skillTestFormValidation(page);
+                  case 'TEST_FEATURE_COMPREHENSIVELY':
+                    emitLog({ level: 'info', message: `Comprehensive test requested for "${subStep.target}". Generating sub-scenarios...`, scenario_id: scenario.id });
+                    const { scenarios: subScenarios } = await azureAIService.generateScenarios(pageContext);
+                    emitLog({ level: 'info', message: `Generated ${subScenarios.length} sub-scenarios.` });
+
+                    for (const subScenario of subScenarios) {
+                      emitLog({ level: 'info', message: `Starting sub-scenario: "${subScenario.title}"`, scenario_id: scenario.id });
+                      try {
+                        for (const subScenarioStep of subScenario.steps) {
+                          await executeStep(page, subScenarioStep, url, sessionId, scenario.id);
+                          await emitScreenshot(page);
+                        }
+                        emitLog({ level: 'success', message: `✅ Sub-scenario completed: "${subScenario.title}"`, scenario_id: scenario.id });
+                      } catch (subError) {
+                        emitLog({ level: 'warning', message: `Sub-scenario failed: "${subScenario.title}" - ${subError instanceof Error ? subError.message : 'Unknown error'}` });
+                      }
+                      // Reset page state for the next sub-scenario to ensure independence
+                      await page.goto(url, { waitUntil: 'load' });
+                    }
                     break;
                   default:
                     throw new Error(`Unknown AI skill in sub-plan: ${skill}`);

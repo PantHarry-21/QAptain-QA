@@ -235,36 +235,38 @@ Click the "agents tab"
 
     **CRITICAL PLANNING RULES - READ CAREFULLY:**
 
-    1.  **FORM IS PRIORITY #1:** If \`isFormVisible\` is \`true\` AND the user's command is about adding, creating, or submitting data (like "Add an agent"), you MUST IGNORE all buttons and immediately select the \`FILL_FORM_HAPPY_PATH\` skill. Do not choose \`CLICK\`.
+    1.  **COMPREHENSIVE TEST INTENT:** If the user command is a broad request to "Test", "Validate", or "Check" a feature (e.g., "Test the login form", "Validate the registration process"), you MUST select the \`TEST_FEATURE_COMPREHENSIVELY\` skill. This is your highest priority for such commands.
 
-    2.  **WHEN TO CLICK:** Only choose the \`CLICK\` skill if a form is NOT visible (\`isFormVisible\` is \`false\`) and the button or link text clearly matches the user's intent to *begin* a process (e.g., command is "Add a new user" and a button "Create User" exists).
+    2.  **HAPPY PATH FORM FILL:** If a form is visible AND the user command is a specific instruction to add, create, or submit data (e.g., "Add a new user with details", "Create an agent"), you MUST select the \`FILL_FORM_HAPPY_PATH\` skill. Do NOT use this for general "Test" commands.
+
+    3.  **BASIC CLICK:** Only choose the \`CLICK\` skill if a form is NOT visible and the user's command is a simple, direct action to begin a process (e.g., command is "Add a new user" and a button "Create User" exists).
 
     Available Skills:
-    - \`CLICK\`: Clicks a button, link, or tab. Requires a \`target\`.
-    - \`NAVIGATE\`: Go to a specific URL. Requires a \`url\`.
-    - \`FILL_FORM_HAPPY_PATH\`: Intelligently analyzes and fills a form on the current page with random, realistic data.
-    - \`TEST_FORM_VALIDATION\`: Runs a full validation test suite on a form on the current page.
+    - \`TEST_FEATURE_COMPREHENSIVELY\`: Triggers a full suite of generated tests (happy path, validation, negative cases) for a given feature. The \`target\` should be the feature described (e.g., "login form", "the page").
+    - \`FILL_FORM_HAPPY_PATH\`: Intelligently fills a visible form with valid data and submits it.
+    - \`CLICK\`: Clicks a single button, link, or tab. Requires a \`target\`.
+    - \`NAVIGATE\`: Goes to a specific URL. Requires a \`url\`.
 
     ---
     **EXAMPLES:**
 
-    **Example 1 (Correct Behavior - The Goal):**
+    **Example 1 (NEW - Comprehensive Test):**
+    User Command: "Test the login feature"
+    Current Page Context: { "isFormVisible": true, "visibleButtons": ["Login", "Forgot Password"] }
+    Your Output: {"plan":[{ "skill": "TEST_FEATURE_COMPREHENSIVELY", "target": "login feature" }]}
+    (REASONING: The user wants to test a whole feature, not just perform one action. This skill will trigger multiple sub-scenarios like valid login, invalid login, etc.)
+
+    **Example 2 (Happy Path Fill):**
     User Command: "Add an agent"
     Current Page Context: { "isFormVisible": true, "visibleButtons": ["Add Agent", "Cancel"] }
-    Your Output: {"plan":[{ "skill": "FILL_FORM_HAPPY_PATH" }]}(
-REASONING: A form is visible and the user wants to add something. The correct action is to fill the form.)
+    Your Output: {"plan":[{ "skill": "FILL_FORM_HAPPY_PATH" }]}
+    (REASONING: A form is visible and the user gave a specific instruction to add something. This is a single happy-path action.)
 
-    **Example 2 (Incorrect Behavior to AVOID):**
-    User Command: "Add an agent"
-    Current Page Context: { "isFormVisible": true, "visibleButtons": ["Add Agent", "Cancel"] }
-    Your Output (THIS IS WRONG): {"plan":[{ "skill": "CLICK", "target": "Add Agent" }]}(
-REASONING: This is wrong because a form is already visible. Clicking the button is not the primary action.)
-
-    **Example 3 (Correct Time to Click):**
+    **Example 3 (Basic Click):**
     User Command: "Add an agent"
     Current Page Context: { "isFormVisible": false, "visibleButtons": ["Add Agent", "Delete Agent"] }
-    Your Output: {"plan":[{ "skill": "CLICK", "target": "Add Agent" }]}(
-REASONING: No form is visible. Clicking the button is the necessary first step to open the form.)
+    Your Output: {"plan":[{ "skill": "CLICK", "target": "Add Agent" }]}
+    (REASONING: No form is visible. Clicking the button is the necessary first step to open the form.)
     ---
 
     Now, generate the plan for the user command and context above.

@@ -194,45 +194,53 @@ export default function TestExecutionPage() {
                   {isConnected ? 'Connected' : 'Disconnected'}
                 </span>
               </div>
-              {testStatus === 'completed' && (
-                <Button onClick={handleViewResults}>View Results</Button>
-              )}
+              {/* {testStatus === 'completed' && (
+                <Button onClick={handleViewResults}>View Resultsss</Button>
+              )} */}
             </div>
           </div>
         </div>
 
-        {/* Control Panel */}
-        <Card className="mb-6">
-          <CardHeader><CardTitle className="flex items-center gap-2"><Monitor className="w-5 h-5" />Test Control</CardTitle></CardHeader>
-          <CardContent>
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-4">
-                {testStatus === 'idle' && (
-                  <Button onClick={handleStartTest} disabled={!isConnected || testStatus === 'running'}>
-                    {testStatus === 'running' ? (
-                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                    ) : (
-                      <Play className="w-4 h-4 mr-2" />
-                    )}
-                    {testStatus === 'running' ? 'Starting...' : 'Start Test'}
-                  </Button>
-                )}
-                {(testStatus === 'completed' || testStatus === 'failed') && (
-                  <Button onClick={handleViewResults}>
-                    <CheckCircle className="w-4 h-4 mr-2" />
-                    View Results
-                  </Button>
-                )}
-              </div>
-              <div className="flex items-center gap-4">
-                <Badge variant="outline" className="flex items-center gap-2">
-                  <div className={`w-2 h-2 rounded-full ${getStatusColor(testStatus)}`} />
-                  {testStatus.charAt(0).toUpperCase() + testStatus.slice(1)}
-                </Badge>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
+        <Card className="mb-8 h-25 flex flex-col justify-center px-6 py-4">
+  <div className="flex items-center justify-between w-full">
+    {/* LEFT SIDE: Title + Buttons */}
+    <div className="flex flex-col items-start gap-4">
+      <CardTitle className="flex items-center gap-2 text-lg font-semibold">
+        <Monitor className="w-5 h-5" />
+        Test Control
+      </CardTitle>
+
+      <div className="flex items-center gap-4">
+        {testStatus === 'idle' && (
+          <Button
+            onClick={handleStartTest}
+            disabled={!isConnected || testStatus === 'running'}
+          >
+            {testStatus === 'running' ? (
+              <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+            ) : (
+              <Play className="w-4 h-4 mr-2" />
+            )}
+            {testStatus === 'running' ? 'Starting...' : 'Start Test'}
+          </Button>
+        )}
+
+        {(testStatus === 'completed' || testStatus === 'failed') && (
+          <Button onClick={handleViewResults}>
+            <CheckCircle className="w-4 h-4 mr-2" />
+            View Results
+          </Button>
+        )}
+      </div>
+    </div>
+
+    {/* RIGHT SIDE: Badge */}
+    <Badge variant="outline" className="flex items-center gap-2">
+      <div className={`w-2 h-2 rounded-full ${getStatusColor(testStatus)}`} />
+      {testStatus.charAt(0).toUpperCase() + testStatus.slice(1)}
+    </Badge>
+  </div>
+</Card>
 
         {/* Progress Overview */}
         {progress && (
