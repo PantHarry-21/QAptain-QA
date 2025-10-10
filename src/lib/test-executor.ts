@@ -31,54 +31,45 @@ interface CommandDefinition {
 
 // --- Helper Functions ---
 
-async function findLocator(page: Page, identifier: string, elementType?: string): Promise<Locator> {
-    // If the identifier looks like a generic submission command, prioritize finding a button with type="submit"
-    if (/^(submit|sign in|log in|login|save|continue|next|go)$/i.test(identifier.trim())) {
-        const submitButton = page.locator('[type="submit"]');
-        if (await submitButton.count() > 0) {
-            return submitButton.first();
-        }
-    }
-
-    // Clean the identifier to make it more robust against AI verbosity (e.g., "submit button" -> "submit")
+async function findLocator(page: Page, identifier: string): Promise<Locator> {
     const cleanedIdentifier = identifier.replace(/\b(tab|button|link|page|the|field|input)\b/gi, '').trim();
-
-    // Use a regex that matches the cleaned identifier, which is more flexible
     const searchRegex = new RegExp(cleanedIdentifier.replace(/[.*+?^${}()|[\\]/g, '\\$&'), 'i');
 
-    const locators: Locator[] = [
-        // Prioritize roles for robustness
+    const locators: Locator[] = [];
+
+    // If the identifier looks like a generic submission command, prioritize finding a button with type="submit"
+    if (/^(submit|sign in|log in|login|save|continue|next|go)$/i.test(identifier.trim())) {
+        locators.push(page.locator('[type="submit"]'));
+    }
+    
+    // Add CSS selector if it looks like one
+    if (identifier.startsWith('#') || identifier.startsWith('.')) {
+        locators.push(page.locator(identifier));
+    }
+
+    // Add all standard locators
+    locators.push(
         page.getByRole('button', { name: searchRegex }),
         page.getByRole('link', { name: searchRegex }),
-        page.getByRole('tab', { name: searchRegex }), // Added tab role
+        page.getByRole('tab', { name: searchRegex }),
         page.getByRole('checkbox', { name: searchRegex }),
         page.getByRole('radio', { name: searchRegex }),
-
-        // Other common locators
         page.getByLabel(searchRegex),
         page.getByPlaceholder(searchRegex),
         page.getByText(searchRegex),
-        
-        // Finally, try test IDs with both cleaned and original identifiers
         page.getByTestId(cleanedIdentifier),
-        page.getByTestId(identifier),
-    ];
+        page.getByTestId(identifier)
+    );
 
-    // Add CSS selector if it looks like one (and prioritize it)
-    if (identifier.startsWith('#') || identifier.startsWith('.')) {
-        locators.unshift(page.locator(identifier));
+    // Chain all locators with .or()
+    let combinedLocator = locators[0];
+    for (let i = 1; i < locators.length; i++) {
+        combinedLocator = combinedLocator.or(locators[i]);
     }
 
-    // Find the first locator that exists in the DOM
-    for (const locator of locators) {
-        // Check if any element matches the locator
-        if (await locator.count() > 0) {
-            // Return the first matching element. The action (.click, .fill) will handle visibility and scrolling.
-            return locator.first();
-        }
-    }
-
-    throw new Error(`Element with identifier \"${identifier}\" not found in the DOM.`);
+    // The action (.click, .fill) will handle visibility and auto-waiting.
+    // We return the first match from the combined set of locators.
+    return combinedLocator.first();
 }
 
 
