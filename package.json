@@ -6,7 +6,8 @@
     "dev": "tsx server.ts",
     "build": "next build",
     "start": "NODE_ENV=production tsx server.ts 2>&1",
-    "lint": "next lint"
+    "lint": "next lint",
+    "postinstall": "node scripts/download-chromium.mjs"
   },
   "dependencies": {
     "@azure/identity": "^4.12.0",
