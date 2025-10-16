@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import playwright from 'playwright-core';
 import chromium from '@sparticuz/chromium';
-import { azureAIService } from '@/lib/azure-ai';
+import { openAIService } from '@/lib/openai';
 
 export async function POST(request: NextRequest) {
   let browser: playwright.Browser | null = null;
@@ -58,7 +58,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Call the new AI interpreter service
-    const result = await azureAIService.interpretScenario(userStory, pageContext);
+    const result = await openAIService.interpretScenario(userStory, pageContext);
 
     return NextResponse.json(result);
 

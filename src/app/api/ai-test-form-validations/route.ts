@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import playwright, { Browser, Page } from 'playwright-core';
 import chromium from '@sparticuz/chromium';
-import { azureAIService } from '@/lib/azure-ai';
+import { openAIService, PageContext } from '@/lib/openai';
 import { executeSingleCommand } from '@/lib/test-executor'; // We might need to refactor this
 
 // Helper to find the submit button
@@ -54,62 +54,53 @@ export async function POST(request: NextRequest) {
     
     // 1. Analyze the form
     await page.goto(url, { waitUntil: 'networkidle' });
-    const formsData = await page.evaluate(() => {
-      const forms = Array.from(document.querySelectorAll('form')).map((form, formIndex) => {
-        const inputs = Array.from(form.querySelectorAll('input, textarea, select')).map((input) => {
-            const labelEl = input.closest('label');
-            let labelText = '';
-            if (labelEl) {
-                labelText = labelEl.textContent || '';
-            } else {
-                const labels = input.labels;
-                if (labels && labels.length > 0) {
-                    labelText = Array.from(labels).map(l => l.textContent).join(' ');
-                }
-            }
-            return {
-                tagName: input.tagName.toLowerCase(),
-                type: input.getAttribute('type') || 'text',
-                name: input.getAttribute('name') || '',
-                id: input.id || '',
-                placeholder: input.getAttribute('placeholder') || '',
-                label: labelText.trim(),
-                isDisabled: (input as HTMLInputElement).disabled,
-                isReadOnly: (input as HTMLInputElement).readOnly,
-            };
-        });
-        const usefulInputs = inputs.filter(input => !input.isDisabled && !input.isReadOnly && input.type !== 'hidden');
-        return { formId: `form_${formIndex}`, inputs: usefulInputs };
-      });
-      return forms.filter(form => form.inputs.length > 0);
+    const pageContext: PageContext = await page.evaluate(() => {
+        const allForms = Array.from(document.querySelectorAll('form')).map(form => ({
+            id: form.id,
+            className: form.className,
+            inputs: Array.from(form.querySelectorAll('input, textarea, select')).map(input => ({
+                name: (input as HTMLInputElement).name,
+                type: (input as HTMLInputElement).type,
+                placeholder: (input as HTMLInputElement).placeholder,
+            })),
+        }));
+
+        const allNavLinks = Array.from(document.querySelectorAll('nav a')).map(link => ({
+            href: (link as HTMLAnchorElement).href,
+            text: link.textContent,
+        }));
+
+        return {
+            title: document.title,
+            url: window.location.href,
+            hasLoginForm: !!document.querySelector('form[id*="login"], form[class*="login"]'),
+            hasContactForm: !!document.querySelector('form[id*="contact"], form[class*="contact"]'),
+            hasSearchForm: !!document.querySelector('form[role="search"], form[action*="search"]'),
+            forms: allForms,
+            navLinks: allNavLinks,
+        };
     });
 
-    if (!formsData || formsData.length === 0) {
+    if (!pageContext.forms || pageContext.forms.length === 0) {
       return NextResponse.json({ error: 'No usable forms found on the page.' }, { status: 404 });
     }
-    const firstForm = formsData[0];
 
     // 2. Generate the test plan from the AI
-    const testPlan = await azureAIService.generateFormValidationScenarios(firstForm);
-    const results = [];
+    const testPlan = await openAIService.generateScenarios(pageContext);
 
+    // NOTE: The execution part of this route has been temporarily disabled.
+    // The new `generateScenarios` method produces a different output format that is not compatible
+    // with the old `executeSingleCommand` function. The test executor needs to be refactored
+    // to handle the new scenario structure (e.g., "Fill 'test' into 'username'").
+    const results: any[] = [];
+    /*
     // 3. Execute each scenario in the test plan
     for (const scenario of testPlan.scenarios) {
-        console.log(`--- Running Scenario: ${scenario.name} ---`);
+        console.log(`--- Running Scenario: ${scenario.title} ---`);
         await page.goto(url, { waitUntil: 'networkidle' });
 
-        // Execute fill steps
-        for (const step of scenario.steps) {
-            // We need a way to execute these steps. For now, we'll use a simplified version.
-            // This highlights the need to refactor test-executor to export its command functions.
-            try {
-                await executeSingleCommand({ type: 'fill', target: step.target, value: step.value }, page, url, 'session-id', 'scenario-id');
-            }
-            catch (e) {
-                console.error(`Error during fill step for target "${step.target}":`, e);
-                // In a real scenario, we'd log this failure and continue if possible
-            }
-        }
+        // The execution logic below is now incompatible with the new scenario step format.
+        // It needs to be refactored to parse and execute string-based commands.
 
         // Find and click the submit button
         const submitButton = await findSubmitButton(page);
@@ -118,7 +109,7 @@ export async function POST(request: NextRequest) {
             // Wait for potential navigation or async validation
             await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
         } else {
-            results.push({ scenarioName: scenario.name, status: 'Failed', error: 'Could not find submit button.' });
+            results.push({ scenarioName: scenario.title, status: 'Failed', error: 'Could not find submit button.' });
             continue; // Move to next scenario
         }
 
@@ -128,18 +119,18 @@ export async function POST(request: NextRequest) {
 
         // For now, we just record the outcome. The next step is to use AI to analyze these.
         results.push({
-            scenarioName: scenario.name,
+            scenarioName: scenario.title,
             status: 'Completed',
             screenshot: `data:image/png;base64,${screenshot.toString('base64')}`,
-            // pageText: pageText, // This can be very large, so we omit it for now
         });
     }
+    */
 
     await browser.close();
 
     return NextResponse.json({
       success: true,
-      message: "Form validation test execution completed.",
+      message: "Form validation test plan generated successfully. Execution is temporarily disabled.",
       data: {
         testPlan,
         results

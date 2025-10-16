@@ -1,13 +1,11 @@
 /**
  * @fileoverview
- * This file defines the AI service for QAptain.
- * NOTE: The filename is a misnomer. This service uses the standard OpenAI API, not the Azure OpenAI API.
- * The class has been renamed to OpenAIService to reflect this.
+ * This file defines the AI service for QAptain, powered by the OpenAI API.
  */
 
 import OpenAI from 'openai';
-import { TestLog } from './supabase';
 import { prompts } from './prompts';
+import { TestLog } from './supabase';
 
 // --- Configuration ---
 
@@ -30,13 +28,29 @@ interface AICompletionConfig {
   topP?: number;
 }
 
-// Interfaces for method arguments
-interface PageContext {
-  visibleButtons?: string[];
-  visibleLinks?: string[];
-  formInputs?: { label?: string; name?: string; placeholder?: string }[];
+// This interface defines the comprehensive data extracted from a web page.
+export interface PageContext {
+  title: string;
+  url: string;
+  hasLoginForm: boolean;
+  hasContactForm: boolean;
+  hasSearchForm: boolean;
+  forms: {
+    id: string;
+    className: string;
+    inputs: {
+      name: string;
+      type: string;
+      placeholder: string;
+    }[];
+  }[];
+  navLinks: {
+    href: string;
+    text: string | null;
+  }[];
 }
 
+// Interfaces for method arguments
 interface Scenario {
   title: string;
   description: string;
@@ -53,13 +67,6 @@ interface TestResults {
 }
 
 // Interfaces for method return types
-interface WebPageAnalysis {
-  summary: string;
-  keyElements: string[];
-  suggestedTests: string[];
-  complexity: 'simple' | 'medium' | 'complex';
-}
-
 interface WorkflowPlan {
   plan: {
     skill: 'CLICK' | 'NAVIGATE' | 'FILL_FORM_HAPPY_PATH' | 'TEST_FORM_VALIDATION';
@@ -89,12 +96,13 @@ interface TestAnalysis {
   qualityScore: number;
 }
 
+
 // --- Service Class ---
 
 export class OpenAIService {
   private readonly defaultConfig: AICompletionConfig = {
     temperature: 0.7,
-    maxTokens: 2000,
+    maxTokens: 4000, // Increased default for potentially complex scenario generation
     topP: 0.9,
   };
 
@@ -129,15 +137,13 @@ export class OpenAIService {
         throw new Error('AI returned an empty response.');
       }
 
-      // Find the first '{' and the last '}' to extract the JSON object
-      const jsonStartIndex = rawContent.indexOf('{');
-      const jsonEndIndex = rawContent.lastIndexOf('}');
-
-      if (jsonStartIndex === -1 || jsonEndIndex === -1) {
+      // A more robust way to find and parse the JSON object
+      const jsonMatch = rawContent.match(/\{.*\}/s);
+      if (!jsonMatch) {
         throw new Error('No valid JSON object found in the AI response.');
       }
 
-      const jsonString = rawContent.substring(jsonStartIndex, jsonEndIndex + 1);
+      const jsonString = jsonMatch[0];
       return JSON.parse(jsonString) as T;
 
     } catch (error) {
@@ -154,7 +160,7 @@ export class OpenAIService {
    * @param pageContext The context of the current web page.
    * @returns A promise that resolves to an object containing the steps.
    */
-  async interpretScenario(userStory: string, pageContext: PageContext): Promise<InterpretedScenario> {
+  async interpretScenario(userStory: string, pageContext: any): Promise<InterpretedScenario> {
     const prompt = prompts.interpretScenario(userStory, pageContext);
     return this._generateAndParseJSON<InterpretedScenario>(prompt, { maxTokens: 2000 });
   }
@@ -165,7 +171,7 @@ export class OpenAIService {
    * @param context The context of the current web page.
    * @returns A promise that resolves to the generated plan.
    */
-  async createWorkflowPlan(userCommand: string, context: PageContext): Promise<WorkflowPlan> {
+  async createWorkflowPlan(userCommand: string, context: any): Promise<WorkflowPlan> {
     const prompt = prompts.createWorkflowPlan(userCommand, context);
     return this._generateAndParseJSON<WorkflowPlan>(prompt, { maxTokens: 1000 });
   }
@@ -196,30 +202,20 @@ export class OpenAIService {
    * @param testResults The final results of the test session.
    * @returns A promise that resolves to the final analysis report.
    */
-  async generateTestAnalysis(testResults: TestResults): Promise<TestAnalysis> {
-    const prompt = prompts.generateTestAnalysis(testResults);
+  async generateTestAnalysis(testResults: TestResults, logs: TestLog[], scenarios: any[]): Promise<TestAnalysis> {
+    const prompt = prompts.generateTestAnalysis(testResults, logs, scenarios);
     return this._generateAndParseJSON<TestAnalysis>(prompt, { maxTokens: 3000 });
   }
 
   /**
-   * Generates a list of test scenarios based on page context.
-   * @param pageContext The context of the current web page.
+   * Generates a list of test scenarios based on a comprehensive page context.
+   * @param pageContext The full context of the web page from Playwright.
    * @returns A promise that resolves to an object containing the generated scenarios.
    */
   async generateScenarios(pageContext: PageContext): Promise<{ scenarios: { title: string; description: string; steps: string[] }[] }> {
     const prompt = prompts.generateScenarios(pageContext);
-    return this._generateAndParseJSON<{ scenarios: { title: string; description: string; steps: string[] }[] }>(prompt, { maxTokens: 4000 });
-  }
-  
-  /**
-   * Analyzes the structure of a web page.
-   * @param pageInfo Information about the page (title, URL).
-   * @returns A promise that resolves to the AI's analysis of the page.
-   */
-  async analyzeWebPage(pageInfo: { title: string; url: string }): Promise<WebPageAnalysis> {
-    const prompt = prompts.analyzeWebPage(pageInfo);
-    return this._generateAndParseJSON<WebPageAnalysis>(prompt);
+    return this._generateAndParseJSON<{ scenarios: { title: string; description: string; steps: string[] }[] }>(prompt);
   }
 }
 
-export const azureAIService = new OpenAIService();
+export const openAIService = new OpenAIService();

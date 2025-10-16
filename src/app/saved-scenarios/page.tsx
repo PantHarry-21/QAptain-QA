@@ -34,6 +34,7 @@ const itemVariants = {
 };
 
 export default function SavedScenariosPage() {
+  const [title, setTitle] = useState("");
   const [userStory, setUserStory] = useState("");
   const [savedScenarios, setSavedScenarios] = useState<SavedScenario[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -60,8 +61,8 @@ export default function SavedScenariosPage() {
   }, []);
 
   const handleCreateScenario = async () => {
-    if (!userStory.trim()) {
-      setError("Scenario description is required.");
+    if (!title.trim() || !userStory.trim()) {
+      setError("Scenario title and description are required.");
       return;
     }
     setIsSaving(true);
@@ -70,13 +71,14 @@ export default function SavedScenariosPage() {
       const response = await fetch('/api/saved-scenarios', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_story: userStory }),
+        body: JSON.stringify({ title, user_story: userStory }),
       });
       if (!response.ok) {
         const errorData = await response.json();
         throw new Error(errorData.details || 'Failed to save scenario.');
       }
       toast({ title: "Scenario Saved", description: "Your new scenario has been successfully saved." });
+      setTitle("");
       setUserStory("");
       fetchSavedScenarios();
     } catch (err) {
@@ -97,6 +99,28 @@ export default function SavedScenariosPage() {
       toast({ title: "Scenario Updated", description: `"${scenario.title}" has been saved.` });
     } catch (err) {
       toast({ variant: 'destructive', title: 'Error', description: err instanceof Error ? err.message : 'Could not update scenario.' });
+    }
+  };
+
+  const handleDeleteScenario = async (scenarioId: string) => {
+    if (!confirm('Are you sure you want to delete this scenario? This action cannot be undone.')) {
+      return;
+    }
+
+    try {
+      const response = await fetch(`/api/saved-scenarios?id=${scenarioId}`, {
+        method: 'DELETE',
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.details || 'Failed to delete scenario.');
+      }
+
+      toast({ title: "Scenario Deleted", description: "The scenario has been permanently removed." });
+      fetchSavedScenarios(); // Refresh the list
+    } catch (err) {
+      toast({ variant: 'destructive', title: 'Error', description: err instanceof Error ? err.message : 'Could not delete scenario.' });
     }
   };
 
@@ -142,16 +166,20 @@ export default function SavedScenariosPage() {
       <Card className="mb-8">
         <CardHeader>
           <CardTitle>Add a New Scenario</CardTitle>
-          <CardDescription>Describe a test in your own words. The AI will convert it into steps and save it to your global library.</CardDescription>
+          <CardDescription>Manually add a new test scenario to your library.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <div>
-            <label htmlFor="user_story" className="text-sm font-medium text-slate-300 mb-2 block">Scenario Description</label>
-            <Textarea id="user_story" placeholder="e.g., Login with invalid credentials and verify the error message..." rows={4} value={userStory} onChange={(e) => setUserStory(e.target.value)} className="bg-transparent"/>
+            <label htmlFor="title" className="text-sm font-medium text-slate-300 mb-2 block">Scenario Title</label>
+            <Input id="title" placeholder="e.g., Successful Login" value={title} onChange={(e) => setTitle(e.target.value)} className="bg-transparent"/>
           </div>
-          <Button onClick={handleCreateScenario} disabled={isSaving || !userStory.trim()}>
+          <div>
+            <label htmlFor="user_story" className="text-sm font-medium text-slate-300 mb-2 block">Scenario Description / User Story</label>
+            <Textarea id="user_story" placeholder="e.g., When a user enters valid credentials, they should be redirected to the dashboard." rows={3} value={userStory} onChange={(e) => setUserStory(e.target.value)} className="bg-transparent"/>
+          </div>
+          <Button onClick={handleCreateScenario} disabled={isSaving || !title.trim() || !userStory.trim()}>
             {isSaving ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Save className="w-4 h-4 mr-2" />}
-            Interpret & Save
+            Save Manual Scenario
           </Button>
         </CardContent>
       </Card>
@@ -189,9 +217,12 @@ export default function SavedScenariosPage() {
                               <Button variant="ghost" size="icon" onClick={() => handleDeleteStep(scenario.id, index)} aria-label="Delete step"><Trash2 className="w-4 h-4 text-red-500" /></Button>
                             </div>
                           ))}
-                          <div className="flex items-center gap-2 pt-2">
-                            <Button variant="outline" size="sm" onClick={() => handleAddStep(scenario.id)}><PlusCircle className="w-4 h-4 mr-2"/> Add Step</Button>
-                            <Button size="sm" onClick={() => handleUpdateScenario(scenario)}><Save className="w-4 h-4 mr-2"/> Save Changes</Button>
+                          <div className="flex items-center justify-between gap-2 pt-2">
+                             <div>
+                               <Button variant="outline" size="sm" onClick={() => handleAddStep(scenario.id)}><PlusCircle className="w-4 h-4 mr-2"/> Add Step</Button>
+                               <Button size="sm" onClick={() => handleUpdateScenario(scenario)} className="ml-2"><Save className="w-4 h-4 mr-2"/> Save Changes</Button>
+                             </div>
+                             <Button variant="destructive" size="sm" onClick={() => handleDeleteScenario(scenario.id)}><Trash2 className="w-4 h-4 mr-2"/> Delete Scenario</Button>
                           </div>
                         </div>
                       </AccordionContent>

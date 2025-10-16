@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import playwright, { Browser } from 'playwright-core';
 import chromium from '@sparticuz/chromium';
-import { azureAIService } from '@/lib/azure-ai';
+import { openAIService } from '@/lib/openai';
 
 export async function POST(request: NextRequest) {
   let browser: Browser | null = null;
@@ -75,7 +75,7 @@ export async function POST(request: NextRequest) {
     const firstForm = formsData[0];
 
     // Call the AI service to generate the form filling steps
-    const result = await azureAIService.generateFakerMappings(firstForm);
+    const result = await openAIService.generateFakerMappings(firstForm);
 
     return NextResponse.json({
       success: true,

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -9,23 +9,76 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
-import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter, DialogClose } from "@/components/ui/dialog";
-import { Loader2, ArrowLeft, Wand2, Target, PlusCircle, Bot, User, Trash2, Bookmark } from "lucide-react";
+import { Loader2, ArrowLeft, Wand2, Target, PlusCircle, Bot, User, Trash2, Bookmark, GripVertical, CheckCircle, ChevronDown } from "lucide-react";
+import {
+  DndContext,
+  closestCenter,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+} from '@dnd-kit/core';
+import {
+  arrayMove,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+} from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 import { v4 as uuidv4 } from 'uuid';
 import { useToast } from "@/hooks/use-toast";
 
 // --- Type Definitions ---
 interface Scenario {
-  id: string;
+  id: string; // Volatile ID for the UI session
+  savedId?: string; // Persistent ID from the database, if saved
+  isSaved: boolean; // Tracks if the current state is saved to the DB
   title: string;
   description: string;
   steps: string[];
   type: 'ai' | 'manual' | 'saved';
 }
 
-interface SavedScenario extends Omit<Scenario, 'type'> {
+interface SavedScenarioDto {
+  id: string;
+  title: string;
   user_story: string;
+  steps: string[];
+}
+
+// Moved SortableStepItem outside of the main component to prevent re-creation on render
+function SortableStepItem({ scenarioId, step, index, handleStepChange, handleDeleteStep }) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+  } = useSortable({ id: `${scenarioId}-${index}` });
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  };
+
+  return (
+    <div ref={setNodeRef} style={style} className="flex items-center gap-2">
+      <Button variant="ghost" size="icon" {...attributes} {...listeners} className="cursor-grab">
+        <GripVertical className="w-5 h-5 text-slate-400" />
+      </Button>
+      <Input
+        type="text"
+        value={step}
+        onChange={(e) => handleStepChange(scenarioId, index, e.target.value)}
+        placeholder="Enter a test step"
+        className="flex-grow font-mono text-sm h-9 bg-transparent"
+      />
+      <Button variant="ghost" size="icon" onClick={() => handleDeleteStep(scenarioId, index)} aria-label="Delete step">
+        <Trash2 className="w-4 h-4 text-red-500" />
+      </Button>
+    </div>
+  );
 }
 
 export default function ScenariosPage() {
@@ -44,11 +97,42 @@ export default function ScenariosPage() {
   const [isInterpreting, setIsInterpreting] = useState(false);
 
   // State for saved scenarios modal
-  const [savedScenarios, setSavedScenarios] = useState<SavedScenario[]>([]);
+  const [savedScenarios, setSavedScenarios] = useState<SavedScenarioDto[]>([]);
   const [isLoadingSaved, setIsLoadingSaved] = useState(false);
   const [selectedSaved, setSelectedSaved] = useState<Set<string>>(new Set());
 
   const router = useRouter();
+
+  const sensors = useSensors(
+    useSensor(PointerSensor),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    })
+  );
+
+  function handleDragEnd(event) {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+
+    const [activeScenarioId, activeIndexStr] = active.id.split('-');
+    const [overScenarioId, overIndexStr] = over.id.split('-');
+    
+    if (activeScenarioId !== overScenarioId) return;
+
+    const activeIndex = parseInt(activeIndexStr, 10);
+    const overIndex = parseInt(overIndexStr, 10);
+
+    setScenarios((items) => items.map(scenario => {
+      if (scenario.id === activeScenarioId) {
+        return { 
+          ...scenario, 
+          steps: arrayMove(scenario.steps, activeIndex, overIndex),
+          isSaved: false // Mark as unsaved after reordering
+        };
+      }
+      return scenario;
+    }));
+  }
 
   // --- Effects ---
   useEffect(() => {
@@ -66,10 +150,10 @@ export default function ScenariosPage() {
     const generateInitialScenarios = async () => {
       setIsLoading(true);
       try {
-        const response = await fetch('/api/generate-scenarios', {
+        const response = await fetch('/api/analyze-url', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pageContext: analysis }),
+          body: JSON.stringify({ url: storedUrl }),
         });
 
         if (!response.ok) {
@@ -77,15 +161,15 @@ export default function ScenariosPage() {
           throw new Error(errorData.details || 'Failed to generate scenarios.');
         }
 
-        const data: { scenarios: Omit<Scenario, 'id' | 'type'>[] } = await response.json();
+        const data: { scenarios: Omit<Scenario, 'id' | 'type' | 'savedId' | 'isSaved'>[] } = await response.json();
         const scenariosWithIds = data.scenarios.map(sc => ({
           ...sc,
           id: uuidv4(),
+          isSaved: false,
           type: 'ai' as const
         }));
         
         setScenarios(scenariosWithIds);
-        // Change: Scenarios are now unselected by default.
         setSelectedScenarioIds(new Set());
 
       } catch (err) {
@@ -116,6 +200,7 @@ export default function ScenariosPage() {
         title: manualStory.split('\n')[0],
         description: 'A custom scenario added by the user.',
         steps: data.steps,
+        isSaved: false,
         type: 'manual',
       };
       setScenarios(prev => [...prev, newManualScenario]);
@@ -137,35 +222,17 @@ export default function ScenariosPage() {
     });
   };
 
-  const handleSelectAll = (checked: boolean) => {
-    if (checked) {
-      setSelectedScenarioIds(new Set(scenarios.map(sc => sc.id)));
-    } else {
-      setSelectedScenarioIds(new Set());
-    }
-  };
-
   const handleStartTest = async () => {
-    // 1. Get the scenarios that are currently selected.
     const selectedScenarios = scenarios.filter(sc => selectedScenarioIds.has(sc.id));
-
     if (selectedScenarios.length === 0) {
       setError("Please select at least one scenario to run.");
       return;
     }
-
-    // 2. Create a new, clean list of scenarios by filtering out any empty steps from each one.
-    const scenariosToRun = selectedScenarios.map(sc => ({
-      ...sc,
-      steps: sc.steps.filter(s => s.trim() !== '')
-    }));
-
-    // 3. Check if any of the selected scenarios are now empty after filtering.
+    const scenariosToRun = selectedScenarios.map(sc => ({ ...sc, steps: sc.steps.filter(s => s.trim() !== '') }));
     if (scenariosToRun.some(sc => sc.steps.length === 0)) {
       setError("One of your selected scenarios has no valid steps. Please add steps or unselect it.");
       return;
     }
-
     setIsLoading(true);
     setError("");
     const newSessionId = uuidv4();
@@ -201,7 +268,15 @@ export default function ScenariosPage() {
   const handleAddSavedScenarios = () => {
     const scenariosToAdd = savedScenarios
       .filter(ss => selectedSaved.has(ss.id))
-      .map(ss => ({ ...ss, id: uuidv4(), type: 'saved' as const }));
+      .map(ss => ({ 
+        id: uuidv4(), 
+        savedId: ss.id, // Link to the persistent ID
+        isSaved: true, // It's already saved
+        title: ss.title, 
+        description: ss.user_story, 
+        steps: ss.steps, 
+        type: 'saved' as const 
+      }));
     
     setScenarios(prev => [...prev, ...scenariosToAdd]);
     setSelectedScenarioIds(prev => new Set([...prev, ...scenariosToAdd.map(s => s.id)]));
@@ -209,55 +284,106 @@ export default function ScenariosPage() {
     toast({ title: 'Scenarios Added', description: `${scenariosToAdd.length} saved scenarios have been added to the current test run.` });
   };
 
-  const handleSaveSingleScenario = async (scenario: Scenario) => {
+  const handleSaveScenario = async (scenario: Scenario) => {
+    const payload = {
+      id: scenario.savedId,
+      title: scenario.title,
+      user_story: scenario.description,
+      steps: scenario.steps.filter(s => s.trim() !== ''),
+    };
+
+    const isUpdate = !!scenario.savedId;
+    const url = '/api/saved-scenarios';
+    const method = isUpdate ? 'PUT' : 'POST';
+
     try {
-      const response = await fetch('/api/saved-scenarios', {
-        method: 'POST',
+      const response = await fetch(url, {
+        method,
         headers: { 'Content-Type': 'application/json' },
-        // Use the scenario title as the user_story for saving
-        body: JSON.stringify({ user_story: scenario.title, steps: scenario.steps }),
+        body: JSON.stringify(payload),
       });
+
       if (!response.ok) {
-        throw new Error('Failed to save scenario.');
+        const errorData = await response.json();
+        throw new Error(errorData.details || 'Failed to save scenario.');
       }
-      toast({ title: "Scenario Saved", description: `"${scenario.title}" has been added to your library.` });
+
+      const result = await response.json();
+
+      setScenarios(prev => prev.map(s => {
+        if (s.id === scenario.id) {
+          return { 
+            ...s, 
+            isSaved: true, 
+            // If it was a new scenario, store its new persistent ID
+            savedId: s.savedId || result.data.id 
+          };
+        }
+        return s;
+      }));
+
+      toast({ title: `Scenario ${isUpdate ? 'Updated' : 'Saved'}`, description: `"${scenario.title}" has been saved to your library.` });
     } catch (err) {
       toast({ variant: 'destructive', title: 'Error', description: err instanceof Error ? err.message : 'Could not save scenario.' });
     }
   };
 
-  const handleStepChange = (scenarioId: string, stepIndex: number, newValue: string) => {
+  const handleTitleChange = useCallback((scenarioId: string, newTitle: string) => {
+    setScenarios(prev => prev.map(sc => {
+      if (sc.id === scenarioId) {
+        return { ...sc, title: newTitle, isSaved: false };
+      }
+      return sc;
+    }));
+  }, []);
+
+  const handleStepChange = useCallback((scenarioId: string, stepIndex: number, newValue: string) => {
     setScenarios(prev => prev.map(sc => {
       if (sc.id === scenarioId) {
         const newSteps = [...sc.steps];
         newSteps[stepIndex] = newValue;
-        return { ...sc, steps: newSteps };
+        return { ...sc, steps: newSteps, isSaved: false };
       }
       return sc;
     }));
-  };
+  }, []);
 
-  const handleAddStep = (scenarioId: string) => {
+  const handleAddStep = useCallback((scenarioId: string) => {
     setScenarios(prev => prev.map(sc => {
       if (sc.id === scenarioId) {
-        return { ...sc, steps: [...sc.steps, ""] };
+        return { ...sc, steps: [...sc.steps, ""], isSaved: false };
       }
       return sc;
     }));
-  };
+  }, []);
 
-  const handleDeleteStep = (scenarioId: string, stepIndex: number) => {
+  const handleDeleteStep = useCallback((scenarioId: string, stepIndex: number) => {
     setScenarios(prev => prev.map(sc => {
       if (sc.id === scenarioId) {
         const newSteps = sc.steps.filter((_, i) => i !== stepIndex);
-        return { ...sc, steps: newSteps };
+        return { ...sc, steps: newSteps, isSaved: false };
       }
       return sc;
     }));
-  };
+  }, []);
 
-  const allSelected = scenarios.length > 0 && selectedScenarioIds.size === scenarios.length;
-  const isIndeterminate = selectedScenarioIds.size > 0 && selectedScenarioIds.size < scenarios.length;
+  const allStepIds = useMemo(() => 
+    scenarios.flatMap(sc => sc.steps.map((_, index) => `${sc.id}-${index}`))
+  , [scenarios]);
+
+  const [openItems, setOpenItems] = useState(new Set<string>());
+
+  const toggleItem = (id: string) => {
+    setOpenItems(prev => {
+      const newSet = new Set(prev);
+      if (newSet.has(id)) {
+        newSet.delete(id);
+      } else {
+        newSet.add(id);
+      }
+      return newSet;
+    });
+  };
 
   // --- Render ---
   return (
@@ -323,46 +449,58 @@ export default function ScenariosPage() {
           {isLoading ? (
             <div className="flex items-center justify-center h-64"><Loader2 className="w-8 h-8 animate-spin text-slate-400" /><p className="ml-4 text-slate-500">AI is generating scenarios...</p></div>
           ) : scenarios.length > 0 ? (
-            <>
-              <div className="flex items-center gap-3 p-2 mb-2">
-                <Checkbox id="select-all" checked={allSelected} indeterminate={isIndeterminate} onCheckedChange={handleSelectAll} />
-                <Label htmlFor="select-all" className="font-semibold">{allSelected ? 'Unselect All' : 'Select All'}</Label>
-              </div>
-              <Accordion type="multiple" className="w-full">
-                {scenarios.map((scenario) => (
-                  <AccordionItem value={scenario.id} key={scenario.id}>
-                    <div className="flex items-center gap-3 p-2 hover:bg-white/5 rounded-lg">
-                      <Checkbox id={scenario.id} checked={selectedScenarioIds.has(scenario.id)} onCheckedChange={(checked) => handleSelectionChange(!!checked, scenario.id)} />
-                      <Label htmlFor={scenario.id} className="flex-1 cursor-pointer">
-                        <AccordionTrigger className="p-1 hover:no-underline">
-                          <div className="flex items-center gap-2">
-                            {scenario.type === 'ai' && <Bot className="w-5 h-5 text-primary"/>}
-                            {scenario.type === 'manual' && <User className="w-5 h-5 text-green-400"/>}
-                            {scenario.type === 'saved' && <Bookmark className="w-5 h-5 text-yellow-400"/>}
-                            <span className="font-semibold text-left">{scenario.title}</span>
-                          </div>
-                        </AccordionTrigger>
-                      </Label>
-                      <Button variant="ghost" size="icon" onClick={() => handleSaveSingleScenario(scenario)}>
-                        <Bookmark className="w-5 h-5 text-slate-400 hover:text-accent"/>
-                      </Button>
-                    </div>
-                    <AccordionContent className="pl-12 pb-2 text-slate-400">
-                      <p className="text-sm mb-2">{scenario.description}</p>
-                      <div className="space-y-2">
-                        {scenario.steps.map((step, index) => (
-                          <div key={index} className="flex items-center gap-2">
-                            <Input type="text" value={step} onChange={(e) => handleStepChange(scenario.id, index, e.target.value)} placeholder="Enter a test step" className="flex-grow font-mono text-sm h-9 bg-transparent"/>
-                            <Button variant="ghost" size="icon" onClick={() => handleDeleteStep(scenario.id, index)} aria-label="Delete step"><Trash2 className="w-4 h-4 text-red-500" /></Button>
-                          </div>
-                        ))}
+            <DndContext
+              sensors={sensors}
+              collisionDetection={closestCenter}
+              onDragEnd={handleDragEnd}
+            >
+              <SortableContext items={allStepIds} strategy={sortableKeyboardCoordinates}>
+                <div className="w-full border rounded-md">
+                  {scenarios.map((scenario) => (
+                    <div key={scenario.id} className="border-b last:border-b-0">
+                      <div className="flex items-center gap-2 p-2 hover:bg-white/5 rounded-lg">
+                        <Checkbox id={scenario.id} checked={selectedScenarioIds.has(scenario.id)} onCheckedChange={(checked) => handleSelectionChange(!!checked, scenario.id)} />
+                        <Button variant="ghost" size="icon" onClick={() => toggleItem(scenario.id)} className="text-slate-400">
+                          <ChevronDown className={`w-5 h-5 transition-transform transform ${openItems.has(scenario.id) ? '' : '-rotate-90'}`} />
+                        </Button>
+                        <div className="flex-1 flex items-center gap-2">
+                          {scenario.type === 'ai' && <Bot className="w-5 h-5 text-primary"/>}
+                          {scenario.type === 'manual' && <User className="w-5 h-5 text-green-400"/>}
+                          {scenario.type === 'saved' && <Bookmark className="w-5 h-5 text-yellow-400"/>}
+                          <Input 
+                            value={scenario.title} 
+                            onChange={(e) => handleTitleChange(scenario.id, e.target.value)} 
+                            className="font-semibold bg-transparent border-none focus:ring-1 focus:ring-primary p-1 h-auto"
+                          />
+                        </div>
+                        <Button variant="ghost" size="icon" onClick={() => handleSaveScenario(scenario)} title={scenario.isSaved ? "Scenario is saved" : "Save scenario to library"}>
+                          {scenario.isSaved 
+                            ? <CheckCircle className="w-5 h-5 text-green-500"/> 
+                            : <Bookmark className="w-5 h-5 text-slate-400 hover:text-accent"/>
+                          }
+                        </Button>
+                      </div>
+                      <div style={{ display: openItems.has(scenario.id) ? 'block' : 'none' }} className="pl-12 pb-2 text-slate-400">
+                        <p className="text-sm mb-2">{scenario.description}</p>
+                        <div className="space-y-2">
+                          {scenario.steps.map((step, index) => (
+                            <SortableStepItem
+                              key={`${scenario.id}-${index}`}
+                              scenarioId={scenario.id}
+                              index={index}
+                              step={step}
+                              handleStepChange={handleStepChange}
+                              handleDeleteStep={handleDeleteStep}
+                            />
+                          ))}
+                        </div>
                         <Button variant="outline" size="sm" onClick={() => handleAddStep(scenario.id)} className="mt-2"><PlusCircle className="w-4 h-4 mr-2"/> Add Step</Button>
                       </div>
-                    </AccordionContent>
-                  </AccordionItem>
-                ))}
-              </Accordion>
-            </>
+                    </div>
+                  ))}
+                </div>
+              </SortableContext>
+            </DndContext>
           ) : (
             <p className="text-sm text-slate-500 text-center py-10">The AI could not generate any scenarios for this URL.</p>
           )}

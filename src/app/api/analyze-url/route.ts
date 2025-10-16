@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import playwright from 'playwright-core';
 import chromium from '@sparticuz/chromium';
-import { azureAIService } from '@/lib/azure-ai';
+import { openAIService, PageContext } from '@/lib/openai';
 
 export async function POST(request: Request) {
   const { url } = await request.json();
@@ -29,8 +29,9 @@ export async function POST(request: Request) {
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: 'load', timeout: 60000 });
 
-    const pageInfo = await page.evaluate(() => {
-      const forms = Array.from(document.querySelectorAll('form')).map(form => ({
+    // Extract comprehensive page context
+    const pageContext: PageContext = await page.evaluate(() => {
+      const allForms = Array.from(document.querySelectorAll('form')).map(form => ({
         id: form.id,
         className: form.className,
         inputs: Array.from(form.querySelectorAll('input, textarea, select')).map(input => ({
@@ -40,7 +41,7 @@ export async function POST(request: Request) {
         })),
       }));
 
-      const navLinks = Array.from(document.querySelectorAll('nav a')).map(link => ({
+      const allNavLinks = Array.from(document.querySelectorAll('nav a')).map(link => ({
         href: (link as HTMLAnchorElement).href,
         text: link.textContent,
       }));
@@ -51,17 +52,26 @@ export async function POST(request: Request) {
         hasLoginForm: !!document.querySelector('form[id*="login"], form[class*="login"]'),
         hasContactForm: !!document.querySelector('form[id*="contact"], form[class*="contact"]'),
         hasSearchForm: !!document.querySelector('form[role="search"], form[action*="search"]'),
-        forms,
-        navLinks,
+        forms: allForms,
+        navLinks: allNavLinks,
       };
     });
 
-    const analysis = await azureAIService.analyzeWebPage(pageInfo);
+    // Generate scenarios directly using the extracted context
+    const scenarios = await openAIService.generateScenarios(pageContext);
 
-    return NextResponse.json(analysis);
+    return NextResponse.json(scenarios);
+
   } catch (error) {
-    console.error('Error analyzing URL:', error);
-    return NextResponse.json({ error: 'Failed to analyze URL' }, { status: 500 });
+    console.error('Error analyzing URL and generating scenarios:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return NextResponse.json(
+      { 
+        error: 'Failed to analyze URL and generate scenarios',
+        details: errorMessage
+      },
+      { status: 500 }
+    );
   } finally {
     if (browser) {
       await browser.close();

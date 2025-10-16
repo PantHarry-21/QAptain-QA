@@ -1,6 +1,6 @@
 import { Page } from 'playwright-core';
 import { faker } from '@faker-js/faker';
-import { azureAIService } from '@/lib/azure-ai';
+import { openAIService, PageContext } from '@/lib/openai';
 import { executeSingleCommand } from '@/lib/test-executor';
 
 async function findSubmitButton(page: Page, contextSelector: string) {
@@ -23,25 +23,6 @@ async function findSubmitButton(page: Page, contextSelector: string) {
         }
     }
     return null;
-}
-
-// Safely call a faker method based on the AI's mapping
-function getFakerDataFromMapping(mapping: { namespace: string; method: string; options?: any[] }): string {
-    try {
-        const { namespace, method, options = [] } = mapping;
-        const ns = faker[namespace as keyof typeof faker];
-        if (ns) {
-            const fn = ns[method as keyof typeof ns];
-            if (typeof fn === 'function') {
-                // @ts-ignore
-                return fn(...options);
-            }
-        }
-        return faker.lorem.word(); // Fallback for invalid mapping
-    } catch (e) {
-        console.error('Faker dispatch error:', e);
-        return faker.lorem.word();
-    }
 }
 
 export async function skillTestFormValidation(page: Page, contextSelector: string = 'body'): Promise<any> {
@@ -87,14 +68,29 @@ export async function skillTestFormValidation(page: Page, contextSelector: strin
     }
     const formToTest = formsData[0];
 
-    // 2. Generate the validation test plan from the AI
-    const testPlan = await azureAIService.generateFormValidationScenarios(formToTest);
-    const results = [];
+    // Construct a PageContext object for the new AI service
+    const pageContext: PageContext = {
+        title: await page.title(),
+        url: originalUrl,
+        hasLoginForm: false, // Context is limited to the form, so these are unknown
+        hasContactForm: false,
+        hasSearchForm: false,
+        forms: [{ id: formToTest.formId, className: '', inputs: formToTest.inputs.map(i => ({name: i.name, type: i.type, placeholder: i.placeholder})) }],
+        navLinks: [], // Not available in this limited context
+    };
 
+    // 2. Generate the validation test plan from the AI
+    const testPlan = await openAIService.generateScenarios(pageContext);
+    
+    // NOTE: The execution part of this skill has been temporarily disabled.
+    // The new `generateScenarios` method produces a different output format that is not compatible
+    // with the old execution logic. This section needs to be refactored.
+    const results: any[] = [];
+    /*
     // 3. Augment the Happy Path scenario with Faker data using the AI+Faker mapping
     const happyPathScenario = testPlan.scenarios.find((s: any) => s.title.toLowerCase().includes('happy path'));
     if (happyPathScenario) {
-        const fakerMappings = await azureAIService.generateFakerMappings(formToTest);
+        const fakerMappings = await openAIService.generateFakerMappings(formToTest);
         happyPathScenario.steps = formToTest.inputs.map(input => {
             const fieldName = input.label || input.name || input.placeholder;
             const mapping = fakerMappings[fieldName];
@@ -152,6 +148,7 @@ export async function skillTestFormValidation(page: Page, contextSelector: strin
             }
         });
     }
+    */
 
     return {
         testPlan,

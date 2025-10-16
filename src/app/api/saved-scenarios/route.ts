@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { databaseService } from '@/lib/database';
-import { azureAIService } from '@/lib/azure-ai';
+import { openAIService } from '@/lib/openai';
 
 /**
  * GET handler to fetch all saved scenarios.
@@ -20,24 +20,29 @@ export async function GET() {
 }
 
 /**
- * POST handler to create a new saved scenario by interpreting a user story.
+ * POST handler to create a new saved scenario.
+ * Can either interpret a user story to generate steps or accept a pre-defined title and user story.
  */
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { user_story, pageContext } = body;
+    const { user_story, pageContext, title: providedTitle, steps: providedSteps } = body;
 
     if (!user_story) {
       return NextResponse.json({ error: 'user_story is required' }, { status: 400 });
     }
 
-    const { steps } = await azureAIService.interpretScenario(user_story, pageContext || {});
+    let steps = providedSteps;
+    if (!steps || steps.length === 0) {
+      const interpretation = await openAIService.interpretScenario(user_story, pageContext || {});
+      steps = interpretation.steps;
+    }
 
     if (!steps || steps.length === 0) {
       return NextResponse.json({ error: "The AI couldn't determine any steps from your description." }, { status: 400 });
     }
 
-    const title = user_story.split('\n')[0];
+    const title = providedTitle || user_story.split('\n')[0];
 
     const newScenario = await databaseService.createSavedScenario({ title, user_story, steps });
 
@@ -80,6 +85,31 @@ export async function PUT(request: NextRequest) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     return NextResponse.json(
       { error: 'Failed to update saved scenario', details: errorMessage },
+      { status: 500 }
+    );
+  }
+}
+
+/**
+ * DELETE handler to remove a saved scenario.
+ */
+export async function DELETE(request: NextRequest) {
+  try {
+    const { searchParams } = new URL(request.url);
+    const id = searchParams.get('id');
+
+    if (!id) {
+      return NextResponse.json({ error: 'Scenario ID is required' }, { status: 400 });
+    }
+
+    await databaseService.deleteSavedScenario(id);
+
+    return NextResponse.json({ success: true, message: 'Scenario deleted successfully.' });
+  } catch (error) {
+    console.error('Error deleting saved scenario:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return NextResponse.json(
+      { error: 'Failed to delete saved scenario', details: errorMessage },
       { status: 500 }
     );
   }

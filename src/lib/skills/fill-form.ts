@@ -1,6 +1,6 @@
 import { Page } from 'playwright-core';
 import { faker } from '@faker-js/faker';
-import { azureAIService } from '@/lib/azure-ai';
+import { openAIService } from '@/lib/openai';
 
 /**
  * A skill that uses an AI to map form fields to Faker.js methods, then dynamically
@@ -61,7 +61,7 @@ export async function skillFillFormHappyPath(page: Page): Promise<void> {
     return;
   }
 
-  const fakerMappings = await azureAIService.generateFakerMappings(formInputs);
+  const fakerMappings = await openAIService.generateFakerMappings(formInputs);
 
   // 4. Iterate through mappings, generate data, and fill the form
   for (const fieldName in fakerMappings) {

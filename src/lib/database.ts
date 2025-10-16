@@ -409,6 +409,19 @@ export class DatabaseService {
     }
     return data;
   }
+
+  async deleteSavedScenario(id: string): Promise<boolean> {
+    const { error } = await supabase
+      .from('saved_scenarios')
+      .delete()
+      .eq('id', id);
+
+    if (error) {
+      console.error('Error deleting saved scenario:', error);
+      return false;
+    }
+    return true;
+  }
 }
 
 export const databaseService = new DatabaseService();

@@ -2,12 +2,13 @@ import playwright, { Page, Browser, Locator } from 'playwright-core';
 import chromium from '@sparticuz/chromium';
 import { v4 as uuidv4 } from 'uuid';
 import { databaseService } from '@/lib/database';
-import { azureAIService } from './azure-ai';
+import { openAIService } from './openai';
 import { TestLog } from '@/lib/supabase';
 import { Server } from 'socket.io';
 
 import { skillFillFormHappyPath } from './skills/fill-form';
 import { getDomContextSelector } from './utils';
+import { goldenScenarios } from './golden-scenarios';
 
 // --- Interfaces ---
 
@@ -32,44 +33,36 @@ interface CommandDefinition {
 // --- Helper Functions ---
 
 async function findLocator(page: Page, identifier: string): Promise<Locator> {
-    const cleanedIdentifier = identifier.replace(/\b(tab|button|link|page|the|field|input)\b/gi, '').trim();
+    const cleanedIdentifier = identifier.replace(/['"“”]/g, '').replace(/\b(tab|button|link|page|the|field|input)\b/gi, '').trim();
     const searchRegex = new RegExp(cleanedIdentifier.replace(/[.*+?^${}()|[\\]/g, '\\$&'), 'i');
 
-    const locators: Locator[] = [];
+    // --- Locator Priority List ---
+    // Tries locators in order of reliability. The first one that finds a visible element is used.
+    const strategies = [
+        () => page.getByRole('button', { name: searchRegex }),
+        () => page.getByRole('link', { name: searchRegex }),
+        () => page.getByLabel(searchRegex),
+        () => page.getByPlaceholder(searchRegex),
+        () => page.getByTestId(cleanedIdentifier),
+        () => page.getByText(searchRegex),
+        // Fallback for buttons that aren't properly labeled for accessibility
+        () => page.locator(`button:has-text("${cleanedIdentifier}")`),
+    ];
 
-    // If the identifier looks like a generic submission command, prioritize finding a button with type="submit"
-    if (/^(submit|sign in|log in|login|save|continue|next|go)$/i.test(identifier.trim())) {
-        locators.push(page.locator('[type="submit"]'));
-    }
-    
-    // Add CSS selector if it looks like one
-    if (identifier.startsWith('#') || identifier.startsWith('.')) {
-        locators.push(page.locator(identifier));
-    }
-
-    // Add all standard locators
-    locators.push(
-        page.getByRole('button', { name: searchRegex }),
-        page.getByRole('link', { name: searchRegex }),
-        page.getByRole('tab', { name: searchRegex }),
-        page.getByRole('checkbox', { name: searchRegex }),
-        page.getByRole('radio', { name: searchRegex }),
-        page.getByLabel(searchRegex),
-        page.getByPlaceholder(searchRegex),
-        page.getByText(searchRegex),
-        page.getByTestId(cleanedIdentifier),
-        page.getByTestId(identifier)
-    );
-
-    // Chain all locators with .or()
-    let combinedLocator = locators[0];
-    for (let i = 1; i < locators.length; i++) {
-        combinedLocator = combinedLocator.or(locators[i]);
+    for (const getLocator of strategies) {
+        const locator = getLocator();
+        // Use a short timeout to see if this strategy yields any results quickly.
+        // The .click() action itself will wait longer for the element to be actionable.
+        if (await locator.count() > 0) {
+            // Check if the first match is visible.
+            if (await locator.first().isVisible()) {
+                console.log(`Found visible element for "${cleanedIdentifier}" using a priority strategy.`);
+                return locator; // Return the locator group for this strategy
+            }
+        }
     }
 
-    // The action (.click, .fill) will handle visibility and auto-waiting.
-    // We return the first match from the combined set of locators.
-    return combinedLocator.first();
+    throw new Error(`Could not find a visible element matching "${identifier}" using any priority strategy.`);
 }
 
 
@@ -83,7 +76,7 @@ const commandDefinitions: CommandDefinition[] = [
     },
     // FILL command (generic) - This now uses a negative lookahead to avoid being too greedy
     {
-        regex: /^(?:Enter|Type|Fill|Input|Write)\s+['"]?(.+?)['"]?\s+into\s(?:the\s*)?(?!.*?\s(?:with|for)\s(?:placeholder|label|name|aria-label))['"]?(.+?)['"]?$/i,
+        regex: /^(?:Enter|Type|Fill|Input|Write)\s+["']?(.+?)["']?\s+(?:into|in)\s(?:the\s*)?(?!.*?\s(?:with|for)\s(?:placeholder|label|name|aria-label))["']?(.+?)["']?$/i,
         parser: m => ({ type: 'fill', value: m[1], target: m[2] })
     },
 
@@ -137,6 +130,10 @@ const commandDefinitions: CommandDefinition[] = [
 
     // ASSERTIONS — URL (Most specific)
     {
+        regex: /^(?:Verify|Assert|Check)\s+(?:that\s+)?(?:the\s+)?page\s+(?:url|address)\s+is\s+['"]?(.+?)['"]?$/i,
+        parser: m => ({ type: 'assertUrlIs', value: m[1] })
+    },
+    {
         regex: /^(?:Verify|Assert|Check)\s+(?:that\s+)?(?:the\s+)?page\s+(?:url|address)\s+contains\s+['"]?(.+?)['"]?$/i,
         parser: m => ({ type: 'assertUrlContains', value: m[1] })
     },
@@ -170,6 +167,11 @@ const commandDefinitions: CommandDefinition[] = [
         regex: /^(Check|Uncheck|Tick|Untick)\s*(?:the)?\s*(?:checkbox|option|toggle)?\s*['"]?(.+?)['"]?$/i,
         parser: m => ({ type: 'checkUncheck', action: m[1].toLowerCase(), target: m[2] })
     },
+    // ASSERTIONS —- VALIDITY
+    {
+        regex: /^(?:Verify|Assert|Check)\s+(?:that\s+)?(?:the\s*)?['"]?(.+?)['"]?\s*(?:field|input)?\s+is\s+(valid|invalid)$/i,
+        parser: m => ({ type: 'assertValidity', target: m[1], value: m[2] })
+    },
 ];
 
 function parseSingleCommand(step: string): ParsedCommand | null {
@@ -198,6 +200,7 @@ function parseStep(step: string): (ParsedCommand | null)[] {
 }
 
 export async function executeSingleCommand(command: ParsedCommand, page: Page, baseUrl: string, sessionId: string, scenarioId: string): Promise<void> {
+  console.log('Executing command:', command);
   // Add a small delay before each command
   await page.waitForTimeout(250);
 
@@ -221,8 +224,11 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
       break;
 
     case 'click':
-      const locator = await findLocator(page, command.target!); 
-      await locator.click({ timeout: 10000 });
+      const locator = await findLocator(page, command.target!);
+      // Removed `force: true` to ensure Playwright's actionability checks are performed.
+      // This prevents false positives where a click is reported on a non-interactive element.
+      // The click action now auto-waits for the element to be visible, stable, and enabled.
+      await locator.first().click({ timeout: 30000 });
       break;
 
     case 'press':
@@ -333,6 +339,17 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
       break;
     }
 
+    case 'assertValidity': {
+      const { target, value } = command;
+      const locator = await findLocator(page, target!); 
+      const isValid = await locator.evaluate(el => (el as HTMLInputElement).checkValidity());
+      const expectedValid = value === 'valid';
+      if (isValid !== expectedValid) {
+        throw new Error(`Expected input \"${target}\" to be ${value}, but it was not.`);
+      }
+      break;
+    }
+
     case 'login': {
         const emailField = await findLocator(page, 'email');
         await emailField.fill(command.username!); 
@@ -402,6 +419,23 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
     databaseService.createTestLog({ session_id: sessionId, ...fullLog });
   };
 
+  const processedScenarios = scenarios.map(scenario => {
+    const goldenMatch = goldenScenarios.find(golden => 
+      golden.title.toLowerCase() === scenario.title.toLowerCase()
+    );
+
+    if (goldenMatch) {
+      emitLog({ 
+        level: 'info', 
+        message: `Golden scenario matched: "${scenario.title}". Overriding AI-generated steps with predefined steps.`,
+        scenario_id: scenario.id 
+      });
+      return { ...scenario, steps: goldenMatch.steps };
+    }
+    
+    return scenario;
+  });
+
   const emitScreenshot = async (page: Page) => {
     try {
       const screenshot = await page.screenshot({ type: 'png' });
@@ -410,14 +444,14 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
   };
 
   let sessionResults = {
-    totalScenarios: scenarios.length,
+    totalScenarios: processedScenarios.length,
     passedScenarios: 0,
     failedScenarios: 0,
-    totalSteps: scenarios.reduce((sum, scenario) => sum + scenario.steps.length, 0),
+    totalSteps: processedScenarios.reduce((sum, scenario) => sum + scenario.steps.length, 0),
     passedSteps: 0,
     failedSteps: 0
   };
-  const scenarioIds = scenarios.map(s => s.id);
+  const scenarioIds = processedScenarios.map(s => s.id);
   await databaseService.updateTestSession(sessionId, { selected_scenario_ids: scenarioIds });
 
   try {
@@ -444,11 +478,11 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
     });
     const page = await context.newPage();
 
-    emitLog({ level: 'info', message: `Playwright browser initialized. Starting execution for ${scenarios.length} scenarios.` });
+    emitLog({ level: 'info', message: `Playwright browser initialized. Starting execution for ${processedScenarios.length} scenarios.` });
     await emitScreenshot(page);
 
-    for (let i = 0; i < scenarios.length; i++) {
-      const scenario = scenarios[i];
+    for (let i = 0; i < processedScenarios.length; i++) {
+      const scenario = processedScenarios[i];
       const scenarioStartTime = new Date();
       let scenarioPassed = true;
 
@@ -471,7 +505,7 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
         completedSteps++;
         io.to(sessionRoom).emit('test-progress', {
           currentScenario: i + 1,
-          totalScenarios: scenarios.length,
+          totalScenarios: processedScenarios.length,
           currentStep: completedSteps,
           totalSteps: sessionResults.totalSteps,
           currentScenarioTitle: scenario.title,
@@ -526,7 +560,7 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
               }
 
               emitLog({ level: 'info', message: `Engaging AI orchestrator with context: ${JSON.stringify(pageContext)}`, scenario_id: scenario.id });
-              const plan = await azureAIService.createWorkflowPlan(stepDescription, pageContext);
+              const plan = await openAIService.createWorkflowPlan(stepDescription, pageContext);
               emitLog({ level: 'info', message: `AI has generated a sub-plan: ${JSON.stringify(plan.plan)}`, scenario_id: scenario.id });
 
               for (const subStep of plan.plan) {
@@ -544,7 +578,7 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
                     break;
                   case 'TEST_FEATURE_COMPREHENSIVELY':
                     emitLog({ level: 'info', message: `Comprehensive test requested for "${subStep.target}". Generating sub-scenarios...`, scenario_id: scenario.id });
-                    const { scenarios: subScenarios } = await azureAIService.generateScenarios(pageContext);
+                    const { scenarios: subScenarios } = await openAIService.generateScenarios(pageContext);
                     emitLog({ level: 'info', message: `Generated ${subScenarios.length} sub-scenarios.` });
 
                     for (const subScenario of subScenarios) {
@@ -602,8 +636,7 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
               sessionResults.passedScenarios++;
               updatePayload = {
                 status: 'passed',
-                completed_at: new Date().toISOString(),
-                duration: scenarioDuration
+                completed_at: new Date().toISOString()
               };
               emitLog({ level: 'success', message: `✅ Scenario completed: "${scenario.title}"`, scenario_id: scenario.id });
             } else {
@@ -611,7 +644,6 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
               updatePayload = {
                 status: 'failed',
                 completed_at: new Date().toISOString(),
-                duration: scenarioDuration,
                 error_message: `Scenario failed due to step error.`
               };
               emitLog({ level: 'error', message: `❌ Scenario failed: "${scenario.title}"`, scenario_id: scenario.id });
@@ -625,7 +657,7 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
               // AI Analysis per scenario
               try {
                 const scenarioLogs = logs.filter(log => log.scenario_id === scenario.id);
-                const scenarioAnalysis = await azureAIService.analyzeScenario(scenario, scenarioLogs);
+                const scenarioAnalysis = await openAIService.analyzeScenario(scenario, scenarioLogs);
         
                 await databaseService.createScenarioReport({
                   scenario_id: scenario.id,
@@ -658,7 +690,7 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
       video_url: videoPath, 
     });
 
-    const aiReport = await azureAIService.generateTestAnalysis(
+    const aiReport = await openAIService.generateTestAnalysis(
       { ...sessionResults, status: 'completed', startTime: startTime.toISOString(), endTime: endTime.toISOString(), duration },
       logs,
       scenarios
