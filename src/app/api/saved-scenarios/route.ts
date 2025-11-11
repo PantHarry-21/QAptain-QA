@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { databaseService } from '@/lib/database';
 import { openAIService } from '@/lib/openai';
 import { getServerSession } from 'next-auth';
-import { authOptions } from '@/app/api/auth/[...nextauth]/route';
+import { getAuthOptions } from '@/lib/auth';
 
 export const dynamic = 'force-dynamic';
 
@@ -11,7 +11,7 @@ export const dynamic = 'force-dynamic';
  */
 export async function GET() {
   try {
-    const session = await getServerSession(authOptions);
+    const session = await getServerSession(getAuthOptions());
     if (!session || !session.user || !session.user.id) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
@@ -34,7 +34,7 @@ export async function GET() {
  */
 export async function POST(request: NextRequest) {
   try {
-    const session = await getServerSession(authOptions);
+    const session = await getServerSession(getAuthOptions());
     if (!session || !session.user || !session.user.id) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
@@ -80,7 +80,7 @@ export async function POST(request: NextRequest) {
  */
 export async function PUT(request: NextRequest) {
   try {
-    const session = await getServerSession(authOptions);
+    const session = await getServerSession(getAuthOptions());
     if (!session || !session.user || !session.user.id) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
@@ -120,7 +120,7 @@ export async function PUT(request: NextRequest) {
  */
 export async function DELETE(request: NextRequest) {
   try {
-    const session = await getServerSession(authOptions);
+    const session = await getServerSession(getAuthOptions());
     if (!session || !session.user || !session.user.id) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
