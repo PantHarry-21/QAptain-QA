@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { openAIService } from '@/lib/openai';
 
+export const dynamic = 'force-dynamic';
+
 export async function POST(request: NextRequest) {
   try {
     const { description, url } = await request.json();

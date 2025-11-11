@@ -3,6 +3,8 @@ import playwright, { Browser } from 'playwright-core';
 import chromium from '@sparticuz/chromium';
 import { openAIService } from '@/lib/openai';
 
+export const dynamic = 'force-dynamic';
+
 export async function POST(request: NextRequest) {
   let browser: Browser | null = null;
   try {

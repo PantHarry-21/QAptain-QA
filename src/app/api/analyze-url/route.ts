@@ -3,6 +3,8 @@ import playwright from 'playwright-core';
 import chromium from '@sparticuz/chromium';
 import { openAIService, PageContext } from '@/lib/openai';
 
+export const dynamic = 'force-dynamic';
+
 export async function POST(request: Request) {
   const { url } = await request.json();
 

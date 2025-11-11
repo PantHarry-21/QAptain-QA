@@ -4,6 +4,8 @@ import { openAIService } from '@/lib/openai';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/app/api/auth/[...nextauth]/route';
 
+export const dynamic = 'force-dynamic';
+
 /**
  * GET handler to fetch all saved scenarios for the logged-in user.
  */

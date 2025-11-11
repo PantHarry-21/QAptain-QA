@@ -4,6 +4,8 @@ import chromium from '@sparticuz/chromium';
 import { openAIService, PageContext } from '@/lib/openai';
 import { executeSingleCommand } from '@/lib/test-executor'; // We might need to refactor this
 
+export const dynamic = 'force-dynamic';
+
 // Helper to find the submit button
 async function findSubmitButton(page: Page) {
     const buttonSelectors = [
