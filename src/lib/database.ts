@@ -382,10 +382,29 @@ export class DatabaseService {
     return data;
   }
 
-  async getAllSavedScenarios(): Promise<SavedScenario[]> {
+  async getSavedScenario(id: string, userId: string): Promise<SavedScenario | null> {
     const { data, error } = await supabase
       .from('saved_scenarios')
       .select('*')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (error) {
+      // Don't log an error if the scenario is simply not found
+      if (error.code !== 'PGRST116') { // PGRST116 = "exact one row not found"
+        console.error('Error fetching saved scenario:', error);
+      }
+      return null;
+    }
+    return data;
+  }
+
+  async getAllSavedScenarios(userId: string): Promise<SavedScenario[]> {
+    const { data, error } = await supabase
+      .from('saved_scenarios')
+      .select('*')
+      .eq('user_id', userId)
       .order('created_at', { ascending: false });
 
     if (error) {

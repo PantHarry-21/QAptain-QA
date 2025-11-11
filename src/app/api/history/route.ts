@@ -1,8 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { supabase } from '@/lib/supabase';
+import { getServerSession } from 'next-auth';
+import { authOptions } from '../auth/[...nextauth]/route';
 
 export async function GET(request: NextRequest) {
   try {
+    const session = await getServerSession(authOptions);
+    if (!session || !session.user || !session.user.id) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
     const { searchParams } = new URL(request.url);
     const page = parseInt(searchParams.get('page') || '1', 10);
     const limit = parseInt(searchParams.get('limit') || '10', 10);
@@ -15,27 +22,19 @@ export async function GET(request: NextRequest) {
 
     let query = supabase
       .from('test_sessions')
-      .select('*', { count: 'exact' });
+      .select('*', { count: 'exact' })
+      .eq('user_id', session.user.id);
 
-    // Apply search query if it exists
     if (searchQuery) {
-      // Assuming 'name' is a column you want to search on. 
-      // The user can provide a name for a test session.
-      // Also searching by id.
       query = query.or(`name.ilike.%${searchQuery}%,id::text.eq.${searchQuery}`);
     }
 
-    // Apply sorting
     query = query.order(sortBy, { ascending: order === 'asc' });
-
-    // Apply pagination
     query = query.range(from, to);
 
     const { data, error, count } = await query;
 
-    if (error) {
-      throw error;
-    }
+    if (error) throw error;
 
     return NextResponse.json({
       success: true,
@@ -52,10 +51,7 @@ export async function GET(request: NextRequest) {
     console.error('Error fetching test history:', error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     return NextResponse.json(
-      { 
-        error: 'Failed to fetch test history',
-        details: errorMessage
-      },
+      { error: 'Failed to fetch test history', details: errorMessage },
       { status: 500 }
     );
   }
@@ -63,6 +59,11 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
+    const session = await getServerSession(authOptions);
+    if (!session || !session.user || !session.user.id) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
     const { sessionId, url, scenarios } = await request.json();
 
     if (!sessionId || !url || !scenarios) {
@@ -71,6 +72,7 @@ export async function POST(request: NextRequest) {
 
     const newSession = {
       id: sessionId,
+      user_id: session.user.id, // Associate with the logged-in user
       url: url,
       status: 'pending',
       total_scenarios: scenarios.length,
@@ -89,33 +91,24 @@ export async function POST(request: NextRequest) {
       .select()
       .single();
 
-    if (error) {
-      throw new Error(error.message);
-    }
+    if (error) throw new Error(error.message);
 
-    // Insert scenarios
     const newScenarios = scenarios.map((scenario: any) => ({
       id: scenario.id,
       session_id: sessionId,
       title: scenario.title,
       description: scenario.description || '',
-      priority: scenario.priority || 'medium',
-      category: scenario.category || 'custom',
       steps: scenario.steps,
-      estimated_time: scenario.estimatedTime || 'unknown',
       status: 'pending',
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
-      is_custom: true,
     }));
 
     const { error: scenariosError } = await supabase
       .from('test_scenarios')
       .insert(newScenarios);
 
-    if (scenariosError) {
-      throw new Error(scenariosError.message);
-    }
+    if (scenariosError) throw new Error(scenariosError.message);
 
     return NextResponse.json({ success: true, session: data });
 
@@ -123,10 +116,7 @@ export async function POST(request: NextRequest) {
     console.error('Error creating test session:', error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     return NextResponse.json(
-      { 
-        error: 'Failed to create test session',
-        details: errorMessage
-      },
+      { error: 'Failed to create test session', details: errorMessage },
       { status: 500 }
     );
   }

@@ -8,12 +8,14 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Label } from "@/components/ui/label";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Loader2, Globe, Zap, BarChart3, Play } from "lucide-react";
+import { useSession } from 'next-auth/react';
 
 export default function Home() {
   const [url, setUrl] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState("");
   const router = useRouter();
+  const { status } = useSession();
 
   const validateUrl = (inputUrl: string) => {
     try {
@@ -27,6 +29,11 @@ export default function Home() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+
+    if (status === 'unauthenticated') {
+      router.push('/login?error=Please log in to start a test.');
+      return;
+    }
 
     if (!url.trim()) {
       setError("Please enter a URL");

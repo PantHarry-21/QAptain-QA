@@ -1,13 +1,15 @@
 'use client';
 
 import { useState, useEffect } from "react";
+import { useSession } from "next-auth/react";
+import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Input } from "@/components/ui/input";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
-import { Loader2, Save, Bot, Trash2, PlusCircle } from "lucide-react";
+import { Loader2, Save, Bot, Trash2, PlusCircle, LogIn } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { motion } from "framer-motion";
 
@@ -37,16 +39,21 @@ export default function SavedScenariosPage() {
   const [title, setTitle] = useState("");
   const [userStory, setUserStory] = useState("");
   const [savedScenarios, setSavedScenarios] = useState<SavedScenario[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState("");
   const { toast } = useToast();
+  const { data: session, status } = useSession();
 
   const fetchSavedScenarios = async () => {
     setIsLoading(true);
+    setError("");
     try {
       const response = await fetch('/api/saved-scenarios');
-      if (!response.ok) throw new Error('Failed to fetch scenarios');
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || 'Failed to fetch scenarios');
+      }
       const data = await response.json();
       setSavedScenarios(data.data || []);
     } catch (err) {
@@ -57,8 +64,12 @@ export default function SavedScenariosPage() {
   };
 
   useEffect(() => {
-    fetchSavedScenarios();
-  }, []);
+    if (status === 'authenticated') {
+      fetchSavedScenarios();
+    } else if (status === 'unauthenticated') {
+      setIsLoading(false);
+    }
+  }, [status]);
 
   const handleCreateScenario = async () => {
     if (!title.trim() || !userStory.trim()) {
@@ -80,7 +91,7 @@ export default function SavedScenariosPage() {
       toast({ title: "Scenario Saved", description: "Your new scenario has been successfully saved." });
       setTitle("");
       setUserStory("");
-      fetchSavedScenarios();
+      await fetchSavedScenarios();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An unknown error occurred');
     } finally {
@@ -118,7 +129,7 @@ export default function SavedScenariosPage() {
       }
 
       toast({ title: "Scenario Deleted", description: "The scenario has been permanently removed." });
-      fetchSavedScenarios(); // Refresh the list
+      await fetchSavedScenarios();
     } catch (err) {
       toast({ variant: 'destructive', title: 'Error', description: err instanceof Error ? err.message : 'Could not delete scenario.' });
     }
@@ -153,6 +164,32 @@ export default function SavedScenariosPage() {
       return sc;
     }));
   };
+
+  if (status === 'loading' || isLoading) {
+    return (
+      <div className="container mx-auto px-4 py-8 flex items-center justify-center" style={{ height: 'calc(100vh - 8rem)' }}>
+        <Loader2 className="w-16 h-16 animate-spin text-primary" />
+      </div>
+    );
+  }
+
+  if (status === 'unauthenticated') {
+    return (
+      <div className="container mx-auto px-4 py-8 flex flex-col items-center justify-center text-center" style={{ height: 'calc(100vh - 8rem)' }}>
+        <Card className="max-w-md">
+          <CardHeader>
+            <CardTitle className="flex items-center justify-center gap-2"><LogIn className="w-6 h-6"/> Authentication Required</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="mb-4 text-slate-400">Please log in to manage your saved scenarios.</p>
+            <Button asChild>
+              <Link href="/login">Log In</Link>
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
 
   return (
     <div className="container mx-auto px-4 py-8">
@@ -190,9 +227,7 @@ export default function SavedScenariosPage() {
           <CardDescription>Edit the steps of any scenario and save your changes.</CardDescription>
         </CardHeader>
         <CardContent>
-          {isLoading ? (
-            <div className="flex items-center justify-center h-40"><Loader2 className="w-8 h-8 animate-spin text-slate-400" /></div>
-          ) : savedScenarios.length > 0 ? (
+          {savedScenarios.length > 0 ? (
             <motion.div
               variants={containerVariants}
               initial="hidden"

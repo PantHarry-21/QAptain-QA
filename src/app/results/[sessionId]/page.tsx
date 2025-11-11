@@ -505,7 +505,7 @@ export default function ResultsPage() {
                   <div>
                     <h3 className="text-lg font-semibold mb-2 flex items-center gap-2"><Lightbulb className="w-5 h-5" />Key Findings</h3>
                     <ul className="list-disc pl-5 space-y-1 text-slate-700 dark:text-slate-300">
-                      {(report.key_findings ?? []).map((finding: string, index: number) => (
+                      {(Array.isArray(report.key_findings) ? report.key_findings : (report.key_findings ? [report.key_findings] : [])).map((finding: string, index: number) => (
                         <li key={index}>{finding}</li>
                       ))}
                     </ul>
@@ -513,7 +513,7 @@ export default function ResultsPage() {
                   <div>
                     <h3 className="text-lg font-semibold mb-2 flex items-center gap-2"><ShieldAlert className="w-5 h-5" />Recommendations</h3>
                     <ul className="list-disc pl-5 space-y-1 text-slate-700 dark:text-slate-300">
-                      {(report.recommendations ?? []).map((rec: string, index: number) => (
+                      {(Array.isArray(report.recommendations) ? report.recommendations : (report.recommendations ? [report.recommendations] : [])).map((rec: string, index: number) => (
                         <li key={index}>{rec}</li>
                       ))}
                     </ul>
@@ -552,13 +552,7 @@ export default function ResultsPage() {
                         </div>
                         <div>
                           <h4 className="font-semibold">Issues</h4>
-                          {scenarioReport.issues.length > 0 ? (
-                            <ul className="list-disc pl-5">
-                              {Array.isArray(scenarioReport.issues) ? scenarioReport.issues.map((issue: string, i: number) => <li key={i}>{issue}</li>) : <p>No issues found.</p>}
-                            </ul>
-                          ) : (
-                            <p>No issues found.</p>
-                          )}
+                          {Array.isArray(scenarioReport.issues) ? scenarioReport.issues.map((issue: string, i: number) => <li key={i}>{issue}</li>) : (scenarioReport.issues ? <li>{scenarioReport.issues}</li> : <p>No issues found.</p>)}
                         </div>
                         <div>
                           <h4 className="font-semibold">Recommendations</h4>
@@ -567,7 +561,7 @@ export default function ResultsPage() {
                               {scenarioReport.recommendations.map((rec: string, i: number) => <li key={i}>{rec}</li>)}
                             </ul>
                           ) : (
-                            <p>No recommendations.</p>
+                            <p>{scenarioReport.recommendations || 'No recommendations.'}</p>
                           )}
                         </div>
                       </div>

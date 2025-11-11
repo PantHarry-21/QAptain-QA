@@ -1,6 +1,3 @@
-import dotenv from 'dotenv';
-dotenv.config();
-
 import { createClient } from '@supabase/supabase-js';
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
@@ -98,17 +95,35 @@ export interface TestReport {
 
 export interface User {
   id: string;
+  first_name?: string;
+  last_name?: string;
   email: string;
+  password?: string;
+  email_verified?: string;
+  activation_token?: string;
+  image?: string;
   created_at: string;
   updated_at: string;
-  subscription_tier: 'free' | 'pro' | 'enterprise';
+  subscription_tier?: 'free' | 'pro' | 'enterprise';
 }
 
 export interface SavedScenario {
   id: string;
+  user_id: string;
   created_at: string;
   url: string;
   title: string;
   user_story: string;
   steps: string[];
+}
+
+export interface ScenarioReport {
+  id: string;
+  scenario_id: string;
+  session_id: string;
+  summary: string;
+  status: 'passed' | 'failed';
+  steps_details: any[]; // or a more specific type
+  created_at: string;
+  updated_at: string;
 }

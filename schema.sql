@@ -144,3 +144,53 @@ COMMENT ON TABLE test_logs IS 'Aggregates all logs (info, errors, screenshots) f
 COMMENT ON TABLE test_reports IS 'Stores the final AI-generated analysis for a completed test session.';
 COMMENT ON TABLE scenario_reports IS 'Stores AI-generated analysis for each individual scenario.';
 COMMENT ON TABLE saved_scenarios IS 'Stores reusable test scenarios created by users.';
+
+-- 8. users Table
+CREATE TABLE IF NOT EXISTS users (
+    id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+    first_name TEXT,
+    last_name TEXT,
+    email TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
+    email_verified TIMESTAMPTZ,
+    activation_token TEXT,
+    image TEXT,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- 9. accounts Table
+CREATE TABLE IF NOT EXISTS accounts (
+  id uuid NOT NULL DEFAULT uuid_generate_v4(),
+  "userId" uuid NOT NULL,
+  type text NOT NULL,
+  provider text NOT NULL,
+  "providerAccountId" text NOT NULL,
+  refresh_token text NULL,
+  access_token text NULL,
+  expires_at int8 NULL,
+  token_type text NULL,
+  scope text NULL,
+  id_token text NULL,
+  session_state text NULL,
+  CONSTRAINT accounts_pkey PRIMARY KEY (id),
+  CONSTRAINT "accounts_userId_fkey" FOREIGN KEY ("userId") REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- 10. sessions Table
+CREATE TABLE IF NOT EXISTS sessions (
+  id uuid NOT NULL DEFAULT uuid_generate_v4(),
+  "sessionToken" text NOT NULL,
+  "userId" uuid NOT NULL,
+  expires timestamptz NOT NULL,
+  CONSTRAINT sessions_pkey PRIMARY KEY (id),
+  CONSTRAINT "sessions_userId_fkey" FOREIGN KEY ("userId") REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- 11. verification_tokens Table
+CREATE TABLE IF NOT EXISTS verification_tokens (
+  token text NOT NULL,
+  identifier text NOT NULL,
+  expires timestamptz NOT NULL,
+  CONSTRAINT verification_tokens_pkey PRIMARY KEY (token)
+);

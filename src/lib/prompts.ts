@@ -131,18 +131,24 @@ export const prompts = {
   /**
    * Prompt to interpret a user's natural language story into executable steps.
    */
-  interpretScenario: (userStory: string, pageContext: any) => `
-    You are an expert test automation engineer. Your task is to convert a user's natural language instructions into a precise, step-by-step test script formatted as a JSON object.
-
-    User Story: "${userStory}"
-
+  interpretScenario: (userStory: string, pageContext: any) => {
+    let contextString = '';
+    if (pageContext && Object.keys(pageContext).length > 0) {
+      contextString = `
     Page Context (Visible Elements):
     - Buttons: [${pageContext.visibleButtons?.join(", ") || "None"}]
     - Links: [${pageContext.visibleLinks?.join(", ") || "None"}]
     - Inputs/Labels: [${pageContext.formInputs
         ?.map((i: any) => i.label || i.name || i.placeholder)
         .join(", ") || "None"}]
+      `;
+    }
 
+    return `
+    You are an expert test automation engineer. Your task is to convert a user's natural language instructions into a precise, step-by-step test script formatted as a JSON object.
+
+    User Story: "${userStory}"
+    ${contextString}
     **CRITICAL INSTRUCTIONS:**
     1.  **Output Format:** You MUST return a single JSON object with one key: "steps". The value MUST be an array of strings.
     2.  **Atomicity:** Each string in the array MUST be a single, precise, executable command. Do NOT combine actions into one step.
@@ -201,7 +207,7 @@ export const prompts = {
     ---
 
     Now, generate the JSON object for the provided User Story and Page Context.
-  `,
+  `},
 
   /**
    * Prompt to create a high-level workflow plan from a user command.

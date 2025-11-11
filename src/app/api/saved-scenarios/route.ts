@@ -1,13 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { databaseService } from '@/lib/database';
 import { openAIService } from '@/lib/openai';
+import { getServerSession } from 'next-auth';
+import { authOptions } from '@/app/api/auth/[...nextauth]/route';
 
 /**
- * GET handler to fetch all saved scenarios.
+ * GET handler to fetch all saved scenarios for the logged-in user.
  */
 export async function GET() {
   try {
-    const savedScenarios = await databaseService.getAllSavedScenarios();
+    const session = await getServerSession(authOptions);
+    if (!session || !session.user || !session.user.id) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const savedScenarios = await databaseService.getAllSavedScenarios(session.user.id);
     return NextResponse.json({ success: true, data: savedScenarios });
   } catch (error) {
     console.error('Error fetching saved scenarios:', error);
@@ -20,11 +27,16 @@ export async function GET() {
 }
 
 /**
- * POST handler to create a new saved scenario.
+ * POST handler to create a new saved scenario for the logged-in user.
  * Can either interpret a user story to generate steps or accept a pre-defined title and user story.
  */
 export async function POST(request: NextRequest) {
   try {
+    const session = await getServerSession(authOptions);
+    if (!session || !session.user || !session.user.id) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
     const body = await request.json();
     const { user_story, pageContext, title: providedTitle, steps: providedSteps } = body;
 
@@ -44,7 +56,7 @@ export async function POST(request: NextRequest) {
 
     const title = providedTitle || user_story.split('\n')[0];
 
-    const newScenario = await databaseService.createSavedScenario({ title, user_story, steps });
+    const newScenario = await databaseService.createSavedScenario({ title, user_story, steps, user_id: session.user.id });
 
     if (!newScenario) {
       return NextResponse.json({ success: true, message: 'Scenario already exists.', data: null });
@@ -66,11 +78,22 @@ export async function POST(request: NextRequest) {
  */
 export async function PUT(request: NextRequest) {
   try {
+    const session = await getServerSession(authOptions);
+    if (!session || !session.user || !session.user.id) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
     const body = await request.json();
     const { id, steps, title, user_story } = body;
 
     if (!id || !steps) {
       return NextResponse.json({ error: 'Scenario ID and steps are required' }, { status: 400 });
+    }
+
+    const existingScenario = await databaseService.getSavedScenario(id, session.user.id);
+
+    if (!existingScenario) {
+      return NextResponse.json({ error: 'Scenario not found or unauthorized' }, { status: 404 });
     }
 
     const updatedScenario = await databaseService.updateSavedScenario(id, { steps, title, user_story });
@@ -95,11 +118,22 @@ export async function PUT(request: NextRequest) {
  */
 export async function DELETE(request: NextRequest) {
   try {
+    const session = await getServerSession(authOptions);
+    if (!session || !session.user || !session.user.id) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
     const { searchParams } = new URL(request.url);
     const id = searchParams.get('id');
 
     if (!id) {
       return NextResponse.json({ error: 'Scenario ID is required' }, { status: 400 });
+    }
+
+    const existingScenario = await databaseService.getSavedScenario(id, session.user.id);
+
+    if (!existingScenario) {
+      return NextResponse.json({ error: 'Scenario not found or unauthorized' }, { status: 404 });
     }
 
     await databaseService.deleteSavedScenario(id);
