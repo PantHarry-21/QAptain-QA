@@ -7,7 +7,6 @@ import bcrypt from "bcrypt"
 
 export const dynamic = 'force-dynamic'
 
-const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 export const authOptions = {
   providers: [
@@ -18,6 +17,7 @@ export const authOptions = {
         password: {  label: "Password", type: "password" }
       },
       async authorize(credentials) {
+        const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
         if (!credentials?.email || !credentials?.password) {
           return null
         }
