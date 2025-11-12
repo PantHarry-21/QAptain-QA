@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "tsx server.ts",
     "build": "next build",
-    "start": "NODE_ENV=production tsx server.ts 2>&1",
+    "start": "next start",
     "lint": "next lint",
     "postinstall": "node scripts/download-chromium.mjs"
   },
