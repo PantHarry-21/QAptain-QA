@@ -1,5 +1,4 @@
 import type { NextConfig } from "next";
-import { SpeedInsights } from "@vercel/speed-insights/next"
 
 const withBundleAnalyzer = require('@next/bundle-analyzer')({
   enabled: process.env.ANALYZE === 'true',
