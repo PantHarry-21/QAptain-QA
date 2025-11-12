@@ -2,7 +2,6 @@
 import { SupabaseAdapter } from "@next-auth/supabase-adapter"
 import CredentialsProvider from "next-auth/providers/credentials"
 import { createClient } from "@supabase/supabase-js"
-import bcrypt from "bcrypt"
 import { NextAuthOptions } from "next-auth"
 
 export const getAuthOptions = (): NextAuthOptions => {
@@ -20,30 +19,19 @@ export const getAuthOptions = (): NextAuthOptions => {
             return null
           }
 
-          const { data: user, error } = await supabase
-            .from("users")
-            .select("*")
-            .eq("email", credentials.email)
-            .single()
+          const { data, error } = await supabase.auth.signInWithPassword({
+            email: credentials.email,
+            password: credentials.password,
+          })
 
-          if (error || !user) {
+          if (error || !data.user) {
             return null
-          }
-
-          const isValid = await bcrypt.compare(credentials.password, user.password)
-
-          if (!isValid) {
-            return null
-          }
-
-          if (!user.email_verified) {
-              throw new Error("Email not verified")
           }
 
           return {
-              id: user.id,
-              email: user.email,
-              name: `${user.first_name} ${user.last_name}`,
+              id: data.user.id,
+              email: data.user.email,
+              name: data.user.user_metadata.full_name,
           }
         }
       })

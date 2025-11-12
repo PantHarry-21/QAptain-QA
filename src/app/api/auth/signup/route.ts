@@ -1,8 +1,6 @@
 
 import { NextResponse } from 'next/server'
-import bcrypt from 'bcrypt'
 import { createClient } from '@supabase/supabase-js'
-import { v4 as uuidv4 } from 'uuid'
 
 export const dynamic = 'force-dynamic'
 
@@ -16,41 +14,26 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'All fields are required' }, { status: 400 })
     }
 
-    // Check if user already exists
-    const { data: existingUser, error: findError } = await supabase
-      .from('users')
-      .select('id')
-      .eq('email', email)
-      .single()
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        data: {
+          first_name: firstName,
+          last_name: lastName,
+        },
+      },
+    })
 
-    if (existingUser) {
-      return NextResponse.json({ error: 'User with this email already exists' }, { status: 409 })
+    if (error) {
+      console.error('Supabase sign up error:', error)
+      return NextResponse.json({ error: error.message }, { status: error.status || 500 })
+    }
+    
+    if (data.user && data.user.identities && data.user.identities.length === 0) {
+        return NextResponse.json({ error: 'User with this email already exists' }, { status: 409 })
     }
 
-    const hashedPassword = await bcrypt.hash(password, 10)
-    const activationToken = uuidv4()
-
-    const { data: newUser, error: insertError } = await supabase
-      .from('users')
-      .insert({
-        first_name: firstName,
-        last_name: lastName,
-        email,
-        password: hashedPassword,
-        activation_token: activationToken,
-        email_verified: null, // Will be set to timestamp upon activation
-      })
-      .select()
-      .single()
-
-    if (insertError) {
-      console.error('Error inserting new user:', insertError)
-      return NextResponse.json({ error: 'Failed to create user' }, { status: 500 })
-    }
-
-    // In a real application, you would send an email with this link
-    const activationLink = `${process.env.NEXTAUTH_URL}/api/auth/activate/${activationToken}`
-    console.log(`Activation Link for ${email}: ${activationLink}`)
 
     return NextResponse.json({ message: 'User registered successfully. Please check your email for activation link.' }, { status: 201 })
   } catch (error) {
