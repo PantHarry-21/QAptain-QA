@@ -1,56 +1,102 @@
+// app/api/auth/activate/[token]/route.ts
+import "server-only";
+import { NextResponse } from "next/server";
 
-import { NextResponse } from 'next/server'
-import { createClient } from '@supabase/supabase-js'
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+export const fetchCache = "force-no-store";
+export const runtime = "nodejs";
 
-export const dynamic = 'force-dynamic'
+function getSupabaseAdmin() {
+  const url = process.env.SUPABASE_URL;
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !serviceKey) return null;
 
-const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
+  // Lazy import to avoid module-scope side effects during build
+  // and to keep this route Node-runtime friendly.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { createClient } = require("@supabase/supabase-js");
+  return createClient(url, serviceKey);
+}
 
-export async function GET(req: Request, context: { params: { token: string } }) {
+export async function GET(
+  req: Request,
+  context: { params: { token?: string } }
+) {
   try {
-    const params = await context.params;
-    const { token } = params;
+    const token = context.params?.token ?? "";
 
     if (!token) {
-      return NextResponse.redirect(new URL('/login?error=Activation token missing', req.url))
+      return NextResponse.redirect(
+        new URL("/login?error=Activation token missing", req.url)
+      );
     }
 
+    const supabase = getSupabaseAdmin();
+    if (!supabase) {
+      // Don’t throw at build/import time—return a runtime error instead
+      return NextResponse.redirect(
+        new URL(
+          "/login?error=Server misconfigured (SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing)",
+          req.url
+        )
+      );
+    }
+
+    // Look up the user by activation token
     const { data: user, error: findError } = await supabase
-      .from('users')
-      .select('*')
-      .eq('activation_token', token)
-      .single()
+      .from("users")
+      .select("*")
+      .eq("activation_token", token)
+      .single();
 
     if (findError || !user) {
-      console.error('Activation error: User not found or token invalid', findError)
-      return NextResponse.redirect(new URL('/login?error=Invalid or expired activation link', req.url))
+      console.error("Activation error: User not found or token invalid", findError);
+      return NextResponse.redirect(
+        new URL("/login?error=Invalid or expired activation link", req.url)
+      );
     }
 
-    // Check if already verified
+    // Already verified?
     if (user.email_verified) {
-      return NextResponse.redirect(new URL('/login?message=Account already activated. Please log in.', req.url))
+      return NextResponse.redirect(
+        new URL(
+          "/login?message=Account already activated. Please log in.",
+          req.url
+        )
+      );
     }
 
-    // Activate user
-    console.log(`Attempting to activate user ID: ${user.id} with email: ${user.email}`);
+    // Activate user (clear token + mark timestamp)
+    console.log(
+      `Attempting to activate user ID: ${user.id} with email: ${user.email}`
+    );
     const { error: updateError } = await supabase
-      .from('users')
+      .from("users")
       .update({
         email_verified: new Date().toISOString(),
-        activation_token: null, // Clear the token after activation
+        activation_token: null,
       })
-      .eq('id', user.id)
+      .eq("id", user.id);
 
     if (updateError) {
-      console.error('Error updating user for activation:', updateError);
-      console.error('Supabase update error details:', updateError.message, updateError.details, updateError.hint);
-      return NextResponse.redirect(new URL('/login?error=Failed to activate account', req.url));
+      console.error("Error updating user for activation:", updateError);
+      return NextResponse.redirect(
+        new URL("/login?error=Failed to activate account", req.url)
+      );
     }
-    console.log(`Successfully activated user ID: ${user.id}`);
 
-    return NextResponse.redirect(new URL('/login?message=Account activated successfully! You can now log in.', req.url))
+    console.log(`Successfully activated user ID: ${user.id}`);
+    return NextResponse.redirect(
+      new URL(
+        "/login?message=Account activated successfully! You can now log in.",
+        req.url
+      )
+    );
   } catch (error) {
-    console.error('Activation API error:', error)
-    return NextResponse.redirect(new URL('/login?error=Internal server error', req.url))
+    console.error("Activation API error:", error);
+    return NextResponse.redirect(
+      new URL("/login?error=Internal server error", req.url)
+    );
   }
 }
