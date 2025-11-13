@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
 import { Home, FileText, History, BarChart3, Bot, Settings } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { cn } from "@/lib/utils.client";
 
 const navItems = [
   { href: "/", icon: Home, label: "Dashboard" },

@@ -5,7 +5,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Bot, X, Sparkles, Send } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { cn } from "@/lib/utils";
+import { cn } from "@/lib/utils.client";
 
 export function AssistantPanel() {
   const [isOpen, setIsOpen] = useState(true);

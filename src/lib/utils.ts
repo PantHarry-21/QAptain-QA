@@ -1,10 +1,4 @@
-import { type ClassValue, clsx } from "clsx"
-import { twMerge } from "tailwind-merge"
 import { Page } from 'playwright-core';
-
-export function cn(...inputs: ClassValue[]) {
-  return twMerge(clsx(inputs))
-}
 
 export async function getDomContextSelector(page: Page): Promise<string> {
     return await page.evaluate(() => {
