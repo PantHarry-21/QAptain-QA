@@ -25,6 +25,12 @@ export async function GET(
   req: Request,
   context: { params: { token?: string } }
 ) {
+  // During Next.js build (page data collection), avoid any runtime logic.
+  // Return a trivial OK so the build doesn't fail.
+  const phase = process.env.NEXT_PHASE;
+  if (phase === "phase-production-build" || phase === "phase-development-build") {
+    return new Response("OK", { status: 200 });
+  }
   try {
     const url = new URL(req.url);
     const token = context.params?.token || url.searchParams.get("token") || "";
