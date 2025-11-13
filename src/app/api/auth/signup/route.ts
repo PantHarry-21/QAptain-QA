@@ -50,6 +50,10 @@ export async function POST(req: Request) {
     }
 
     // 1) Sign up via ANON key (correct for auth flows)
+    // Get the base URL - use NEXTAUTH_URL in production, or fallback to request origin
+    // This ensures production uses https://qaptain.vercel.app instead of localhost
+    const baseUrl = process.env.NEXTAUTH_URL || new URL(req.url).origin;
+    
     const { data, error } = await supabase.auth.signUp({
       email,
       password,
@@ -58,7 +62,9 @@ export async function POST(req: Request) {
           first_name: firstName,
           last_name: lastName,
         },
-        // emailRedirectTo: `${new URL(req.url).origin}/auth/callback`, // if you use Supabase email confirm
+        // Configure email redirect URL - Supabase will append token as query param
+        // This fixes the localhost issue in production emails
+        emailRedirectTo: `${baseUrl}/api/auth/activate`,
       },
     });
 
