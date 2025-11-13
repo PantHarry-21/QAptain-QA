@@ -1,16 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
 
-/**
- * Determines if we're running in production environment
- */
-function isProduction(): boolean {
-  return (
-    process.env.NODE_ENV === 'production' ||
-    process.env.VERCEL_ENV === 'production' ||
-    !!process.env.VERCEL
-  );
-}
-
 function isClient(): boolean {
   return typeof window !== 'undefined';
 }
@@ -24,23 +13,21 @@ export function getSupabaseUrl(): string {
   if (isClient()) {
     return process.env.NEXT_PUBLIC_SUPABASE_URL || '';
   }
-  if (isProduction()) {
-    return (
-      // Accept multiple possible production variable names
-      process.env.PRODUCTION_NEXT_SUPABASE_URL ||
-      process.env.PRODUCTION_PUBLIC_SUPABASE_URL ||
-      process.env.PRODUCTION_NEXT_PUBLIC_SUPABASE_URL ||
-      process.env.PRODUCTION_SUPABASE_URL ||
-      process.env.NEXT_PUBLIC_SUPABASE_URL ||
-      process.env.SUPABASE_URL ||
-      ''
-    );
+
+  const candidates = [
+    'PRODUCTION_NEXT_SUPABASE_URL',
+    'PRODUCTION_PUBLIC_SUPABASE_URL',
+    'PRODUCTION_NEXT_PUBLIC_SUPABASE_URL',
+    'PRODUCTION_SUPABASE_URL',
+    'SUPABASE_URL',
+    'NEXT_PUBLIC_SUPABASE_URL',
+  ];
+
+  for (const key of candidates) {
+    const value = process.env[key];
+    if (value) return value;
   }
-  return (
-    process.env.NEXT_PUBLIC_SUPABASE_URL ||
-    process.env.SUPABASE_URL ||
-    ''
-  );
+  return '';
 }
 
 /**
@@ -52,15 +39,19 @@ export function getSupabaseAnonKey(): string {
   if (isClient()) {
     return process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
   }
-  if (isProduction()) {
-    return (
-      process.env.PRODUCTION_PUBLIC_SUPABASE_ANON_KEY ||
-      process.env.PRODUCTION_NEXT_PUBLIC_SUPABASE_ANON_KEY ||
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
-      ''
-    );
+
+  const candidates = [
+    'PRODUCTION_PUBLIC_SUPABASE_ANON_KEY',
+    'PRODUCTION_NEXT_PUBLIC_SUPABASE_ANON_KEY',
+    'SUPABASE_ANON_KEY',
+    'NEXT_PUBLIC_SUPABASE_ANON_KEY',
+  ];
+
+  for (const key of candidates) {
+    const value = process.env[key];
+    if (value) return value;
   }
-  return process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
+  return '';
 }
 
 /**
@@ -69,16 +60,16 @@ export function getSupabaseAnonKey(): string {
  * Local: Uses SUPABASE_SERVICE_ROLE_KEY
  */
 export function getSupabaseServiceRoleKey(): string {
-  if (isProduction()) {
-    return (
-      process.env.PRODUCTION_SUPABASE_SERVICE_ROLE_KEY ||
-      // allow alternative naming too
-      process.env.PRODUCTION_SUPABASE_SERVICE_ROLE_KEY ||
-      process.env.SUPABASE_SERVICE_ROLE_KEY ||
-      ''
-    );
+  const candidates = [
+    'PRODUCTION_SUPABASE_SERVICE_ROLE_KEY',
+    'SUPABASE_SERVICE_ROLE_KEY',
+  ];
+
+  for (const key of candidates) {
+    const value = process.env[key];
+    if (value) return value;
   }
-  return process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+  return '';
 }
 
 // Lazily create Supabase client only when credentials are present
