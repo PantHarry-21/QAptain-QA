@@ -1,7 +1,7 @@
 // app/api/auth/activate/[token]/route.ts
 import "server-only";
 import { NextResponse } from "next/server";
-import { getSupabaseUrl, getSupabaseServiceRoleKey } from "@/lib/supabase";
+import { getSupabaseUrl, getSupabaseServiceRoleKey } from "../../../../../lib/supabase";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;

@@ -1,7 +1,7 @@
 // app/api/auth/signup/route.ts
 import "server-only";
 import { NextResponse } from "next/server";
-import { getSupabaseUrl, getSupabaseAnonKey, getSupabaseServiceRoleKey } from "@/lib/supabase";
+import { getSupabaseUrl, getSupabaseAnonKey, getSupabaseServiceRoleKey } from "../../../../lib/supabase";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -63,9 +63,9 @@ export async function POST(req: Request) {
           first_name: firstName,
           last_name: lastName,
         },
-        // Configure email redirect URL - Supabase will append token as query param
-        // This fixes the localhost issue in production emails
-        emailRedirectTo: `${baseUrl}/api/auth/activate`,
+        // Configure email redirect to a client route so Supabase's hash fragment is handled in browser
+        // Supabase will confirm the email before redirecting
+        emailRedirectTo: `${baseUrl}/login`,
       },
     });
 

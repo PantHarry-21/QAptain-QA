@@ -19,6 +19,9 @@ function isProduction(): boolean {
 export function getSupabaseUrl(): string {
   if (isProduction()) {
     return (
+      // Accept multiple possible production variable names
+      process.env.PRODUCTION_NEXT_SUPABASE_URL ||
+      process.env.PRODUCTION_PUBLIC_SUPABASE_URL ||
       process.env.PRODUCTION_NEXT_PUBLIC_SUPABASE_URL ||
       process.env.PRODUCTION_SUPABASE_URL ||
       process.env.NEXT_PUBLIC_SUPABASE_URL ||
@@ -41,6 +44,7 @@ export function getSupabaseUrl(): string {
 export function getSupabaseAnonKey(): string {
   if (isProduction()) {
     return (
+      process.env.PRODUCTION_PUBLIC_SUPABASE_ANON_KEY ||
       process.env.PRODUCTION_NEXT_PUBLIC_SUPABASE_ANON_KEY ||
       process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
       ''
@@ -57,6 +61,8 @@ export function getSupabaseAnonKey(): string {
 export function getSupabaseServiceRoleKey(): string {
   if (isProduction()) {
     return (
+      process.env.PRODUCTION_SUPABASE_SERVICE_ROLE_KEY ||
+      // allow alternative naming too
       process.env.PRODUCTION_SUPABASE_SERVICE_ROLE_KEY ||
       process.env.SUPABASE_SERVICE_ROLE_KEY ||
       ''
