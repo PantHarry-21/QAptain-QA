@@ -1,8 +1,9 @@
-// app/api/env-check/route.ts
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+
 export async function GET() {
   const ok = (k: string) => Boolean(process.env[k]);
+
   const keys = [
     "NEXTAUTH_URL",
     "NEXTAUTH_SECRET",
@@ -29,3 +30,4 @@ export async function GET() {
     headers: { "content-type": "application/json" },
   });
 }
+
