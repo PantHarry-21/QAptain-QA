@@ -11,6 +11,14 @@ export const fetchCache = "force-no-store";
 export const runtime = "nodejs";
 
 function getHandler() {
+  // During Next.js build (page data collection), avoid initializing NextAuth
+  // or validating env. Return a trivial handler so build doesn't fail.
+  // NEXT_PHASE is set by Next.js during build (e.g., 'phase-production-build').
+  const phase = process.env.NEXT_PHASE;
+  if (phase === "phase-production-build" || phase === "phase-development-build") {
+    return (req: Request) => new Response("OK", { status: 200 });
+  }
+
   const options = getAuthOptions();
   // Validate NEXTAUTH_SECRET at runtime (not build time)
   if (!options.secret && process.env.NODE_ENV === "production") {
