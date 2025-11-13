@@ -75,13 +75,9 @@ export const getAuthOptions = (): NextAuthOptions => {
     console.warn("[auth] SupabaseAdapter disabled: missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
   }
 
-  // NEXTAUTH_SECRET is required in production
+  // NEXTAUTH_SECRET validation is handled at runtime in the route handler
+  // to avoid build-time errors
   const secret = get("NEXTAUTH_SECRET");
-  if (!secret && process.env.NODE_ENV === "production") {
-    throw new Error(
-      "NEXTAUTH_SECRET is required in production. Please set it in your environment variables."
-    );
-  }
 
   return {
     secret: secret || undefined,
