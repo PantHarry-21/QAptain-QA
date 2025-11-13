@@ -1,66 +1,103 @@
+import type { NextAuthOptions } from "next-auth";
+import CredentialsProvider from "next-auth/providers/credentials";
+import { createClient } from "@supabase/supabase-js";
+import { SupabaseAdapter } from "@next-auth/supabase-adapter";
 
-import { SupabaseAdapter } from "@next-auth/supabase-adapter"
-import CredentialsProvider from "next-auth/providers/credentials"
-import { createClient } from "@supabase/supabase-js"
-import { NextAuthOptions } from "next-auth"
+/** helpers: never throw at module scope */
+const has = (k: string) => Boolean(process.env[k]);
+const get = (k: string, fallback = "") => process.env[k] ?? fallback;
+const warnMissing = (k: string) => {
+  if (!has(k)) console.warn(`[auth] Missing env: ${k}`);
+};
 
+/**
+ * Build-safe NextAuth options for v4.
+ * - Adapter is optional and added only when required envs exist
+ * - Credentials uses SUPABASE_URL + NEXT_PUBLIC_SUPABASE_ANON_KEY (NOT service role)
+ */
 export const getAuthOptions = (): NextAuthOptions => {
-  return {
-    providers: [
-      CredentialsProvider({
-        name: "Credentials",
-        credentials: {
-          email: { label: "Email", type: "text" },
-          password: {  label: "Password", type: "password" }
-        },
-        async authorize(credentials) {
-          const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
-          if (!credentials?.email || !credentials?.password) {
-            return null
-          }
+  // Soft validations (warn only)
+  ["NEXTAUTH_SECRET", "NEXTAUTH_URL", "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY"].forEach(
+    warnMissing
+  );
 
-          const { data, error } = await supabase.auth.signInWithPassword({
-            email: credentials.email,
-            password: credentials.password,
-          })
+  /** Credentials provider (server-only) */
+  const providers = [
+    CredentialsProvider({
+      name: "Credentials",
+      credentials: {
+        email: { label: "Email", type: "text" },
+        password: { label: "Password", type: "password" },
+      },
+      async authorize(credentials) {
+        const SUPABASE_URL = get("SUPABASE_URL");
+        const SUPABASE_ANON_KEY = get("NEXT_PUBLIC_SUPABASE_ANON_KEY");
 
-          if (error || !data.user) {
-            return null
-          }
-
-          return {
-              id: data.user.id,
-              email: data.user.email,
-              name: data.user.user_metadata.full_name,
-          }
+        if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+          console.warn("[auth] Missing SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY in authorize()");
+          return null;
         }
-      })
-    ],
-    adapter: SupabaseAdapter({
-      url: process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      secret: process.env.SUPABASE_SERVICE_ROLE_KEY!,
+        if (!credentials?.email || !credentials?.password) return null;
+
+        // Use ANON key for user auth flows
+        const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+        const { data, error } = await supabase.auth.signInWithPassword({
+          email: credentials.email,
+          password: credentials.password,
+        });
+
+        if (error || !data?.user) return null;
+
+        return {
+          id: data.user.id,
+          email: data.user.email,
+          name: (data.user.user_metadata as any)?.full_name ?? data.user.email ?? "User",
+        };
+      },
     }),
-    session: {
-      strategy: "jwt",
-    },
+  ];
+
+  /** Optional Supabase adapter (requires service role) */
+  const SUPABASE_URL = get("SUPABASE_URL");
+  const SUPABASE_SERVICE_ROLE_KEY = get("SUPABASE_SERVICE_ROLE_KEY");
+  const adapter =
+    SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+      ? (SupabaseAdapter({
+          url: SUPABASE_URL,
+          secret: SUPABASE_SERVICE_ROLE_KEY,
+        }) as any)
+      : undefined;
+
+  if (!adapter) {
+    console.warn("[auth] SupabaseAdapter disabled: missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  }
+
+  return {
+    secret: get("NEXTAUTH_SECRET") || undefined,
+    adapter,
+    providers: providers as any,
+    session: { strategy: "jwt" },
     callbacks: {
       async session({ session, token }) {
-        session.user.id = token.sub
-        session.accessToken = token.accessToken
-        return session
+        // @ts-expect-error - augmenting session
+        session.user.id = token.sub;
+        // @ts-expect-error - custom field
+        session.accessToken = (token as any).accessToken;
+        return session;
       },
       async jwt({ token, user, account }) {
-        if (account) {
-          token.accessToken = account.access_token
+        if (account?.access_token) {
+          (token as any).accessToken = account.access_token;
         }
-        if (user) {
-          token.id = user.id
+        if (user?.id) {
+          (token as any).id = user.id;
         }
-        return token
-      }
+        return token;
+      },
     },
     pages: {
-      signIn: '/login',
+      signIn: "/login",
     },
-  }
-}
+  };
+};
