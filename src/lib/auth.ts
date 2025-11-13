@@ -30,11 +30,12 @@ export const getAuthOptions = (): NextAuthOptions => {
         password: { label: "Password", type: "password" },
       },
       async authorize(credentials) {
-        const SUPABASE_URL = get("SUPABASE_URL");
+        // Use SUPABASE_URL if available, fallback to NEXT_PUBLIC_SUPABASE_URL (same value)
+        const SUPABASE_URL = get("SUPABASE_URL") || get("NEXT_PUBLIC_SUPABASE_URL");
         const SUPABASE_ANON_KEY = get("NEXT_PUBLIC_SUPABASE_ANON_KEY");
 
         if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-          console.warn("[auth] Missing SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY in authorize()");
+          console.warn("[auth] Missing SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL) or NEXT_PUBLIC_SUPABASE_ANON_KEY in authorize()");
           return null;
         }
         if (!credentials?.email || !credentials?.password) return null;
@@ -59,7 +60,8 @@ export const getAuthOptions = (): NextAuthOptions => {
   ];
 
   /** Optional Supabase adapter (requires service role) */
-  const SUPABASE_URL = get("SUPABASE_URL");
+  // Use SUPABASE_URL if available, fallback to NEXT_PUBLIC_SUPABASE_URL (same value)
+  const SUPABASE_URL = get("SUPABASE_URL") || get("NEXT_PUBLIC_SUPABASE_URL");
   const SUPABASE_SERVICE_ROLE_KEY = get("SUPABASE_SERVICE_ROLE_KEY");
   const adapter =
     SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
@@ -73,8 +75,16 @@ export const getAuthOptions = (): NextAuthOptions => {
     console.warn("[auth] SupabaseAdapter disabled: missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
   }
 
+  // NEXTAUTH_SECRET is required in production
+  const secret = get("NEXTAUTH_SECRET");
+  if (!secret && process.env.NODE_ENV === "production") {
+    throw new Error(
+      "NEXTAUTH_SECRET is required in production. Please set it in your environment variables."
+    );
+  }
+
   return {
-    secret: get("NEXTAUTH_SECRET") || undefined,
+    secret: secret || undefined,
     adapter,
     providers: providers as any,
     session: { strategy: "jwt" },

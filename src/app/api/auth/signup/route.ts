@@ -9,7 +9,8 @@ export const runtime = "nodejs";
 
 // Lazy helpers (no module-scope env access or clients)
 function getSupabaseAnon() {
-  const url = process.env.SUPABASE_URL;
+  // Use SUPABASE_URL if available, fallback to NEXT_PUBLIC_SUPABASE_URL (same value)
+  const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
   const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
   if (!url || !anon) return null;
   // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -18,7 +19,8 @@ function getSupabaseAnon() {
 }
 
 function getSupabaseAdmin() {
-  const url = process.env.SUPABASE_URL;
+  // Use SUPABASE_URL if available, fallback to NEXT_PUBLIC_SUPABASE_URL (same value)
+  const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
   const service = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !service) return null;
   // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -42,7 +44,7 @@ export async function POST(req: Request) {
     const supabase = getSupabaseAnon();
     if (!supabase) {
       return NextResponse.json(
-        { error: "Server misconfigured: SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY missing" },
+        { error: "Server misconfigured: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL) or NEXT_PUBLIC_SUPABASE_ANON_KEY missing" },
         { status: 500 }
       );
     }
