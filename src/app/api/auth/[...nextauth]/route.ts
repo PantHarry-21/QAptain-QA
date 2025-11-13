@@ -1,7 +1,8 @@
 
 import "server-only";
-import NextAuth from "next-auth"
-import { getAuthOptions } from "./../../../../lib/auth"
+import NextAuth from "next-auth";
+import { NextResponse } from "next/server";
+import { getAuthOptions } from "./../../../../lib/auth";
 
 // Stop static analysis / caching and prefer Node
 export const dynamic = "force-dynamic";
@@ -13,19 +14,25 @@ function getHandler() {
   const options = getAuthOptions();
   // Validate NEXTAUTH_SECRET at runtime (not build time)
   if (!options.secret && process.env.NODE_ENV === "production") {
-    throw new Error(
-      "NEXTAUTH_SECRET is required in production. Please set it in your environment variables."
+    return NextResponse.json(
+      {
+        error:
+          "NEXTAUTH_SECRET is required in production. Please set it in your environment variables.",
+      },
+      { status: 500 }
     );
   }
   return NextAuth(options);
 }
 
-export async function GET(req: Request, context: any) {
+export async function GET(req: Request) {
   const handler = getHandler();
-  return handler(req, context);
+  if (handler instanceof NextResponse) return handler;
+  return handler(req);
 }
 
-export async function POST(req: Request, context: any) {
+export async function POST(req: Request) {
   const handler = getHandler();
-  return handler(req, context);
+  if (handler instanceof NextResponse) return handler;
+  return handler(req);
 }

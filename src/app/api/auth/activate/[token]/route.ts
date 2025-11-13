@@ -1,6 +1,7 @@
 // app/api/auth/activate/[token]/route.ts
 import "server-only";
 import { NextResponse } from "next/server";
+import { getSupabaseUrl, getSupabaseServiceRoleKey } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -8,9 +9,9 @@ export const fetchCache = "force-no-store";
 export const runtime = "nodejs";
 
 function getSupabaseAdmin() {
-  // Use SUPABASE_URL if available, fallback to NEXT_PUBLIC_SUPABASE_URL (same value)
-  const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  // Use environment-aware Supabase credentials
+  const url = getSupabaseUrl();
+  const serviceKey = getSupabaseServiceRoleKey();
   if (!url || !serviceKey) return null;
 
   // Lazy import to avoid module-scope side effects during build
@@ -36,10 +37,10 @@ export async function GET(
 
     const supabase = getSupabaseAdmin();
     if (!supabase) {
-      // Don’t throw at build/import time—return a runtime error instead
+      // Don't throw at build/import time—return a runtime error instead
       return NextResponse.redirect(
         new URL(
-          "/login?error=Server misconfigured (SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing)",
+          "/login?error=Server misconfigured: Supabase credentials missing. Please check your environment variables.",
           req.url
         )
       );

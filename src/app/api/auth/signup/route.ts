@@ -1,6 +1,7 @@
 // app/api/auth/signup/route.ts
 import "server-only";
 import { NextResponse } from "next/server";
+import { getSupabaseUrl, getSupabaseAnonKey, getSupabaseServiceRoleKey } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -9,9 +10,9 @@ export const runtime = "nodejs";
 
 // Lazy helpers (no module-scope env access or clients)
 function getSupabaseAnon() {
-  // Use SUPABASE_URL if available, fallback to NEXT_PUBLIC_SUPABASE_URL (same value)
-  const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  // Use environment-aware Supabase credentials
+  const url = getSupabaseUrl();
+  const anon = getSupabaseAnonKey();
   if (!url || !anon) return null;
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { createClient } = require("@supabase/supabase-js");
@@ -19,9 +20,9 @@ function getSupabaseAnon() {
 }
 
 function getSupabaseAdmin() {
-  // Use SUPABASE_URL if available, fallback to NEXT_PUBLIC_SUPABASE_URL (same value)
-  const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const service = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  // Use environment-aware Supabase credentials
+  const url = getSupabaseUrl();
+  const service = getSupabaseServiceRoleKey();
   if (!url || !service) return null;
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { createClient } = require("@supabase/supabase-js");
@@ -44,7 +45,7 @@ export async function POST(req: Request) {
     const supabase = getSupabaseAnon();
     if (!supabase) {
       return NextResponse.json(
-        { error: "Server misconfigured: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL) or NEXT_PUBLIC_SUPABASE_ANON_KEY missing" },
+        { error: "Server misconfigured: Supabase credentials missing. Please check your environment variables." },
         { status: 500 }
       );
     }

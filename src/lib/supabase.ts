@@ -1,10 +1,77 @@
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+/**
+ * Determines if we're running in production environment
+ */
+function isProduction(): boolean {
+  return (
+    process.env.NODE_ENV === 'production' ||
+    process.env.VERCEL_ENV === 'production' ||
+    !!process.env.VERCEL
+  );
+}
+
+/**
+ * Gets the appropriate Supabase URL based on environment
+ * Production: Uses PRODUCTION_NEXT_PUBLIC_SUPABASE_URL or PRODUCTION_SUPABASE_URL
+ * Local: Uses NEXT_PUBLIC_SUPABASE_URL or SUPABASE_URL
+ */
+export function getSupabaseUrl(): string {
+  if (isProduction()) {
+    return (
+      process.env.PRODUCTION_NEXT_PUBLIC_SUPABASE_URL ||
+      process.env.PRODUCTION_SUPABASE_URL ||
+      process.env.NEXT_PUBLIC_SUPABASE_URL ||
+      process.env.SUPABASE_URL ||
+      ''
+    );
+  }
+  return (
+    process.env.NEXT_PUBLIC_SUPABASE_URL ||
+    process.env.SUPABASE_URL ||
+    ''
+  );
+}
+
+/**
+ * Gets the appropriate Supabase Anon Key based on environment
+ * Production: Uses PRODUCTION_NEXT_PUBLIC_SUPABASE_ANON_KEY
+ * Local: Uses NEXT_PUBLIC_SUPABASE_ANON_KEY
+ */
+export function getSupabaseAnonKey(): string {
+  if (isProduction()) {
+    return (
+      process.env.PRODUCTION_NEXT_PUBLIC_SUPABASE_ANON_KEY ||
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
+      ''
+    );
+  }
+  return process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
+}
+
+/**
+ * Gets the appropriate Supabase Service Role Key based on environment
+ * Production: Uses PRODUCTION_SUPABASE_SERVICE_ROLE_KEY
+ * Local: Uses SUPABASE_SERVICE_ROLE_KEY
+ */
+export function getSupabaseServiceRoleKey(): string {
+  if (isProduction()) {
+    return (
+      process.env.PRODUCTION_SUPABASE_SERVICE_ROLE_KEY ||
+      process.env.SUPABASE_SERVICE_ROLE_KEY ||
+      ''
+    );
+  }
+  return process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+}
+
+// Get credentials based on environment
+const supabaseUrl = getSupabaseUrl();
+const supabaseAnonKey = getSupabaseAnonKey();
 
 // Only log in development to avoid exposing sensitive info
 if (process.env.NODE_ENV === 'development') {
+  console.log('Environment:', isProduction() ? 'Production' : 'Local');
   console.log('Supabase URL:', supabaseUrl ? 'Set' : 'Missing');
   console.log('Supabase Anon Key:', supabaseAnonKey ? 'Set' : 'Missing');
 }

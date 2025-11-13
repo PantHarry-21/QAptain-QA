@@ -2,6 +2,7 @@ import type { NextAuthOptions } from "next-auth";
 import CredentialsProvider from "next-auth/providers/credentials";
 import { createClient } from "@supabase/supabase-js";
 import { SupabaseAdapter } from "@next-auth/supabase-adapter";
+import { getSupabaseUrl, getSupabaseAnonKey, getSupabaseServiceRoleKey } from "./supabase";
 
 /** helpers: never throw at module scope */
 const has = (k: string) => Boolean(process.env[k]);
@@ -30,12 +31,12 @@ export const getAuthOptions = (): NextAuthOptions => {
         password: { label: "Password", type: "password" },
       },
       async authorize(credentials) {
-        // Use SUPABASE_URL if available, fallback to NEXT_PUBLIC_SUPABASE_URL (same value)
-        const SUPABASE_URL = get("SUPABASE_URL") || get("NEXT_PUBLIC_SUPABASE_URL");
-        const SUPABASE_ANON_KEY = get("NEXT_PUBLIC_SUPABASE_ANON_KEY");
+        // Use environment-aware Supabase credentials
+        const SUPABASE_URL = getSupabaseUrl();
+        const SUPABASE_ANON_KEY = getSupabaseAnonKey();
 
         if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-          console.warn("[auth] Missing SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL) or NEXT_PUBLIC_SUPABASE_ANON_KEY in authorize()");
+          console.warn("[auth] Missing Supabase credentials in authorize()");
           return null;
         }
         if (!credentials?.email || !credentials?.password) return null;
@@ -60,9 +61,9 @@ export const getAuthOptions = (): NextAuthOptions => {
   ];
 
   /** Optional Supabase adapter (requires service role) */
-  // Use SUPABASE_URL if available, fallback to NEXT_PUBLIC_SUPABASE_URL (same value)
-  const SUPABASE_URL = get("SUPABASE_URL") || get("NEXT_PUBLIC_SUPABASE_URL");
-  const SUPABASE_SERVICE_ROLE_KEY = get("SUPABASE_SERVICE_ROLE_KEY");
+  // Use environment-aware Supabase credentials
+  const SUPABASE_URL = getSupabaseUrl();
+  const SUPABASE_SERVICE_ROLE_KEY = getSupabaseServiceRoleKey();
   const adapter =
     SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
       ? (SupabaseAdapter({
