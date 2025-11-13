@@ -11,12 +11,19 @@ function isProduction(): boolean {
   );
 }
 
+function isClient(): boolean {
+  return typeof window !== 'undefined';
+}
+
 /**
  * Gets the appropriate Supabase URL based on environment
- * Production: Uses PRODUCTION_NEXT_PUBLIC_SUPABASE_URL or PRODUCTION_SUPABASE_URL
- * Local: Uses NEXT_PUBLIC_SUPABASE_URL or SUPABASE_URL
+ * - CLIENT: Only NEXT_PUBLIC_* variables are available
+ * - SERVER: Supports your PRODUCTION_* naming plus standard fallbacks
  */
 export function getSupabaseUrl(): string {
+  if (isClient()) {
+    return process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+  }
   if (isProduction()) {
     return (
       // Accept multiple possible production variable names
@@ -38,10 +45,13 @@ export function getSupabaseUrl(): string {
 
 /**
  * Gets the appropriate Supabase Anon Key based on environment
- * Production: Uses PRODUCTION_NEXT_PUBLIC_SUPABASE_ANON_KEY
- * Local: Uses NEXT_PUBLIC_SUPABASE_ANON_KEY
+ * - CLIENT: Only NEXT_PUBLIC_* variables are available
+ * - SERVER: Supports your PRODUCTION_* naming plus standard fallbacks
  */
 export function getSupabaseAnonKey(): string {
+  if (isClient()) {
+    return process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
+  }
   if (isProduction()) {
     return (
       process.env.PRODUCTION_PUBLIC_SUPABASE_ANON_KEY ||
