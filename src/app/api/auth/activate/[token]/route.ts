@@ -25,7 +25,8 @@ export async function GET(
   context: { params: { token?: string } }
 ) {
   try {
-    const token = context.params?.token ?? "";
+    const url = new URL(req.url);
+    const token = context.params?.token || url.searchParams.get("token") || "";
 
     if (!token) {
       return NextResponse.redirect(
