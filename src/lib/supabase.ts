@@ -81,23 +81,69 @@ export function getSupabaseServiceRoleKey(): string {
   return process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 }
 
-// Get credentials based on environment
-const supabaseUrl = getSupabaseUrl();
-const supabaseAnonKey = getSupabaseAnonKey();
+// Lazily create Supabase client only when credentials are present
+type SupabaseClientType = ReturnType<typeof createClient>;
 
-// Only log in development to avoid exposing sensitive info
-if (process.env.NODE_ENV === 'development') {
-  console.log('Environment:', isProduction() ? 'Production' : 'Local');
-  console.log('Supabase URL:', supabaseUrl ? 'Set' : 'Missing');
-  console.log('Supabase Anon Key:', supabaseAnonKey ? 'Set' : 'Missing');
+const phase = process.env.NEXT_PHASE;
+const isBuildPhase =
+  phase === "phase-production-build" || phase === "phase-development-build";
+
+let cachedSupabase: SupabaseClientType | null = null;
+
+function initSupabaseClient(): SupabaseClientType | null {
+  if (isBuildPhase) {
+    return null;
+  }
+
+  const supabaseUrl = getSupabaseUrl();
+  const supabaseAnonKey = getSupabaseAnonKey();
+
+  if (!supabaseUrl || !supabaseAnonKey) {
+    if (process.env.NODE_ENV === 'development' && !isClient()) {
+      console.warn(
+        '[supabase] Missing Supabase credentials. URL set:',
+        Boolean(supabaseUrl),
+        'Anon key set:',
+        Boolean(supabaseAnonKey)
+      );
+    }
+    return null;
+  }
+
+  return createClient(supabaseUrl, supabaseAnonKey);
 }
 
-// Create client with fallback to empty strings to prevent crashes
-// The client will fail gracefully when used if env vars are missing
-export const supabase = createClient(
-  supabaseUrl || '',
-  supabaseAnonKey || ''
-);
+export function getSupabaseClient(): SupabaseClientType | null {
+  if (!cachedSupabase) {
+    cachedSupabase = initSupabaseClient();
+  }
+  return cachedSupabase;
+}
+
+function requireSupabaseClient(): SupabaseClientType {
+  const client = getSupabaseClient();
+  if (!client) {
+    throw new Error(
+      'Supabase client not initialized. Ensure Supabase credentials are set.'
+    );
+  }
+  return client;
+}
+
+// Backwards compatibility export for modules that import { supabase }
+export const supabase = new Proxy(
+  {},
+  {
+    get(_target, prop, receiver) {
+      const client = requireSupabaseClient();
+      const value = (client as any)[prop];
+      if (typeof value === 'function') {
+        return value.bind(client);
+      }
+      return value;
+    },
+  }
+) as SupabaseClientType;
 
 // Database types
 export interface TestSession {
