@@ -16,7 +16,6 @@
     "@dnd-kit/sortable": "^8.0.0",
     "@dnd-kit/utilities": "^3.2.2",
     "@hookform/resolvers": "^5.1.1",
-
     "@next-auth/supabase-adapter": "^0.2.1",
     "@next/bundle-analyzer": "^15.5.4",
     "@playwright/test": "^1.56.0",
@@ -60,7 +59,6 @@
     "axios": "^1.10.0",
     "cheerio": "^1.1.2",
     "class-variance-authority": "^0.7.1",
-    "client": "^0.0.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
     "date-fns": "^4.1.0",
@@ -92,7 +90,6 @@
     "react-syntax-highlighter": "^15.6.6",
     "recharts": "^2.15.4",
     "sharp": "^0.34.3",
-    "socket-io": "^1.0.0",
     "socket.io": "^4.8.1",
     "socket.io-client": "^4.8.1",
     "sonner": "^2.0.6",
