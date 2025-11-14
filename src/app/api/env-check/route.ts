@@ -19,6 +19,13 @@ export async function GET() {
     "NEXT_PUBLIC_SUPABASE_ANON_KEY",
     "PRODUCTION_SUPABASE_SERVICE_ROLE_KEY",
     "SUPABASE_SERVICE_ROLE_KEY",
+    // Neon database variables
+    "QAPTAIN_URL",
+    "QAPTAIN_ANON_KEY",
+    "QAPTAIN_SERVICE_ROLE_KEY",
+    "NEON_URL",
+    "NEON_ANON_KEY",
+    "NEON_SERVICE_ROLE_KEY",
   ];
 
   const result: Record<string, boolean> = {};

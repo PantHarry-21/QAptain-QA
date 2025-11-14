@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { supabase } from '@/lib/supabase';
+import { databaseService } from '@/lib/database';
 import { getServerSession } from 'next-auth';
 import { getAuthOptions } from '@/lib/auth';
+import { getNeonClient, isNeonAvailable } from '@/lib/neon';
+import { supabase } from '@/lib/supabase';
 
 export const dynamic = 'force-dynamic';
 
@@ -22,7 +24,13 @@ export async function GET(request: NextRequest) {
     const from = (page - 1) * limit;
     const to = from + limit - 1;
 
-    let query = supabase
+    // Use the appropriate database client
+    const db = isNeonAvailable() ? getNeonClient() : supabase;
+    if (!db) {
+      return NextResponse.json({ error: 'Database not available' }, { status: 500 });
+    }
+
+    let query = db
       .from('test_sessions')
       .select('*', { count: 'exact' })
       .eq('user_id', session.user.id);
@@ -72,9 +80,10 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'sessionId, url, and scenarios are required' }, { status: 400 });
     }
 
-    const newSession = {
+    // Use database service which handles Neon/Supabase switching
+    const newSession = await databaseService.createTestSession({
       id: sessionId,
-      user_id: session.user.id, // Associate with the logged-in user
+      user_id: session.user.id,
       url: url,
       status: 'pending',
       total_scenarios: scenarios.length,
@@ -85,15 +94,11 @@ export async function POST(request: NextRequest) {
       failed_steps: 0,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
-    };
+    });
 
-    const { data, error } = await supabase
-      .from('test_sessions')
-      .insert([newSession])
-      .select()
-      .single();
-
-    if (error) throw new Error(error.message);
+    if (!newSession) {
+      throw new Error('Failed to create test session');
+    }
 
     const newScenarios = scenarios.map((scenario: any) => ({
       id: scenario.id,
@@ -106,13 +111,19 @@ export async function POST(request: NextRequest) {
       updated_at: new Date().toISOString(),
     }));
 
-    const { error: scenariosError } = await supabase
+    // Use database service for batch insert
+    const db = isNeonAvailable() ? getNeonClient() : supabase;
+    if (!db) {
+      throw new Error('Database not available');
+    }
+
+    const { error: scenariosError } = await db
       .from('test_scenarios')
       .insert(newScenarios);
 
     if (scenariosError) throw new Error(scenariosError.message);
 
-    return NextResponse.json({ success: true, session: data });
+    return NextResponse.json({ success: true, session: newSession });
 
   } catch (error) {
     console.error('Error creating test session:', error);

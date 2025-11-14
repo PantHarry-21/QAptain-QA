@@ -1,10 +1,27 @@
 import { supabase } from './supabase';
+import { getNeonClient, isNeonAvailable } from './neon';
 import { TestSession, TestScenario, TestStep, TestLog, TestReport, ScenarioReport } from './supabase';
 
 export class DatabaseService {
+  /**
+   * Gets the appropriate database client based on environment
+   * - Production: Uses Neon database
+   * - Local: Uses Supabase database
+   */
+  private getDbClient() {
+    if (isNeonAvailable()) {
+      const neonClient = getNeonClient();
+      if (neonClient) {
+        return neonClient;
+      }
+    }
+    // Fallback to Supabase (local development or if Neon is not available)
+    return supabase;
+  }
   // Test Session Operations
   async createTestSession(sessionData: Partial<TestSession>): Promise<TestSession | null> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('test_sessions')
       .insert([sessionData])
       .select()
@@ -19,7 +36,8 @@ export class DatabaseService {
   }
 
   async getTestSession(sessionId: string): Promise<TestSession | null> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('test_sessions')
       .select('*')
       .eq('id', sessionId)
@@ -34,7 +52,8 @@ export class DatabaseService {
   }
 
   async updateTestSession(sessionId: string, updates: Partial<TestSession>): Promise<TestSession | null> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('test_sessions')
       .update(updates)
       .eq('id', sessionId)
@@ -50,7 +69,8 @@ export class DatabaseService {
   }
 
   async listTestSessions(userId?: string, limit: number = 10): Promise<TestSession[]> {
-    let query = supabase
+    const db = this.getDbClient();
+    let query = db
       .from('test_sessions')
       .select('*')
       .order('created_at', { ascending: false })
@@ -72,7 +92,8 @@ export class DatabaseService {
 
   // Test Scenario Operations
   async createTestScenario(scenarioData: Partial<TestScenario>): Promise<TestScenario | null> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('test_scenarios')
       .insert([scenarioData])
       .select()
@@ -87,7 +108,8 @@ export class DatabaseService {
   }
 
   async getTestScenarios(sessionId: string): Promise<TestScenario[]> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('test_scenarios')
       .select('*')
       .eq('session_id', sessionId)
@@ -102,7 +124,8 @@ export class DatabaseService {
   }
 
   async updateTestScenario(scenarioId: string, updates: Partial<TestScenario>): Promise<TestScenario | null> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('test_scenarios')
       .update(updates)
       .eq('id', scenarioId)
@@ -118,7 +141,8 @@ export class DatabaseService {
   }
 
   async getTestScenario(scenarioId: string): Promise<TestScenario | null> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('test_scenarios')
       .select('*')
       .eq('id', scenarioId)
@@ -134,7 +158,8 @@ export class DatabaseService {
 
   // Test Step Operations
   async createTestStep(stepData: Partial<TestStep>): Promise<TestStep | null> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('test_steps')
       .insert([stepData])
       .select()
@@ -149,7 +174,8 @@ export class DatabaseService {
   }
 
   async getTestSteps(scenarioId: string): Promise<TestStep[]> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('test_steps')
       .select('*')
       .eq('scenario_id', scenarioId)
@@ -164,7 +190,8 @@ export class DatabaseService {
   }
 
   async updateTestStep(stepId: string, updates: Partial<TestStep>): Promise<TestStep | null> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('test_steps')
       .update(updates)
       .eq('id', stepId)
@@ -181,7 +208,8 @@ export class DatabaseService {
 
   // Test Log Operations
   async createTestLog(logData: Partial<TestLog>): Promise<TestLog | null> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('test_logs')
       .insert([logData])
       .select()
@@ -196,7 +224,8 @@ export class DatabaseService {
   }
 
   async getTestLogs(sessionId: string, limit: number = 100): Promise<TestLog[]> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('test_logs')
       .select('*')
       .eq('session_id', sessionId)
@@ -213,7 +242,8 @@ export class DatabaseService {
 
   // Test Report Operations
   async createTestReport(reportData: Partial<TestReport>): Promise<TestReport | null> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('test_reports')
       .insert([reportData])
       .select()
@@ -228,7 +258,8 @@ export class DatabaseService {
   }
 
   async getTestReport(sessionId: string): Promise<TestReport | null> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('test_reports')
       .select('*')
       .eq('session_id', sessionId)
@@ -244,7 +275,8 @@ export class DatabaseService {
 
   // Scenario Report Operations
   async createScenarioReport(reportData: Partial<ScenarioReport>): Promise<ScenarioReport | null> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('scenario_reports')
       .insert([reportData])
       .select()
@@ -260,7 +292,8 @@ export class DatabaseService {
 
   // Batch Operations
   async createTestStepsBatch(steps: Partial<TestStep>[]): Promise<TestStep[]> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('test_steps')
       .insert(steps)
       .select();
@@ -274,7 +307,8 @@ export class DatabaseService {
   }
 
   async createTestLogsBatch(logs: Partial<TestLog>[]): Promise<TestLog[]> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('test_logs')
       .insert(logs)
       .select();
@@ -295,7 +329,8 @@ export class DatabaseService {
     averageDuration: number;
     recentActivity: any[];
   }> {
-    let sessionQuery = supabase.from('test_sessions').select('*');
+    const db = this.getDbClient();
+    let sessionQuery = db.from('test_sessions').select('*');
     if (userId) {
       sessionQuery = sessionQuery.eq('user_id', userId);
     }
@@ -342,19 +377,20 @@ export class DatabaseService {
 
   // Cleanup Operations
   async deleteTestSession(sessionId: string): Promise<boolean> {
+    const db = this.getDbClient();
     // Delete related records first (foreign key constraints)
-    await supabase.from('test_reports').delete().eq('session_id', sessionId);
-    await supabase.from('test_logs').delete().eq('session_id', sessionId);
+    await db.from('test_reports').delete().eq('session_id', sessionId);
+    await db.from('test_logs').delete().eq('session_id', sessionId);
     
     // Delete steps and scenarios
     const scenarios = await this.getTestScenarios(sessionId);
     for (const scenario of scenarios) {
-      await supabase.from('test_steps').delete().eq('scenario_id', scenario.id);
+      await db.from('test_steps').delete().eq('scenario_id', scenario.id);
     }
-    await supabase.from('test_scenarios').delete().eq('session_id', sessionId);
+    await db.from('test_scenarios').delete().eq('session_id', sessionId);
 
     // Delete session
-    const { error } = await supabase
+    const { error } = await db
       .from('test_sessions')
       .delete()
       .eq('id', sessionId);
@@ -369,7 +405,8 @@ export class DatabaseService {
 
   // Saved Scenario Operations
   async createSavedScenario(scenarioData: Partial<SavedScenario>): Promise<SavedScenario | null> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('saved_scenarios')
       .insert([scenarioData])
       .select()
@@ -383,7 +420,8 @@ export class DatabaseService {
   }
 
   async getSavedScenario(id: string, userId: string): Promise<SavedScenario | null> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('saved_scenarios')
       .select('*')
       .eq('id', id)
@@ -401,7 +439,8 @@ export class DatabaseService {
   }
 
   async getAllSavedScenarios(userId: string): Promise<SavedScenario[]> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('saved_scenarios')
       .select('*')
       .eq('user_id', userId)
@@ -415,7 +454,8 @@ export class DatabaseService {
   }
 
   async updateSavedScenario(id: string, updates: Partial<SavedScenario>): Promise<SavedScenario | null> {
-    const { data, error } = await supabase
+    const db = this.getDbClient();
+    const { data, error } = await db
       .from('saved_scenarios')
       .update(updates)
       .eq('id', id)
@@ -430,7 +470,8 @@ export class DatabaseService {
   }
 
   async deleteSavedScenario(id: string): Promise<boolean> {
-    const { error } = await supabase
+    const db = this.getDbClient();
+    const { error } = await db
       .from('saved_scenarios')
       .delete()
       .eq('id', id);
