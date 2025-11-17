@@ -3,7 +3,7 @@ import CredentialsProvider from "next-auth/providers/credentials";
 import pool from "./db";
 import bcrypt from "bcrypt";
 
-/** helpers: never throw at module scope */
+/** helpers: never throw at module scope (important for Vercel/build) */
 const has = (k: string) => Boolean(process.env[k]);
 const get = (k: string, fallback = "") => process.env[k] ?? fallback;
 const warnMissing = (k: string) => {
@@ -12,26 +12,12 @@ const warnMissing = (k: string) => {
 
 /**
  * Build-safe NextAuth options for v4.
- * - Adapter is optional and added only when required envs exist
- * - Credentials uses the database connection pool
+ * - Uses Credentials provider against our own DB
+ * - Uses JWT sessions (no DB adapter)
  */
 export const getAuthOptions = (): NextAuthOptions => {
-  // Hard validation for critical environment variables
-  if (!process.env.NEXTAUTH_URL) {
-    throw new Error(
-      "Missing NEXTAUTH_URL environment variable. Please add NEXTAUTH_URL=http://localhost:3000 to your .env file."
-    );
-  }
-  if (!process.env.NEXTAUTH_SECRET) {
-    throw new Error(
-      "Missing NEXTAUTH_SECRET environment variable. Please add a long, random string to your .env file. You can generate one at https://generate-secret.vercel.app/32"
-    );
-  }
-  if (!process.env.DATABASE_URL) {
-    throw new Error(
-      "Missing DATABASE_URL environment variable. Please ensure your database connection string is in the .env file."
-    );
-  }
+  // Soft validation – log missing envs instead of throwing at build time.
+  ["NEXTAUTH_SECRET", "NEXTAUTH_URL", "DATABASE_URL"].forEach(warnMissing);
 
   /** Credentials provider (server-only) - database lookup is manual here */
   const providers = [
