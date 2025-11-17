@@ -1,13 +1,9 @@
-import { PrismaClient } from '@prisma/client'
+import { Pool } from '@neondatabase/serverless';
 
-const globalForPrisma = globalThis as unknown as {
-  prisma: PrismaClient | undefined
-}
+// Initialize the connection pool.
+// The connection string will be read from the environment variables.
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+});
 
-export const db =
-  globalForPrisma.prisma ??
-  new PrismaClient({
-    log: ['query'],
-  })
-
-if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = db
+export default pool;

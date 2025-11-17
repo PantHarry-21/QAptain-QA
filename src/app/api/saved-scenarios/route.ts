@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { databaseService } from '@/lib/database';
+import pool from '@/lib/db';
 import { openAIService } from '@/lib/openai';
 import { getServerSession } from 'next-auth';
 import { getAuthOptions } from '@/lib/auth';
@@ -16,8 +16,17 @@ export async function GET() {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const savedScenarios = await databaseService.getAllSavedScenarios(session.user.id);
-    return NextResponse.json({ success: true, data: savedScenarios });
+    const client = await pool.connect();
+    try {
+      const { rows: savedScenarios } = await client.query(
+        'SELECT id, title, user_story, steps FROM saved_scenarios WHERE user_id = $1',
+        [session.user.id]
+      );
+
+      return NextResponse.json({ success: true, data: savedScenarios });
+    } finally {
+      client.release();
+    }
   } catch (error) {
     console.error('Error fetching saved scenarios:', error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -58,13 +67,17 @@ export async function POST(request: NextRequest) {
 
     const title = providedTitle || user_story.split('\n')[0];
 
-    const newScenario = await databaseService.createSavedScenario({ title, user_story, steps, user_id: session.user.id });
+    const client = await pool.connect();
+    try {
+      const { rows: [newScenario] } = await client.query(
+      'INSERT INTO saved_scenarios (title, user_story, steps, user_id) VALUES ($1, $2, $3, $4) RETURNING id, title, user_story, steps',
+        [title, user_story, steps, session.user.id]
+      );
 
-    if (!newScenario) {
-      return NextResponse.json({ success: true, message: 'Scenario already exists.', data: null });
+      return NextResponse.json({ success: true, data: newScenario }, { status: 201 });
+    } finally {
+      client.release();
     }
-
-    return NextResponse.json({ success: true, data: newScenario }, { status: 201 });
   } catch (error) {
     console.error('Error creating saved scenario:', error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -92,19 +105,26 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json({ error: 'Scenario ID and steps are required' }, { status: 400 });
     }
 
-    const existingScenario = await databaseService.getSavedScenario(id, session.user.id);
+    const client = await pool.connect();
+    try {
+      const { rows: existingScenarios } = await client.query(
+      'SELECT id FROM saved_scenarios WHERE id = $1 AND user_id = $2',
+        [id, session.user.id]
+      );
 
-    if (!existingScenario) {
-      return NextResponse.json({ error: 'Scenario not found or unauthorized' }, { status: 404 });
+      if (existingScenarios.length === 0) {
+        return NextResponse.json({ error: 'Scenario not found or unauthorized' }, { status: 404 });
+      }
+
+    const { rows: [updatedScenario] } = await client.query(
+      'UPDATE saved_scenarios SET steps = $1, title = $2, user_story = $3 WHERE id = $4 RETURNING id, title, user_story, steps',
+      [steps, title, user_story, id]
+    );
+
+      return NextResponse.json({ success: true, data: updatedScenario });
+    } finally {
+      client.release();
     }
-
-    const updatedScenario = await databaseService.updateSavedScenario(id, { steps, title, user_story });
-
-    if (!updatedScenario) {
-      return NextResponse.json({ error: 'Failed to update or find the scenario' }, { status: 404 });
-    }
-
-    return NextResponse.json({ success: true, data: updatedScenario });
   } catch (error) {
     console.error('Error updating saved scenario:', error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -132,15 +152,26 @@ export async function DELETE(request: NextRequest) {
       return NextResponse.json({ error: 'Scenario ID is required' }, { status: 400 });
     }
 
-    const existingScenario = await databaseService.getSavedScenario(id, session.user.id);
+    const client = await pool.connect();
+    try {
+      const { rows: existingScenarios } = await client.query(
+      'SELECT id FROM saved_scenarios WHERE id = $1 AND user_id = $2',
+        [id, session.user.id]
+      );
 
-    if (!existingScenario) {
-      return NextResponse.json({ error: 'Scenario not found or unauthorized' }, { status: 404 });
+      if (existingScenarios.length === 0) {
+        return NextResponse.json({ error: 'Scenario not found or unauthorized' }, { status: 404 });
+      }
+
+    await client.query(
+      'DELETE FROM saved_scenarios WHERE id = $1',
+      [id]
+    );
+
+      return NextResponse.json({ success: true, message: 'Scenario deleted successfully.' });
+    } finally {
+      client.release();
     }
-
-    await databaseService.deleteSavedScenario(id);
-
-    return NextResponse.json({ success: true, message: 'Scenario deleted successfully.' });
   } catch (error) {
     console.error('Error deleting saved scenario:', error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';

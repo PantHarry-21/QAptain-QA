@@ -59,9 +59,13 @@ export default function TestExecutionPage() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [testStatus, setTestStatus] = useState<'idle' | 'running' | 'paused' | 'completed' | 'failed'>('idle');
   const [browserView, setBrowserView] = useState<string | null>(null);
+  const [targetUrl, setTargetUrl] = useState<string>('');
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    const url = sessionStorage.getItem('targetUrl') || '';
+    setTargetUrl(url);
+
     const newSocket = io(process.env.NEXT_PUBLIC_SOCKET_URL || 'http://localhost:3000', {
       path: '/api/socketio',
       transports: ['websocket', 'polling']
@@ -118,9 +122,8 @@ export default function TestExecutionPage() {
 
   const handleStartTest = () => {
     const scenarios = JSON.parse(sessionStorage.getItem('selectedScenarios') || '[]');
-    const url = sessionStorage.getItem('targetUrl') || '';
     
-    if (scenarios.length === 0 || !url) {
+    if (scenarios.length === 0 || !targetUrl) {
       router.push('/scenarios');
       return;
     }
@@ -128,7 +131,7 @@ export default function TestExecutionPage() {
     socket?.emit('start-test', {
       sessionId,
       scenarios,
-      url
+      url: targetUrl
     });
   };
 
@@ -202,45 +205,49 @@ export default function TestExecutionPage() {
         </div>
 
         <Card className="mb-8 h-25 flex flex-col justify-center px-6 py-4">
-  <div className="flex items-center justify-between w-full">
-    {/* LEFT SIDE: Title + Buttons */}
-    <div className="flex flex-col items-start gap-4">
-      <CardTitle className="flex items-center gap-2 text-lg font-semibold">
-        <Monitor className="w-5 h-5" />
-        Test Control
-      </CardTitle>
+          <div className="flex items-center justify-between w-full">
+            {/* LEFT SIDE: Title + Buttons */}
+            <div className="flex flex-col items-start gap-4">
+              <CardTitle className="flex items-center gap-2 text-lg font-semibold">
+                <Monitor className="w-5 h-5" />
+                Test Control
+              </CardTitle>
 
-      <div className="flex items-center gap-4">
-        {testStatus === 'idle' && (
-          <Button
-            onClick={handleStartTest}
-            disabled={!isConnected || testStatus === 'running'}
-          >
-            {testStatus === 'running' ? (
-              <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-            ) : (
-              <Play className="w-4 h-4 mr-2" />
-            )}
-            {testStatus === 'running' ? 'Starting...' : 'Start Test'}
-          </Button>
-        )}
+              <div className="flex items-center gap-4">
+                {testStatus === 'idle' && (
+                  <Button
+                    onClick={handleStartTest}
+                    disabled={!isConnected || testStatus === 'running'}
+                  >
+                    {testStatus === 'running' ? (
+                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    ) : (
+                      <Play className="w-4 h-4 mr-2" />
+                    )}
+                    {testStatus === 'running' ? 'Starting...' : 'Start Test'}
+                  </Button>
+                )}
 
-        {(testStatus === 'completed' || testStatus === 'failed') && (
-          <Button onClick={handleViewResults}>
-            <CheckCircle className="w-4 h-4 mr-2" />
-            View Results
-          </Button>
-        )}
-      </div>
-    </div>
+                {(testStatus === 'completed' || testStatus === 'failed') && (
+                  <Button onClick={handleViewResults}>
+                    <CheckCircle className="w-4 h-4 mr-2" />
+                    View Results
+                  </Button>
+                )}
+              </div>
+               <div className="text-sm text-slate-600 dark:text-slate-400 mt-2">
+                  <p><strong>Testing URL:</strong> {targetUrl || 'Not set'}</p>
+                  <p className="text-xs mt-1">Note: This URL must be a running application for the test to succeed.</p>
+              </div>
+            </div>
 
-    {/* RIGHT SIDE: Badge */}
-    <Badge variant="outline" className="flex items-center gap-2">
-      <div className={`w-2 h-2 rounded-full ${getStatusColor(testStatus)}`} />
-      {testStatus.charAt(0).toUpperCase() + testStatus.slice(1)}
-    </Badge>
-  </div>
-</Card>
+            {/* RIGHT SIDE: Badge */}
+            <Badge variant="outline" className="flex items-center gap-2">
+              <div className={`w-2 h-2 rounded-full ${getStatusColor(testStatus)}`} />
+              {testStatus.charAt(0).toUpperCase() + testStatus.slice(1)}
+            </Badge>
+          </div>
+        </Card>
 
         {/* Progress Overview */}
         {progress && (

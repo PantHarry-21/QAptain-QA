@@ -1,8 +1,7 @@
 import type { NextAuthOptions } from "next-auth";
 import CredentialsProvider from "next-auth/providers/credentials";
-import { createClient } from "@supabase/supabase-js";
-import { SupabaseAdapter } from "@next-auth/supabase-adapter";
-import { getSupabaseUrl, getSupabaseAnonKey, getSupabaseServiceRoleKey } from "./supabase";
+import pool from "./db";
+import bcrypt from "bcrypt";
 
 /** helpers: never throw at module scope */
 const has = (k: string) => Boolean(process.env[k]);
@@ -14,91 +13,115 @@ const warnMissing = (k: string) => {
 /**
  * Build-safe NextAuth options for v4.
  * - Adapter is optional and added only when required envs exist
- * - Credentials uses SUPABASE_URL + NEXT_PUBLIC_SUPABASE_ANON_KEY (NOT service role)
+ * - Credentials uses the database connection pool
  */
 export const getAuthOptions = (): NextAuthOptions => {
-  // Soft validations (warn only)
-  ["NEXTAUTH_SECRET", "NEXTAUTH_URL", "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY"].forEach(
-    warnMissing
-  );
+  // Hard validation for critical environment variables
+  if (!process.env.NEXTAUTH_URL) {
+    throw new Error(
+      "Missing NEXTAUTH_URL environment variable. Please add NEXTAUTH_URL=http://localhost:3000 to your .env file."
+    );
+  }
+  if (!process.env.NEXTAUTH_SECRET) {
+    throw new Error(
+      "Missing NEXTAUTH_SECRET environment variable. Please add a long, random string to your .env file. You can generate one at https://generate-secret.vercel.app/32"
+    );
+  }
+  if (!process.env.DATABASE_URL) {
+    throw new Error(
+      "Missing DATABASE_URL environment variable. Please ensure your database connection string is in the .env file."
+    );
+  }
 
-  /** Credentials provider (server-only) */
+  /** Credentials provider (server-only) - database lookup is manual here */
   const providers = [
     CredentialsProvider({
+      id: "credentials", // Explicit ID for NextAuth
       name: "Credentials",
       credentials: {
         email: { label: "Email", type: "text" },
         password: { label: "Password", type: "password" },
       },
       async authorize(credentials) {
-        // Use environment-aware Supabase credentials
-        const SUPABASE_URL = getSupabaseUrl();
-        const SUPABASE_ANON_KEY = getSupabaseAnonKey();
-
-        if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-          console.warn("[auth] Missing Supabase credentials in authorize()");
+        console.log("[auth] Authorize called with email:", credentials?.email);
+        
+        if (!credentials?.email || !credentials?.password) {
+          console.log("[auth] Missing credentials");
           return null;
         }
-        if (!credentials?.email || !credentials?.password) return null;
 
-        // Use ANON key for user auth flows
-        const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+        const client = await pool.connect();
+        try {
+          console.log("[auth] Querying database for user:", credentials.email);
+          const { rows } = await client.query(
+            "SELECT id, email, password, first_name, last_name, email_verified FROM users WHERE email = $1",
+            [credentials.email]
+          );
+          const user = rows[0];
 
-        const { data, error } = await supabase.auth.signInWithPassword({
-          email: credentials.email,
-          password: credentials.password,
-        });
+          if (!user) {
+            console.log("[auth] User not found in database");
+            return null;
+          }
 
-        if (error || !data?.user) return null;
+          console.log("[auth] User found, comparing password");
+          // Compare password asynchronously
+          const passwordMatch = await bcrypt.compare(credentials.password, user.password);
+          
+          if (passwordMatch) {
+            console.log("[auth] Password match! Creating user object");
+            const fullName = user.first_name && user.last_name 
+              ? `${user.first_name} ${user.last_name}` 
+              : user.first_name || user.last_name || user.email || "User";
+            const userObj = {
+              id: user.id,
+              email: user.email,
+              name: fullName,
+            };
+            console.log("[auth] Returning user object:", { id: userObj.id, email: userObj.email, name: userObj.name });
+            return userObj;
+          } else {
+            console.log("[auth] Password mismatch");
+          }
+        } catch (error) {
+          console.error("[auth] Error during authorization:", error);
+          if (error instanceof Error) {
+            console.error("[auth] Error stack:", error.stack);
+          }
+        } finally {
+          client.release();
+        }
 
-        return {
-          id: data.user.id,
-          email: data.user.email,
-          name: (data.user.user_metadata as any)?.full_name ?? data.user.email ?? "User",
-        };
+        console.log("[auth] Authorization failed");
+        return null;
       },
     }),
   ];
 
-  /** Optional Supabase adapter (requires service role) */
-  // Use environment-aware Supabase credentials
-  const SUPABASE_URL = getSupabaseUrl();
-  const SUPABASE_SERVICE_ROLE_KEY = getSupabaseServiceRoleKey();
-  const adapter =
-    SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
-      ? (SupabaseAdapter({
-          url: SUPABASE_URL,
-          secret: SUPABASE_SERVICE_ROLE_KEY,
-        }) as any)
-      : undefined;
-
-  if (!adapter) {
-    console.warn("[auth] SupabaseAdapter disabled: missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
-  }
-
-  // NEXTAUTH_SECRET validation is handled at runtime in the route handler
-  // to avoid build-time errors
   const secret = get("NEXTAUTH_SECRET");
 
   return {
     secret: secret || undefined,
-    adapter,
     providers: providers as any,
-    session: { strategy: "jwt" },
+    // Use JWT-based sessions (no database adapter for sessions)
+    session: {
+      strategy: "jwt",
+    },
+    debug: process.env.NODE_ENV === "development", // Enable debug in development
+    trustHost: true, // Required for Next.js 15 App Router & Auth.js
     callbacks: {
       async session({ session, token }) {
-        // @ts-expect-error - augmenting session
-        session.user.id = token.sub;
-        // @ts-expect-error - custom field
-        session.accessToken = (token as any).accessToken;
+        // Attach the user id from the JWT into the session object
+        if (session.user && token.sub) {
+          // @ts-expect-error augmenting session
+          session.user.id = token.sub;
+        }
         return session;
       },
-      async jwt({ token, user, account }) {
-        if (account?.access_token) {
-          (token as any).accessToken = account.access_token;
-        }
-        if (user?.id) {
-          (token as any).id = user.id;
+      async jwt({ token, user }) {
+        // On initial sign-in, copy the user id into the JWT
+        if (user) {
+          token.sub = (user as any).id;
         }
         return token;
       },

@@ -1,39 +1,19 @@
 // app/api/auth/activate/[token]/route.ts
 import "server-only";
 import { NextResponse } from "next/server";
-import { getSupabaseUrl, getSupabaseServiceRoleKey } from "../../../../../lib/supabase";
+import pool from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 export const fetchCache = "force-no-store";
 export const runtime = "nodejs";
 
-function getSupabaseAdmin() {
-  // Use environment-aware Supabase credentials
-  const url = getSupabaseUrl();
-  const serviceKey = getSupabaseServiceRoleKey();
-  if (!url || !serviceKey) return null;
-
-  // Lazy import to avoid module-scope side effects during build
-  // and to keep this route Node-runtime friendly.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { createClient } = require("@supabase/supabase-js");
-  return createClient(url, serviceKey);
-}
-
 export async function GET(
   req: Request,
   context: { params: { token?: string } }
 ) {
-  // During Next.js build (page data collection), avoid any runtime logic.
-  // Return a trivial OK so the build doesn't fail.
-  const phase = process.env.NEXT_PHASE;
-  if (phase === "phase-production-build" || phase === "phase-development-build") {
-    return new Response("OK", { status: 200 });
-  }
   try {
-    const url = new URL(req.url);
-    const token = context.params?.token || url.searchParams.get("token") || "";
+    const token = context.params?.token ?? "";
 
     if (!token) {
       return NextResponse.redirect(
@@ -41,67 +21,50 @@ export async function GET(
       );
     }
 
-    const supabase = getSupabaseAdmin();
-    if (!supabase) {
-      // Don't throw at build/import time—return a runtime error instead
+    const client = await pool.connect();
+    try {
+      // Look up the user by activation token
+      const { rows: users } = await client.query(
+        "SELECT * FROM users WHERE activation_token = $1",
+        [token]
+      );
+      const user = users[0];
+
+      if (!user) {
+        return NextResponse.redirect(
+          new URL("/login?error=Invalid or expired activation link", req.url)
+        );
+      }
+
+      // Already verified?
+      if (user.email_verified) {
+        return NextResponse.redirect(
+          new URL(
+            "/login?message=Account already activated. Please log in.",
+            req.url
+          )
+        );
+      }
+
+      // Activate user (clear token + mark timestamp)
+      console.log(
+        `Attempting to activate user ID: ${user.id} with email: ${user.email}`
+      );
+      await client.query(
+        "UPDATE users SET email_verified = NOW(), activation_token = NULL WHERE id = $1",
+        [user.id]
+      );
+
+      console.log(`Successfully activated user ID: ${user.id}`);
       return NextResponse.redirect(
         new URL(
-          "/login?error=Server misconfigured: Supabase credentials missing. Please check your environment variables.",
+          "/login?message=Account activated successfully! You can now log in.",
           req.url
         )
       );
+    } finally {
+      client.release();
     }
-
-    // Look up the user by activation token
-    const { data: user, error: findError } = await supabase
-      .from("users")
-      .select("*")
-      .eq("activation_token", token)
-      .single();
-
-    if (findError || !user) {
-      console.error("Activation error: User not found or token invalid", findError);
-      return NextResponse.redirect(
-        new URL("/login?error=Invalid or expired activation link", req.url)
-      );
-    }
-
-    // Already verified?
-    if (user.email_verified) {
-      return NextResponse.redirect(
-        new URL(
-          "/login?message=Account already activated. Please log in.",
-          req.url
-        )
-      );
-    }
-
-    // Activate user (clear token + mark timestamp)
-    console.log(
-      `Attempting to activate user ID: ${user.id} with email: ${user.email}`
-    );
-    const { error: updateError } = await supabase
-      .from("users")
-      .update({
-        email_verified: new Date().toISOString(),
-        activation_token: null,
-      })
-      .eq("id", user.id);
-
-    if (updateError) {
-      console.error("Error updating user for activation:", updateError);
-      return NextResponse.redirect(
-        new URL("/login?error=Failed to activate account", req.url)
-      );
-    }
-
-    console.log(`Successfully activated user ID: ${user.id}`);
-    return NextResponse.redirect(
-      new URL(
-        "/login?message=Account activated successfully! You can now log in.",
-        req.url
-      )
-    );
   } catch (error) {
     console.error("Activation API error:", error);
     return NextResponse.redirect(

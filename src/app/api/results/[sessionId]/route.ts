@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { supabase } from '@/lib/supabase';
-import { TestSession, TestScenario, TestLog, TestReport } from '@/lib/supabase';
+import pool from '@/lib/db';
 
 export const dynamic = 'force-dynamic';
 
@@ -15,108 +14,115 @@ export async function GET(
   }
 
   try {
-    // Fetch Test Session
-    const { data: session, error: sessionError } = await supabase
-      .from('test_sessions')
-      .select('*, test_reports(*), selected_scenario_ids') // Select session and join with test_reports
-      .eq('id', sessionId)
-      .single();
+    const client = await pool.connect();
+    try {
+      // Fetch Test Session
+      const { rows: [session] } = await client.query(
+        `SELECT 
+           ts.*, 
+           tr.id AS report_id, tr.session_id AS report_session_id, tr.summary AS report_summary, 
+           tr.key_findings AS report_key_findings, tr.recommendations AS report_recommendations, 
+           tr.risk_level AS report_risk_level, tr.risk_assessment_issues AS report_risk_assessment_issues, 
+           tr.performance_metrics AS report_performance_metrics
+         FROM test_sessions ts
+         LEFT JOIN test_reports tr ON ts.id = tr.session_id
+         WHERE ts.id = $1`,
+        [sessionId]
+      );
 
-    if (sessionError) {
-      console.error('Error fetching session:', sessionError);
-      return NextResponse.json({ error: 'Session not found' }, { status: 404 });
+      if (!session) {
+        return NextResponse.json({ error: 'Session not found' }, { status: 404 });
+      }
+
+      // Reconstruct report object if it exists
+      let report = null;
+      if (session.report_id) {
+        report = {
+          id: session.report_id,
+          session_id: session.report_session_id,
+          summary: session.report_summary,
+          key_findings: session.report_key_findings,
+          recommendations: session.report_recommendations,
+          risk_level: session.report_risk_level,
+          risk_assessment_issues: session.report_risk_assessment_issues,
+          performance_metrics: session.report_performance_metrics,
+        };
+        // Remove report-related fields from session object
+        delete session.report_id;
+        delete session.report_session_id;
+        delete session.report_summary;
+        delete session.report_key_findings;
+        delete session.report_recommendations;
+        delete session.report_risk_level;
+        delete session.report_risk_assessment_issues;
+        delete session.report_performance_metrics;
+      }
+
+      // Fetch Test Scenarios
+      let { rows: scenarios } = await client.query(
+        'SELECT * FROM test_scenarios WHERE session_id = $1 ORDER BY created_at ASC',
+        [sessionId]
+      );
+
+      // Retry logic to handle potential DB replication delay
+      let retries = 5;
+      if (scenarios) {
+          const hasRunningScenarios = scenarios.some(s => s.status === 'running');
+
+          if (session.status === 'completed' && hasRunningScenarios) {
+              console.log(`[Results API] Stale data detected for session ${sessionId}. Retrying...`);
+              
+              while (retries > 0) {
+                  await new Promise(resolve => setTimeout(resolve, 1500)); // Wait for 1.5 seconds
+
+                  const { rows: refetchedScenarios } = await client.query(
+                      'SELECT * FROM test_scenarios WHERE session_id = $1 ORDER BY created_at ASC',
+                      [sessionId]
+                  );
+
+                  scenarios = refetchedScenarios;
+                  const stillHasRunning = scenarios?.some(s => s.status === 'running');
+                  if (!stillHasRunning) {
+                      console.log(`[Results API] Fresh data found for session ${sessionId}.`);
+                      break; // Exit loop if data is fresh
+                  }
+                  
+                  retries--;
+                  console.log(`[Results API] Data still stale. Retries left: ${retries}`);
+              }
+          }
+      }
+
+      // Filter scenarios based on selected_scenario_ids if available
+      if (session.selected_scenario_ids && scenarios) {
+        scenarios = scenarios.filter((scenario: any) => session.selected_scenario_ids.includes(scenario.id));
+      }
+
+      // Fetch Test Logs
+      const { rows: logs } = await client.query(
+        'SELECT * FROM test_logs WHERE session_id = $1 ORDER BY timestamp ASC',
+        [sessionId]
+      );
+
+      // Fetch Scenario Reports
+      const { rows: scenarioReports } = await client.query(
+        'SELECT * FROM scenario_reports WHERE session_id = $1',
+        [sessionId]
+      );
+
+      return NextResponse.json({
+        success: true,
+        data: {
+          session,
+          scenarios: scenarios || [],
+          logs: logs || [],
+          report,
+          scenarioReports: scenarioReports || [],
+        },
+      });
+    } finally {
+      client.release();
     }
-
-    // Fetch Test Scenarios
-    let { data: scenarios, error: scenariosError } = await supabase
-      .from('test_scenarios')
-      .select('*')
-      .eq('session_id', sessionId)
-      .order('created_at', { ascending: true });
-
-    if (scenariosError) {
-      console.error('Error fetching scenarios:', scenariosError);
-      scenarios = []; // Ensure scenarios is an empty array on error
-    }
-
-    // Retry logic to handle potential DB replication delay
-    let retries = 5;
-    if (scenarios) {
-        const hasRunningScenarios = scenarios.some(s => s.status === 'running');
-
-        if (session.status === 'completed' && hasRunningScenarios) {
-            console.log(`[Results API] Stale data detected for session ${sessionId}. Retrying...`);
-            
-            while (retries > 0) {
-                await new Promise(resolve => setTimeout(resolve, 1500)); // Wait for 1.5 seconds
-
-                const { data: refetchedScenarios, error: refetchError } = await supabase
-                    .from('test_scenarios')
-                    .select('*')
-                    .eq('session_id', sessionId)
-                    .order('created_at', { ascending: true });
-
-                if (refetchError) {
-                    break; // If refetch fails, break and use the data we have
-                }
-
-                scenarios = refetchedScenarios;
-                const stillHasRunning = scenarios?.some(s => s.status === 'running');
-                if (!stillHasRunning) {
-                    console.log(`[Results API] Fresh data found for session ${sessionId}.`);
-                    break; // Exit loop if data is fresh
-                }
-                
-                retries--;
-                console.log(`[Results API] Data still stale. Retries left: ${retries}`);
-            }
-        }
-    }
-
-
-
-    // Filter scenarios based on selected_scenario_ids if available
-    if (session.selected_scenario_ids && scenarios) {
-      scenarios = scenarios.filter(scenario => session.selected_scenario_ids.includes(scenario.id));
-    }
-
-    // Fetch Test Logs
-    const { data: logs, error: logsError } = await supabase
-      .from('test_logs')
-      .select('*')
-      .eq('session_id', sessionId)
-      .order('timestamp', { ascending: true });
-
-    if (logsError) {
-      console.error('Error fetching logs:', logsError);
-      // Continue even if logs fail
-    }
-
-    // Fetch Scenario Reports
-    const { data: scenarioReports, error: scenarioReportsError } = await supabase
-      .from('scenario_reports')
-      .select('*')
-      .eq('session_id', sessionId);
-
-    if (scenarioReportsError) {
-      console.error('Error fetching scenario reports:', scenarioReportsError);
-      // Continue even if reports fail
-    }
-
-    // The report is already joined with the session, so it's in session.test_reports
-    const report = session.test_reports?.[0] || null; // Assuming one report per session
-    delete session.test_reports; // Remove the joined report from the session object
-
-    return NextResponse.json({
-      success: true,
-      data: {
-        session,
-        scenarios: scenarios || [],
-        logs: logs || [],
-        report,
-        scenarioReports: scenarioReports || [],
-      },
-    });
   } catch (error) {
     console.error('Error in results API:', error);
     return NextResponse.json(

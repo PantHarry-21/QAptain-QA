@@ -1,9 +1,7 @@
-import playwright, { Page, Browser, Locator } from 'playwright-core';
-import chromium from '@sparticuz/chromium';
+import { Page, Browser, Locator, chromium } from 'playwright';
+import sparticuzChromium from '@sparticuz/chromium';
 import { v4 as uuidv4 } from 'uuid';
-import { databaseService } from '@/lib/database';
 import { openAIService } from './openai';
-import { TestLog } from '@/lib/supabase';
 import { Server } from 'socket.io';
 
 import { skillFillFormHappyPath } from './skills/fill-form';
@@ -462,14 +460,14 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
 
     if (isVercel) {
       emitLog({ level: 'info', message: 'Launching browser with @sparticuz/chromium for serverless environment.' });
-      browser = await playwright.chromium.launch({
-        args: chromium.args,
-        executablePath: await chromium.executablePath(),
-        headless: chromium.headless,
+      browser = await chromium.launch({
+        args: sparticuzChromium.args,
+        executablePath: await sparticuzChromium.executablePath(),
+        headless: sparticuzChromium.headless,
       });
     } else {
       emitLog({ level: 'info', message: 'Launching browser with local Playwright installation.' });
-      browser = await playwright.chromium.launch({
+      browser = await chromium.launch({
         headless: true
       });
     }

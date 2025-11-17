@@ -5,20 +5,27 @@
 
 import OpenAI from 'openai';
 import { prompts } from './prompts';
-import { TestLog } from './supabase';
+import { TestLog } from './types';
 
 // --- Configuration ---
 
-const apiKey = process.env.OPENAI_API_KEY;
 const modelName = process.env.OPENAI_MODEL_NAME || 'gpt-4-turbo';
 
-if (!apiKey) {
-  const errorMessage = 'The OPENAI_API_KEY environment variable is missing. Please add it to your Vercel project environment variables. The application cannot function without it.';
-  console.error(errorMessage);
-  throw new Error(errorMessage);
-}
+// Lazy initialization of OpenAI client to ensure env vars are loaded
+let client: OpenAI | null = null;
 
-const client = new OpenAI({ apiKey });
+function getClient(): OpenAI {
+  if (!client) {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      const errorMessage = 'The OPENAI_API_KEY environment variable is missing. Please add it to your .env file or Vercel project environment variables. The application cannot function without it.';
+      console.error(errorMessage);
+      throw new Error(errorMessage);
+    }
+    client = new OpenAI({ apiKey });
+  }
+  return client;
+}
 
 // --- Type Definitions ---
 
@@ -120,7 +127,7 @@ export class OpenAIService {
     let rawContent: string | null = null;
 
     try {
-      const completion = await client.chat.completions.create({
+      const completion = await getClient().chat.completions.create({
         model: modelName,
         messages: [
           { role: 'system', content: 'You are a helpful AI assistant designed to output JSON. You must respond with only the JSON object, without any surrounding text, markdown, or explanations.' },

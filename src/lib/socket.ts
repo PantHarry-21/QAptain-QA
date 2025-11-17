@@ -45,9 +45,12 @@ export const setupSocket = (io: Server) => {
         return;
       }
 
-      // Start the test execution in the background
-      // The executeTests function will handle emitting progress back to the client
-      executeTests(io, sessionId, scenarios, url);
+      // Start the test execution in the background.
+      // Make sure we handle rejections so they don't surface as unhandledRejection.
+      executeTests(io, sessionId, scenarios, url).catch((err) => {
+        console.error('executeTests failed:', err);
+        socket.emit('test-failed', { error: err instanceof Error ? err.message : 'Unknown error' });
+      });
     });
 
     // Handle client disconnection

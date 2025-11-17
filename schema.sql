@@ -1,4 +1,4 @@
--- QAptain Database Schema (v2 - Robust & Idempotent)
+-- QAptain Database Schema (v3 - Corrected for NextAuth)
 -- This script safely creates tables and adds missing columns to existing tables.
 
 -- Enable UUID generation functionality
@@ -21,12 +21,16 @@ BEGIN
     END IF;
 END$$;
 
+--
+-- Application-specific tables
+--
+
 -- 1. test_sessions Table
 CREATE TABLE IF NOT EXISTS test_sessions (
     id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
     created_at TIMESTAMPTZ DEFAULT now()
 );
-ALTER TABLE test_sessions ADD COLUMN IF NOT EXISTS user_id uuid;
+ALTER TABLE test_sessions ADD COLUMN IF NOT EXISTS user_id TEXT; -- Corrected for users.id FK
 ALTER TABLE test_sessions ADD COLUMN IF NOT EXISTS url TEXT;
 ALTER TABLE test_sessions ADD COLUMN IF NOT EXISTS status test_status DEFAULT 'pending';
 ALTER TABLE test_sessions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
@@ -122,32 +126,19 @@ CREATE TABLE IF NOT EXISTS saved_scenarios (
     id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
     created_at TIMESTAMPTZ DEFAULT now()
 );
-ALTER TABLE saved_scenarios ADD COLUMN IF NOT EXISTS user_id uuid;
+ALTER TABLE saved_scenarios ADD COLUMN IF NOT EXISTS user_id TEXT; -- Corrected for users.id FK
 ALTER TABLE saved_scenarios ADD COLUMN IF NOT EXISTS url TEXT;
 ALTER TABLE saved_scenarios ADD COLUMN IF NOT EXISTS title TEXT;
 ALTER TABLE saved_scenarios ADD COLUMN IF NOT EXISTS user_story TEXT;
 ALTER TABLE saved_scenarios ADD COLUMN IF NOT EXISTS steps TEXT[];
 
--- Add Indexes for performance
-CREATE INDEX IF NOT EXISTS idx_test_sessions_user_id ON test_sessions(user_id);
-CREATE INDEX IF NOT EXISTS idx_test_scenarios_session_id ON test_scenarios(session_id);
-CREATE INDEX IF NOT EXISTS idx_test_steps_scenario_id ON test_steps(scenario_id);
-CREATE INDEX IF NOT EXISTS idx_test_logs_session_id ON test_logs(session_id);
-CREATE INDEX IF NOT EXISTS idx_saved_scenarios_url ON saved_scenarios(url);
-CREATE INDEX IF NOT EXISTS idx_saved_scenarios_user_id ON saved_scenarios(user_id);
-
--- Comments to explain the schema
-COMMENT ON TABLE test_sessions IS 'Stores high-level information about each test run.';
-COMMENT ON TABLE test_scenarios IS 'Stores the individual scenarios that are part of a test session.';
-COMMENT ON TABLE test_steps IS 'Stores the granular steps within each test scenario (currently not in use but good for future expansion).';
-COMMENT ON TABLE test_logs IS 'Aggregates all logs (info, errors, screenshots) for a given test session.';
-COMMENT ON TABLE test_reports IS 'Stores the final AI-generated analysis for a completed test session.';
-COMMENT ON TABLE scenario_reports IS 'Stores AI-generated analysis for each individual scenario.';
-COMMENT ON TABLE saved_scenarios IS 'Stores reusable test scenarios created by users.';
+--
+-- NEXTAUTH.JS CORRECTED SCHEMA
+--
 
 -- 8. users Table
 CREATE TABLE IF NOT EXISTS users (
-    id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id TEXT NOT NULL PRIMARY KEY,
     first_name TEXT,
     last_name TEXT,
     email TEXT UNIQUE NOT NULL,
@@ -161,36 +152,43 @@ CREATE TABLE IF NOT EXISTS users (
 
 -- 9. accounts Table
 CREATE TABLE IF NOT EXISTS accounts (
-  id uuid NOT NULL DEFAULT uuid_generate_v4(),
-  "userId" uuid NOT NULL,
-  type text NOT NULL,
-  provider text NOT NULL,
-  "providerAccountId" text NOT NULL,
-  refresh_token text NULL,
-  access_token text NULL,
-  expires_at int8 NULL,
-  token_type text NULL,
-  scope text NULL,
-  id_token text NULL,
-  session_state text NULL,
-  CONSTRAINT accounts_pkey PRIMARY KEY (id),
-  CONSTRAINT "accounts_userId_fkey" FOREIGN KEY ("userId") REFERENCES users(id) ON DELETE CASCADE
+  id TEXT NOT NULL PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  type TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  provider_account_id TEXT NOT NULL,
+  refresh_token TEXT,
+  access_token TEXT,
+  expires_at BIGINT,
+  token_type TEXT,
+  scope TEXT,
+  id_token TEXT,
+  session_state TEXT,
+  UNIQUE (provider, provider_account_id)
 );
 
 -- 10. sessions Table
 CREATE TABLE IF NOT EXISTS sessions (
-  id uuid NOT NULL DEFAULT uuid_generate_v4(),
-  "sessionToken" text NOT NULL,
-  "userId" uuid NOT NULL,
-  expires timestamptz NOT NULL,
-  CONSTRAINT sessions_pkey PRIMARY KEY (id),
-  CONSTRAINT "sessions_userId_fkey" FOREIGN KEY ("userId") REFERENCES users(id) ON DELETE CASCADE
+  id TEXT NOT NULL PRIMARY KEY,
+  session_token TEXT NOT NULL UNIQUE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires TIMESTAMPTZ NOT NULL
 );
 
 -- 11. verification_tokens Table
 CREATE TABLE IF NOT EXISTS verification_tokens (
-  token text NOT NULL,
-  identifier text NOT NULL,
-  expires timestamptz NOT NULL,
-  CONSTRAINT verification_tokens_pkey PRIMARY KEY (token)
+  identifier TEXT NOT NULL,
+  token TEXT NOT NULL,
+  expires TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (identifier, token)
 );
+
+--
+-- INDEXES
+--
+CREATE INDEX IF NOT EXISTS idx_test_sessions_user_id ON test_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_test_scenarios_session_id ON test_scenarios(session_id);
+CREATE INDEX IF NOT EXISTS idx_test_steps_scenario_id ON test_steps(scenario_id);
+CREATE INDEX IF NOT EXISTS idx_test_logs_session_id ON test_logs(session_id);
+CREATE INDEX IF NOT EXISTS idx_saved_scenarios_url ON saved_scenarios(url);
+CREATE INDEX IF NOT EXISTS idx_saved_scenarios_user_id ON saved_scenarios(user_id);

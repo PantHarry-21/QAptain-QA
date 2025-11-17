@@ -1,4 +1,4 @@
-import { TestSession, TestScenario, TestLog, TestReport } from './supabase'; // Assuming these types are available
+import { TestSession, TestScenario, TestLog, TestReport } from './types';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas'; // html2canvas is not actually used in generatePDFReport, but it's imported in the original file. I'll keep it for now.
 

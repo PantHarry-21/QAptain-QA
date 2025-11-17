@@ -5,24 +5,9 @@
  */
 
 import { PageContext } from './openai'; // Import the rich PageContext
-import { TestLog } from './supabase';
+import { TestLog, Scenario, TestResults } from './types';
 
-// --- Type Definitions ---
 
-interface Scenario {
-  title: string;
-  description: string;
-  status: 'passed' | 'failed';
-  duration: number;
-  steps: string[];
-}
-
-interface TestResults {
-  status: string;
-  totalScenarios: number;
-  passedScenarios: number;
-  failedScenarios: number;
-}
 
 // --- Prompts Object ---
 

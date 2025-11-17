@@ -1,4 +1,12 @@
 // server.ts - Next.js Standalone + Socket.IO
+// Load environment variables FIRST before any other imports
+import dotenv from 'dotenv';
+import { resolve } from 'path';
+
+// Load .env file from the project root
+dotenv.config({ path: resolve(process.cwd(), '.env') });
+
+// Now import other modules after env vars are loaded
 import { setupSocket } from '@/lib/socket';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
