@@ -7,6 +7,8 @@ import { Server } from 'socket.io';
 import { skillFillFormHappyPath } from './skills/fill-form';
 import { getDomContextSelector } from './utils';
 import { goldenScenarios } from './golden-scenarios';
+import { databaseService } from './database-service';
+import type { TestLog, TestScenario } from './types';
 
 // --- Interfaces ---
 
@@ -414,7 +416,9 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
     const fullLog = { ...log, id: uuidv4(), timestamp: new Date().toISOString() } as TestLog;
     logs.push(fullLog);
     io.to(sessionRoom).emit('test-log', fullLog);
-    databaseService.createTestLog({ session_id: sessionId, ...fullLog });
+    databaseService
+      .createTestLog({ session_id: sessionId, ...fullLog })
+      .catch(err => console.error('Failed to persist test log', err));
   };
 
   const processedScenarios = scenarios.map(scenario => {
@@ -450,6 +454,31 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
     failedSteps: 0
   };
   const scenarioIds = processedScenarios.map(s => s.id);
+  await databaseService.seedSessionData(sessionId, {
+    session: {
+      id: sessionId,
+      url,
+      status: 'running',
+      total_scenarios: processedScenarios.length,
+      passed_scenarios: 0,
+      failed_scenarios: 0,
+      total_steps: sessionResults.totalSteps,
+      passed_steps: 0,
+      failed_steps: 0,
+      started_at: startTime.toISOString(),
+      created_at: startTime.toISOString(),
+      updated_at: startTime.toISOString(),
+      selected_scenario_ids: scenarioIds,
+    },
+    scenarios: processedScenarios.map((scenario) => ({
+      id: scenario.id,
+      session_id: sessionId,
+      title: scenario.title,
+      description: scenario.description,
+      steps: scenario.steps,
+      status: 'pending',
+    })),
+  });
   await databaseService.updateTestSession(sessionId, { selected_scenario_ids: scenarioIds });
 
   try {
@@ -708,8 +737,24 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
       io.to(sessionRoom).emit('test-report-update', createdReport);
     }
 
+    const clientResults = {
+      total_scenarios: sessionResults.totalScenarios,
+      totalScenarios: sessionResults.totalScenarios,
+      passed_scenarios: sessionResults.passedScenarios,
+      passedScenarios: sessionResults.passedScenarios,
+      failed_scenarios: sessionResults.failedScenarios,
+      failedScenarios: sessionResults.failedScenarios,
+      total_steps: sessionResults.totalSteps,
+      totalSteps: sessionResults.totalSteps,
+      passed_steps: sessionResults.passedSteps,
+      passedSteps: sessionResults.passedSteps,
+      failed_steps: sessionResults.failedSteps,
+      failedSteps: sessionResults.failedSteps,
+      status: 'completed',
+    };
+
     emitLog({ level: 'success', message: '🎉 All test scenarios completed successfully!' });
-    io.to(sessionRoom).emit('test-completed', { sessionId, results: sessionResults, scenarios: finalScenarios });
+    io.to(sessionRoom).emit('test-completed', { sessionId, results: clientResults, scenarios: finalScenarios });
 
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';

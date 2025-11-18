@@ -36,7 +36,7 @@ export const getAuthOptions = (): NextAuthOptions => {
           return null;
         }
 
-        const client = await pool.connect();
+        const client = await pool().connect();
         try {
           console.log("[auth] Querying database for user:", credentials.email);
           const { rows } = await client.query(
