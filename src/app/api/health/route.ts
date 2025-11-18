@@ -1,14 +1,13 @@
 import { NextResponse } from "next/server";
-import pool from "@/lib/db";
+import getPool from "@/lib/db";
 
 export const dynamic = 'force-dynamic';
 
 export async function GET() {
   try {
     // Try to get a client from the pool and make a simple query
-    const client = await pool.connect();
-    await client.query('SELECT 1');
-    client.release(); // Release the client back to the pool
+    const pool = getPool();
+    await pool.query('SELECT 1');
 
     return NextResponse.json({ 
       status: "ok", 

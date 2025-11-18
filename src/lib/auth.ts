@@ -1,6 +1,6 @@
 import type { NextAuthOptions } from "next-auth";
 import CredentialsProvider from "next-auth/providers/credentials";
-import pool from "./db";
+import getPool from "./db";
 import bcrypt from "bcrypt";
 
 /** helpers: never throw at module scope (important for Vercel/build) */
@@ -36,10 +36,10 @@ export const getAuthOptions = (): NextAuthOptions => {
           return null;
         }
 
-        const client = await pool().connect();
+        const pool = getPool();
         try {
           console.log("[auth] Querying database for user:", credentials.email);
-          const { rows } = await client.query(
+          const { rows } = await pool.query(
             "SELECT id, email, password, first_name, last_name, email_verified FROM users WHERE email = $1",
             [credentials.email]
           );
@@ -74,8 +74,6 @@ export const getAuthOptions = (): NextAuthOptions => {
           if (error instanceof Error) {
             console.error("[auth] Error stack:", error.stack);
           }
-        } finally {
-          client.release();
         }
 
         console.log("[auth] Authorization failed");

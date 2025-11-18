@@ -175,9 +175,9 @@ export default function ResultsPage() {
             startTime: session.started_at || '',
             endTime: session.completed_at || '',
             duration: session.duration || 0,
-            totalScenarios: session.total_scenarios || 0,
-            passedScenarios: session.passed_scenarios || 0,
-            failedScenarios: session.failed_scenarios || 0,
+            totalScenarios: scenarios.length,
+            passedScenarios: scenarios.filter(s => s.status === 'passed').length,
+            failedScenarios: scenarios.filter(s => s.status === 'failed').length,
             totalSteps: (session.passed_steps || 0) + (session.failed_steps || 0),
             passedSteps: session.passed_steps || 0,
             failedSteps: session.failed_steps || 0,
@@ -248,7 +248,7 @@ export default function ResultsPage() {
 
   const getStatusColor = (status: string) => {
     switch (status) {
-      case 'completed': return 'bg-green-500';
+      case 'passed': return 'bg-green-500';
       case 'failed': return 'bg-red-500';
       case 'running': return 'bg-blue-500';
       case 'pending': return 'bg-yellow-500';
@@ -290,8 +290,8 @@ export default function ResultsPage() {
   }
 
   const totalScenarios = scenarios.length;
-  const passedScenarios = session.passed_scenarios || 0;
-  const failedScenarios = session.failed_scenarios || 0;
+  const passedScenarios = scenarios.filter(s => s.status === 'passed').length;
+  const failedScenarios = scenarios.filter(s => s.status === 'failed').length;
   const totalSteps = (session.passed_steps || 0) + (session.failed_steps || 0);
   const passedSteps = session.passed_steps || 0;
   const failedSteps = session.failed_steps || 0;
@@ -374,7 +374,7 @@ export default function ResultsPage() {
                       <CardContent className="p-4">
                         <div className="flex items-center justify-between mb-2">
                           <h3 className="text-lg font-semibold">{scenario.title}</h3>
-                          <Badge className={`${getStatusColor(scenario.status)} text-white`}>{scenario.status.toUpperCase()}</Badge>
+                          <Badge className={`${getStatusColor(scenario.status)} text-white`}>{scenario.status.charAt(0).toUpperCase() + scenario.status.slice(1)}</Badge>
                         </div>
                         <p className="text-sm text-slate-600 dark:text-slate-400 mb-2">{scenario.description}</p>
                         <div className="flex items-center gap-4 text-sm text-slate-500 dark:text-slate-400">

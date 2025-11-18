@@ -1,6 +1,6 @@
-import type { PoolClient } from '@neondatabase/serverless';
+import type { Pool } from '@neondatabase/serverless';
 import { v4 as uuidv4 } from 'uuid';
-import pool from './db';
+import getPool from './db';
 import type { TestLog, TestScenario, TestSession, TestReport } from './types';
 
 type TestSessionUpdate = Partial<
@@ -187,16 +187,12 @@ function ensureDatabaseConfigured(action: string): boolean {
   return false;
 }
 
-async function withClient<T>(handler: (client: PoolClient) => Promise<T>): Promise<T> {
+async function withPool<T>(handler: (pool: Pool) => Promise<T>): Promise<T> {
   if (!isDatabaseConfigured) {
     throw new Error('Database connection attempted while DATABASE_URL is not configured.');
   }
-  const client = await pool.connect();
-  try {
-    return await handler(client);
-  } finally {
-    client.release();
-  }
+  const pool = getPool();
+  return handler(pool);
 }
 
 export const databaseService = {
@@ -216,8 +212,8 @@ export const databaseService = {
       state.logs.push(entry);
       return entry;
     }
-    return withClient(async (client) => {
-      await client.query(
+    return withPool(async (pool) => {
+      await pool.query(
         `
           INSERT INTO test_logs (session_id, scenario_id, step_id, level, message, "timestamp", metadata)
           VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -250,7 +246,7 @@ export const databaseService = {
       state.session = nextSession;
       return nextSession;
     }
-    return withClient(async (client) => {
+    return withPool(async (pool) => {
       const entries = Object.entries(updates).filter(
         ([field, value]) => SESSION_UPDATE_FIELDS.has(field) && value !== undefined,
       );
@@ -264,7 +260,7 @@ export const databaseService = {
 
       setClauses.push(`updated_at = NOW()`);
 
-      const result = await client.query(
+      const result = await pool.query(
         `
           UPDATE test_sessions
           SET ${setClauses.join(', ')}
@@ -295,7 +291,7 @@ export const databaseService = {
       state.scenarios[scenarioId] = merged;
       return merged;
     }
-    return withClient(async (client) => {
+    return withPool(async (pool) => {
       const entries = Object.entries(updates).filter(
         ([field, value]) => SCENARIO_UPDATE_FIELDS.has(field) && value !== undefined,
       );
@@ -308,7 +304,7 @@ export const databaseService = {
       const values = entries.map(([, value]) => value);
       setClauses.push(`updated_at = NOW()`);
 
-      const result = await client.query(
+      const result = await pool.query(
         `
           UPDATE test_scenarios
           SET ${setClauses.join(', ')}
@@ -339,8 +335,8 @@ export const databaseService = {
       state.scenarioReports[report.scenario_id] = entry;
       return entry;
     }
-    return withClient(async (client) => {
-      const result = await client.query(
+    return withPool(async (pool) => {
+      const result = await pool.query(
         `
           INSERT INTO scenario_reports (scenario_id, session_id, summary, issues, recommendations)
           VALUES ($1, $2, $3, $4, $5)
@@ -383,8 +379,8 @@ export const databaseService = {
       state.report = entry;
       return entry;
     }
-    return withClient(async (client) => {
-      const result = await client.query(
+    return withPool(async (pool) => {
+      const result = await pool.query(
         `
           INSERT INTO test_reports (
             session_id,
@@ -468,10 +464,10 @@ export const databaseService = {
       };
     }
 
-    return withClient(async (client) => {
+    return withPool(async (pool) => {
       const {
         rows: [session],
-      } = await client.query(
+      } = await pool.query(
         `SELECT 
            ts.*, 
            tr.id AS report_id, tr.session_id AS report_session_id, tr.summary AS report_summary, 
@@ -510,7 +506,7 @@ export const databaseService = {
         delete session.report_performance_metrics;
       }
 
-      let { rows: scenarios } = await client.query(
+      let { rows: scenarios } = await pool.query(
         'SELECT * FROM test_scenarios WHERE session_id = $1 ORDER BY created_at ASC',
         [sessionId],
       );
@@ -521,7 +517,7 @@ export const databaseService = {
         if (session.status === 'completed' && hasRunning) {
           while (retries > 0) {
             await new Promise((resolve) => setTimeout(resolve, 1500));
-            const { rows: refetched } = await client.query(
+            const { rows: refetched } = await pool.query(
               'SELECT * FROM test_scenarios WHERE session_id = $1 ORDER BY created_at ASC',
               [sessionId],
             );
@@ -538,12 +534,12 @@ export const databaseService = {
         scenarios = scenarios.filter((scenario: any) => session.selected_scenario_ids.includes(scenario.id));
       }
 
-      const { rows: logs } = await client.query(
+      const { rows: logs } = await pool.query(
         'SELECT * FROM test_logs WHERE session_id = $1 ORDER BY timestamp ASC',
         [sessionId],
       );
 
-      const { rows: scenarioReports } = await client.query(
+      const { rows: scenarioReports } = await pool.query(
         'SELECT * FROM scenario_reports WHERE session_id = $1',
         [sessionId],
       );
@@ -597,7 +593,7 @@ export const databaseService = {
       };
     }
 
-    return withClient(async (client) => {
+    return withPool(async (pool) => {
       const paramsList: any[] = [userId];
       let searchClause = '';
       if (search) {
@@ -612,7 +608,7 @@ export const databaseService = {
         ${searchClause}
       `;
       const countParams = [...paramsList];
-      const { rows: countRows } = await client.query(countQuery, countParams);
+      const { rows: countRows } = await pool.query(countQuery, countParams);
       const total = parseInt(countRows[0].count, 10);
 
       const limitIndex = paramsList.length + 1;
@@ -630,7 +626,7 @@ export const databaseService = {
         OFFSET $${offsetIndex}
       `;
 
-      const { rows } = await client.query(dataQuery, paramsList);
+      const { rows } = await pool.query(dataQuery, paramsList);
 
       return { rows, total };
     });
