@@ -36,10 +36,10 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'URL is required' }, { status: 400 });
     }
 
-    const isVercel = process.env.VERCEL || process.env.LAMBDA_TASK_ROOT;
-    console.log(`[ai-test-form-validations] Environment detected as ${isVercel ? 'Vercel' : 'Local'}.`);
+    const isServerless = process.env.VERCEL || process.env.LAMBDA_TASK_ROOT || process.env.RENDER;
+    console.log(`[ai-test-form-validations] Environment detected as ${isServerless ? 'Serverless' : 'Local'}.`);
 
-    if (isVercel) {
+    if (isServerless) {
       console.log('[ai-test-form-validations] Launching browser with @sparticuz/chromium for serverless environment.');
       browser = await playwright.chromium.launch({
         args: chromium.args,

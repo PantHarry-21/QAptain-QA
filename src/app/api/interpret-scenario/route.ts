@@ -16,8 +16,8 @@ export async function POST(request: NextRequest) {
 
     if (!pageContext) {
         // Launch browser
-        const isVercel = process.env.VERCEL || process.env.LAMBDA_TASK_ROOT;
-        if (isVercel) {
+        const isServerless = process.env.VERCEL || process.env.LAMBDA_TASK_ROOT || process.env.RENDER;
+        if (isServerless) {
         browser = await playwright.chromium.launch({
             args: chromium.args,
             executablePath: await chromium.executablePath(),

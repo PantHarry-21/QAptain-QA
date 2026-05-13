@@ -29,33 +29,32 @@ export const getAuthOptions = (): NextAuthOptions => {
         password: { label: "Password", type: "password" },
       },
       async authorize(credentials) {
-        console.log("[auth] Authorize called with email:", credentials?.email);
-        
         if (!credentials?.email || !credentials?.password) {
-          console.log("[auth] Missing credentials");
           return null;
         }
 
+        const normalizedEmail = credentials.email.trim().toLowerCase();
         const pool = getPool();
         try {
-          console.log("[auth] Querying database for user:", credentials.email);
           const { rows } = await pool.query(
-            "SELECT id, email, password, first_name, last_name, email_verified FROM users WHERE email = $1",
-            [credentials.email]
+            "SELECT id, email, password, first_name, last_name, email_verified FROM users WHERE LOWER(email) = LOWER($1)",
+            [normalizedEmail]
           );
           const user = rows[0];
 
           if (!user) {
-            console.log("[auth] User not found in database");
             return null;
           }
 
-          console.log("[auth] User found, comparing password");
+          // Block login until activation link is used.
+          if (!user.email_verified) {
+            return null;
+          }
+
           // Compare password asynchronously
           const passwordMatch = await bcrypt.compare(credentials.password, user.password);
           
           if (passwordMatch) {
-            console.log("[auth] Password match! Creating user object");
             const fullName = user.first_name && user.last_name 
               ? `${user.first_name} ${user.last_name}` 
               : user.first_name || user.last_name || user.email || "User";
@@ -64,10 +63,7 @@ export const getAuthOptions = (): NextAuthOptions => {
               email: user.email,
               name: fullName,
             };
-            console.log("[auth] Returning user object:", { id: userObj.id, email: userObj.email, name: userObj.name });
             return userObj;
-          } else {
-            console.log("[auth] Password mismatch");
           }
         } catch (error) {
           console.error("[auth] Error during authorization:", error);
@@ -76,7 +72,6 @@ export const getAuthOptions = (): NextAuthOptions => {
           }
         }
 
-        console.log("[auth] Authorization failed");
         return null;
       },
     }),

@@ -10,7 +10,7 @@ import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter, DialogClose } from "@/components/ui/dialog";
-import { Loader2, ArrowLeft, Wand2, Target, PlusCircle, Bot, User, Trash2, Bookmark, GripVertical, CheckCircle, ChevronDown } from "lucide-react";
+import { Loader2, ArrowLeft, Wand2, Target, PlusCircle, Bot, User, Trash2, Bookmark, GripVertical, CheckCircle, ChevronDown, FileSpreadsheet, UploadCloud } from "lucide-react";
 import {
   DndContext,
   closestCenter,
@@ -92,6 +92,34 @@ export default function ScenariosPage() {
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
   const [selectedScenarioIds, setSelectedScenarioIds] = useState<Set<string>>(new Set());
 
+  // interpretScenario expects a compact "visible elements" shape.
+  // Our cached analyze-url response contains a richer PageContext, so map it.
+  const interpreterPageContext = useMemo(() => {
+    const pc = (pageAnalysis as any)?.pageContext;
+    if (!pc) return null;
+
+    const visibleLinks: string[] = Array.isArray(pc.navLinks)
+      ? pc.navLinks.map((l: any) => (typeof l?.text === 'string' ? l.text : '')).filter((t: string) => t.trim().length > 0)
+      : [];
+
+    const formInputs: Array<{ name: string; placeholder: string; label?: string; type?: string }> = Array.isArray(pc.forms)
+      ? pc.forms.flatMap((f: any) =>
+          (Array.isArray(f?.inputs) ? f.inputs : []).map((i: any) => ({
+            name: typeof i?.name === 'string' ? i.name : '',
+            placeholder: typeof i?.placeholder === 'string' ? i.placeholder : '',
+            label: '',
+            type: typeof i?.type === 'string' ? i.type : '',
+          })),
+        )
+      : [];
+
+    return {
+      visibleButtons: [] as string[],
+      visibleLinks,
+      formInputs,
+    };
+  }, [pageAnalysis]);
+
   // State for manual scenario input
   const [manualStory, setManualStory] = useState("");
   const [isInterpreting, setIsInterpreting] = useState(false);
@@ -100,6 +128,8 @@ export default function ScenariosPage() {
   const [savedScenarios, setSavedScenarios] = useState<SavedScenarioDto[]>([]);
   const [isLoadingSaved, setIsLoadingSaved] = useState(false);
   const [selectedSaved, setSelectedSaved] = useState<Set<string>>(new Set());
+  const [isImportingExcel, setIsImportingExcel] = useState(false);
+  const [bulkText, setBulkText] = useState('');
 
   const router = useRouter();
 
@@ -142,11 +172,35 @@ export default function ScenariosPage() {
       router.push('/');
       return;
     }
+    const directRun = sessionStorage.getItem('directRun') === 'true';
     
     const analysis = JSON.parse(storedAnalysis);
     setUrl(storedUrl);
     setPageAnalysis(analysis);
 
+    if (directRun) {
+      // Direct run mode: do not auto-generate scenarios.
+      setScenarios([]);
+      setSelectedScenarioIds(new Set());
+      return;
+    }
+
+    // Fast path: if Home already stored generated scenarios in sessionStorage,
+    // avoid doing an extra Playwright + OpenAI round-trip.
+    const initialScenarios = Array.isArray((analysis as any)?.scenarios) ? (analysis as any).scenarios : null;
+    if (initialScenarios && initialScenarios.length) {
+      const scenariosWithIds = initialScenarios.map((sc: any) => ({
+        ...sc,
+        id: uuidv4(),
+        isSaved: false,
+        type: 'ai' as const,
+      }));
+      setScenarios(scenariosWithIds);
+      setSelectedScenarioIds(new Set());
+      return;
+    }
+
+    // Fallback: re-run analysis if the stored session payload is missing scenarios.
     const generateInitialScenarios = async () => {
       setIsLoading(true);
       try {
@@ -166,12 +220,11 @@ export default function ScenariosPage() {
           ...sc,
           id: uuidv4(),
           isSaved: false,
-          type: 'ai' as const
+          type: 'ai' as const,
         }));
-        
+
         setScenarios(scenariosWithIds);
         setSelectedScenarioIds(new Set());
-
       } catch (err) {
         setError(err instanceof Error ? err.message : 'An unknown error occurred while generating scenarios.');
       } finally {
@@ -191,7 +244,7 @@ export default function ScenariosPage() {
       const response = await fetch('/api/interpret-scenario', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, userStory: manualStory, pageContext: pageAnalysis }),
+        body: JSON.stringify({ url, userStory: manualStory, pageContext: interpreterPageContext }),
       });
       if (!response.ok) throw new Error('Failed to interpret scenario');
       const data = await response.json();
@@ -211,6 +264,93 @@ export default function ScenariosPage() {
     } finally {
       setIsInterpreting(false);
     }
+  };
+
+  const handleImportExcel = async (file: File) => {
+    setIsImportingExcel(true);
+    setError('');
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('url', url);
+      if (interpreterPageContext) {
+        formData.append('pageContext', JSON.stringify(interpreterPageContext));
+      }
+
+      const response = await fetch('/api/import-excel', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || 'Failed to import Excel test cases.');
+      }
+
+      const data: { scenarios: Array<{ title: string; description?: string; steps: string[] }> } = await response.json();
+
+      const imported = (data.scenarios || []).map((s) => ({
+        id: uuidv4(),
+        title: s.title,
+        description: s.description ?? 'Imported from Excel',
+        steps: Array.isArray(s.steps) ? s.steps.map((x) => String(x)) : [],
+        isSaved: false,
+        type: 'manual' as const,
+      }));
+
+      if (!imported.length) {
+        throw new Error('No valid scenarios were found in the spreadsheet.');
+      }
+
+      setScenarios(imported);
+      setSelectedScenarioIds(new Set(imported.map((s) => s.id)));
+      toast({ title: 'Excel Imported', description: `${imported.length} scenario(s) imported.` });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'An unknown error occurred during Excel import.');
+    } finally {
+      setIsImportingExcel(false);
+    }
+  };
+
+  const parseBulkScenarios = (input: string) => {
+    const blocks = input
+      .split(/\n\s*\n/g)
+      .map((b) => b.trim())
+      .filter(Boolean);
+
+    const normalizeSteps = (line: string) =>
+      line
+        .split(/\s*\|\s*|\s*→\s*|\s*->\s*/g)
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+    const parsed = blocks.map((block) => {
+      const lines = block.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      const title = lines[0] || 'Imported Scenario';
+      const rest = lines.slice(1).join('\n');
+      const steps = rest ? normalizeSteps(rest) : normalizeSteps(title).slice(1);
+      return {
+        id: uuidv4(),
+        title,
+        description: 'Pasted by user',
+        steps: steps.length ? steps : normalizeSteps(title),
+        isSaved: false,
+        type: 'manual' as const,
+      };
+    });
+
+    return parsed.filter((s) => s.steps.length > 0);
+  };
+
+  const handleUseBulkText = () => {
+    const parsed = parseBulkScenarios(bulkText);
+    if (!parsed.length) {
+      setError('No scenarios found in pasted text. Separate scenarios with a blank line.');
+      return;
+    }
+    setScenarios(parsed);
+    setSelectedScenarioIds(new Set(parsed.map((s) => s.id)));
+    toast({ title: 'Scenarios Loaded', description: `${parsed.length} scenario(s) loaded from pasted text.` });
   };
 
   const handleSelectionChange = (checked: boolean, scenarioId: string) => {
@@ -441,6 +581,71 @@ export default function ScenariosPage() {
                     <Button onClick={handleAddManualScenario} disabled={isInterpreting || !manualStory.trim()}>{isInterpreting ? <Loader2 className="w-4 h-4 mr-2 animate-spin"/> : <Wand2 className="w-4 h-4 mr-2"/>}Interpret & Add</Button>
                   </DialogClose>
                 </DialogFooter>
+              </DialogContent>
+            </Dialog>
+            <Dialog>
+              <DialogTrigger asChild>
+                <Button variant="outline">
+                  <UploadCloud className="w-4 h-4 mr-2" />
+                  Paste Scenarios
+                </Button>
+              </DialogTrigger>
+              <DialogContent className="max-w-3xl">
+                <DialogHeader>
+                  <DialogTitle>Paste Scenarios / Steps</DialogTitle>
+                </DialogHeader>
+                <Textarea
+                  placeholder={`Example:\nNavigate to Document Management → Method Development | Verify left-side columns\n\nClick PDF icon in Method Pdf column for an existing record\n\nSearch by Method Code (e.g., AMVR/2508/028) | Search invalid text`}
+                  rows={14}
+                  value={bulkText}
+                  onChange={(e) => setBulkText(e.target.value)}
+                  className="bg-transparent"
+                />
+                <DialogFooter>
+                  <DialogClose asChild>
+                    <Button onClick={handleUseBulkText} disabled={!bulkText.trim()}>
+                      Use Pasted Scenarios
+                    </Button>
+                  </DialogClose>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+            <Dialog>
+              <DialogTrigger asChild>
+                <Button variant="outline" disabled={isLoading || isImportingExcel || !url}>
+                  <FileSpreadsheet className="w-4 h-4 mr-2" />
+                  Import Excel
+                </Button>
+              </DialogTrigger>
+              <DialogContent className="max-w-3xl">
+                <DialogHeader>
+                  <DialogTitle>Import Test Scenarios from Excel</DialogTitle>
+                </DialogHeader>
+
+                <div className="space-y-4">
+                  <div className="space-y-2">
+                    <p className="text-sm text-muted-foreground">
+                      Expected columns (case-insensitive): `title` and either `steps` OR `user_story`.
+                      Also supports `Step 1`, `Step 2`, ... columns.
+                    </p>
+                    <input
+                      type="file"
+                      accept=".xlsx,.xls"
+                      disabled={isImportingExcel}
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        if (f) handleImportExcel(f);
+                      }}
+                      className="block w-full text-sm text-slate-300"
+                    />
+                  </div>
+                  {isImportingExcel && (
+                    <div className="flex items-center gap-3 text-sm text-slate-400">
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Importing & converting scenarios…
+                    </div>
+                  )}
+                </div>
               </DialogContent>
             </Dialog>
           </div>

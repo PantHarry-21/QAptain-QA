@@ -135,6 +135,12 @@ export default function TestExecutionPage() {
     });
   };
 
+  const handleStopTest = () => {
+    if (!sessionId) return;
+    socket?.emit('stop-test', { sessionId });
+    setTestStatus('failed');
+  };
+
   const handleViewResults = () => {
     router.push(`/results/${sessionId}`);
   };
@@ -225,6 +231,13 @@ export default function TestExecutionPage() {
                       <Play className="w-4 h-4 mr-2" />
                     )}
                     {testStatus === 'running' ? 'Starting...' : 'Start Test'}
+                  </Button>
+                )}
+
+                {testStatus === 'running' && (
+                  <Button variant="destructive" onClick={handleStopTest} disabled={!isConnected}>
+                    <Square className="w-4 h-4 mr-2" />
+                    Stop Testing
                   </Button>
                 )}
 

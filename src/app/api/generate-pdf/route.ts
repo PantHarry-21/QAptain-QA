@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import jsPDF from 'jspdf';
-import html2canvas from 'html2canvas';
+import { getServerSession } from 'next-auth';
+import { getAuthOptions } from '@/lib/auth';
+import getPool from '@/lib/db';
 
 export const dynamic = 'force-dynamic';
 
@@ -22,8 +24,17 @@ interface TestLog {
   timestamp: string;
   level: 'info' | 'success' | 'error' | 'warning';
   message: string;
+  scenario_id?: string;
+  step_id?: string;
   step?: string;
   screenshot?: string;
+  metadata?: {
+    screenshot?: string;
+    stepDescription?: string;
+    errorMessage?: string;
+    errorStack?: string;
+    [k: string]: unknown;
+  } | null;
 }
 
 interface ScenarioResult {
@@ -32,6 +43,7 @@ interface ScenarioResult {
   status: 'passed' | 'failed';
   duration: number;
   steps: string[];
+  error_message?: string | null;
 }
 
 interface AIAnalysis {
@@ -52,22 +64,98 @@ interface AIAnalysis {
 
 interface PDFRequest {
   sessionId: string;
-  testResult: TestResult;
-  logs: TestLog[];
-  scenarioResults: ScenarioResult[];
-  aiAnalysis: AIAnalysis;
-  url: string;
 }
 
 export async function POST(request: NextRequest) {
   try {
-    const { sessionId, testResult, logs, scenarioResults, aiAnalysis, url }: PDFRequest = await request.json();
-
-    if (!sessionId || !testResult) {
+    const { sessionId }: PDFRequest = await request.json();
+    if (!sessionId) {
       return NextResponse.json({ 
-        error: 'Session ID and test result are required' 
+        error: 'Session ID is required'
       }, { status: 400 });
     }
+
+    const authSession = await getServerSession(getAuthOptions());
+    if (!authSession || !authSession.user || !authSession.user.id) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const pool = getPool();
+
+    const { rows: sessionRows } = await pool.query(
+      'SELECT * FROM test_sessions WHERE id = $1 AND user_id = $2',
+      [sessionId, authSession.user.id],
+    );
+    const dbSession = sessionRows[0];
+    if (!dbSession) {
+      return NextResponse.json({ error: 'Session not found' }, { status: 404 });
+    }
+
+    const { rows: scenarioRows } = await pool.query(
+      'SELECT id, title, status, duration, steps, error_message FROM test_scenarios WHERE session_id = $1 ORDER BY created_at ASC',
+      [sessionId],
+    );
+    const { rows: logRows } = await pool.query(
+      'SELECT id, "timestamp", level, message, scenario_id, step_id, metadata FROM test_logs WHERE session_id = $1 ORDER BY "timestamp" ASC',
+      [sessionId],
+    );
+    const { rows: reportRows } = await pool.query(
+      'SELECT * FROM test_reports WHERE session_id = $1 LIMIT 1',
+      [sessionId],
+    );
+
+    const testResult: TestResult = {
+      status: dbSession.status,
+      startTime: dbSession.started_at ? new Date(dbSession.started_at).toISOString() : dbSession.created_at,
+      endTime: dbSession.completed_at ? new Date(dbSession.completed_at).toISOString() : dbSession.updated_at,
+      duration: dbSession.duration ?? 0,
+      totalScenarios: dbSession.total_scenarios ?? scenarioRows.length,
+      passedScenarios: dbSession.passed_scenarios ?? 0,
+      failedScenarios: dbSession.failed_scenarios ?? 0,
+      totalSteps: dbSession.total_steps ?? 0,
+      passedSteps: dbSession.passed_steps ?? 0,
+      failedSteps: dbSession.failed_steps ?? 0,
+    };
+
+    const logs: TestLog[] = logRows.map((r: any) => ({
+      id: r.id,
+      timestamp: r.timestamp ? new Date(r.timestamp).toISOString() : new Date().toISOString(),
+      level: r.level,
+      message: r.message,
+      scenario_id: r.scenario_id,
+      step_id: r.step_id,
+      metadata: r.metadata ?? null,
+    }));
+
+    const scenarioResults: ScenarioResult[] = scenarioRows.map((r: any) => ({
+      id: r.id,
+      title: r.title,
+      status: r.status,
+      duration: r.duration ?? 0,
+      steps: r.steps ?? [],
+      error_message: r.error_message ?? null,
+    }));
+
+    const dbReport = reportRows[0];
+    const aiAnalysis: AIAnalysis | null = dbReport
+      ? {
+          summary: dbReport.summary ?? '',
+          keyFindings: dbReport.key_findings ?? [],
+          recommendations: dbReport.recommendations ?? [],
+          riskAssessment: {
+            level: dbReport.risk_level,
+            issues: dbReport.risk_assessment_issues ?? [],
+          },
+          performanceMetrics: dbReport.performance_metrics ?? {
+            averageStepTime: 0,
+            fastestStep: '',
+            slowestStep: '',
+            totalExecutionTime: 0,
+          },
+        }
+      : null;
+
+    const url = dbSession.url ?? '';
 
     // Generate PDF
     const pdfBuffer = await generatePDFReport({
@@ -76,7 +164,7 @@ export async function POST(request: NextRequest) {
       logs,
       scenarioResults,
       aiAnalysis,
-      url
+      url,
     });
 
     // Return PDF as response
@@ -104,7 +192,7 @@ async function generatePDFReport(data: {
   testResult: TestResult;
   logs: TestLog[];
   scenarioResults: ScenarioResult[];
-  aiAnalysis: AIAnalysis;
+  aiAnalysis: AIAnalysis | null;
   url: string;
 }): Promise<Buffer> {
   // Create PDF document
@@ -245,6 +333,46 @@ async function generatePDFReport(data: {
     
     yPosition += 15;
   });
+
+  // Bug Reports (Playwright)
+  checkPageSpace(40);
+  addText('Bug Reports (Playwright)', 20, 18, true);
+  yPosition += 10;
+
+  const failedScenarios = data.scenarioResults.filter((s) => s.status === 'failed');
+  if (failedScenarios.length === 0) {
+    addText('No failures detected.', 20, 12);
+    yPosition += 10;
+  } else {
+    const truncate = (v: unknown, n: number) => (typeof v === 'string' ? v.slice(0, n) : String(v ?? '').slice(0, n));
+
+    failedScenarios.forEach((scenario, index) => {
+      checkPageSpace(50);
+
+      addText(`${index + 1}. ${scenario.title}`, 20, 14, true);
+      yPosition += 4;
+      if (scenario.error_message) {
+        addText(`Error: ${truncate(scenario.error_message, 5000)}`, 25, 10);
+        yPosition += 4;
+      }
+
+      const related = data.logs
+        .filter((l) => l.scenario_id === scenario.id)
+        .filter((l) => l.metadata && typeof l.metadata === 'object' && 'errorMessage' in l.metadata && (l.metadata as any).errorMessage);
+
+      const last = related[related.length - 1];
+      if (last?.metadata) {
+        const md = last.metadata as any;
+        if (md.stepDescription) addText(`Failing Step: ${truncate(md.stepDescription, 3000)}`, 25, 10);
+        if (md.errorMessage) addText(`Playwright Error: ${truncate(md.errorMessage, 3000)}`, 25, 10);
+        if (md.errorStack) addText(`Stack: ${truncate(md.errorStack, 2000)}`, 25, 10);
+      } else {
+        addText('Playwright error details will appear here once captured.', 25, 10);
+      }
+
+      yPosition += 15;
+    });
+  }
 
   // AI Analysis
   if (data.aiAnalysis) {

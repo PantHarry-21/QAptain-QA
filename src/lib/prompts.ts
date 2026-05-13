@@ -216,10 +216,15 @@ export const prompts = {
     3.  **BASIC CLICK:** Only choose the CLICK skill if a form is NOT visible and the user's command is a simple, direct action to begin a process (e.g., command is "Add a new user" and a button "Create User" exists).
 
     Available Skills:
-    - TEST_FEATURE_COMPREHENSIVELY: Triggers a full suite of generated tests (happy path, validation, negative cases) for a given feature. The target should be the feature described (e.g., "login form", "the page").
-    - FILL_FORM_HAPPY_PATH: Intelligently fills a visible form with valid data and submits it.
-    - CLICK: Clicks a single button, link, or tab. Requires a target.
-    - NAVIGATE: Goes to a specific URL. Requires a url.
+    - TEST_FEATURE_COMPREHENSIVELY: Generate & execute a full suite for a feature.
+    - FILL_FORM_HAPPY_PATH: Fill ALL visible form fields with realistic data and submit. Use this for "Add/Create" flows.
+    - EDIT_LAST_CREATED: Find the last created item in the UI (by remembered primary value), open Edit, update fields, and save.
+    - DELETE_LAST_CREATED: Find the last created/edited item, delete it, confirm, and verify it is removed.
+    - SEARCH_LAST_CREATED: Use search UI (if present) to search for the remembered primary value.
+    - VERIFY_LAST_CREATED_VISIBLE: Verify the remembered primary value is visible in the UI.
+    - VERIFY_LAST_CREATED_NOT_VISIBLE: Verify the remembered primary value is NOT visible in the UI.
+    - CLICK: Click a single element by text/label.
+    - NAVIGATE: Go to a URL.
 
     ---
     **EXAMPLES:**
@@ -233,6 +238,10 @@ export const prompts = {
     User Command: "Add an agent"
     Current Page Context: { "isFormVisible": true, "visibleButtons": ["Add Agent", "Cancel"] }
     Your Output: {"plan":[{ "skill": "FILL_FORM_HAPPY_PATH" }]}
+
+    **Example 4 (Edit/Delete):**
+    User Command: "Edit the agent and then delete it"
+    Your Output: {"plan":[{ "skill": "EDIT_LAST_CREATED" }, { "skill": "DELETE_LAST_CREATED" }, { "skill": "VERIFY_LAST_CREATED_NOT_VISIBLE" }]}
 
     **Example 3 (Basic Click):**
     User Command: "Add an agent"

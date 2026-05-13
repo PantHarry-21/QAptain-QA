@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Loader2, Globe, Zap, BarChart3, Play } from "lucide-react";
+import { Loader2, Globe, Zap, BarChart3, Play, ArrowRight } from "lucide-react";
 import { useSession } from 'next-auth/react';
 
 export default function Home() {
@@ -24,6 +24,28 @@ export default function Home() {
     } catch {
       return false;
     }
+  };
+
+  const proceedDirectRun = () => {
+    setError("");
+    if (status === 'unauthenticated') {
+      router.push('/login?error=Please log in to start a test.');
+      return;
+    }
+    if (!url.trim()) {
+      setError("Please enter a URL");
+      return;
+    }
+    if (!validateUrl(url)) {
+      setError("Please enter a valid URL (e.g., https://example.com)");
+      return;
+    }
+    const formattedUrl = url.startsWith('http') ? url : `https://${url}`;
+    sessionStorage.setItem('targetUrl', formattedUrl);
+    // Mark as direct-run: Scenarios page will skip analyze-url.
+    sessionStorage.setItem('directRun', 'true');
+    sessionStorage.setItem('pageAnalysis', JSON.stringify({ scenarios: [], pageContext: null }));
+    router.push('/scenarios');
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -65,6 +87,7 @@ export default function Home() {
 
       sessionStorage.setItem('targetUrl', formattedUrl);
       sessionStorage.setItem('pageAnalysis', JSON.stringify(analysis));
+      sessionStorage.setItem('directRun', 'false');
       
       router.push('/scenarios');
     } catch (err) {
@@ -116,6 +139,18 @@ export default function Home() {
                       <Play className="w-4 h-4" />
                     )}
                     Analyze URL
+                  </Button>
+                </div>
+                <div className="flex justify-end">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={proceedDirectRun}
+                    disabled={isSubmitting}
+                    className="mt-2"
+                  >
+                    <ArrowRight className="w-4 h-4 mr-2" />
+                    Continue without analysis
                   </Button>
                 </div>
               </div>

@@ -37,7 +37,7 @@ function LoginForm() {
       console.log('[Login] Sign in result:', result);
 
       if (result?.error) {
-        setError('Invalid email or password');
+        setError('Invalid credentials or account not activated yet');
         console.error('[Login] Sign in error:', result.error);
       } else if (result?.ok) {
         // Manual redirect on success

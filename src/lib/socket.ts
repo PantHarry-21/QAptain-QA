@@ -1,5 +1,5 @@
 import { Server } from 'socket.io';
-import { executeTests } from './test-executor';
+import { executeTests, requestStop } from './test-executor';
 
 interface StartTestPayload {
   sessionId: string;
@@ -50,6 +50,18 @@ export const setupSocket = (io: Server) => {
       executeTests(io, sessionId, scenarios, url).catch((err) => {
         console.error('executeTests failed:', err);
         socket.emit('test-failed', { error: err instanceof Error ? err.message : 'Unknown error' });
+      });
+    });
+
+    socket.on('stop-test', ({ sessionId }: { sessionId: string }) => {
+      if (!sessionId) return;
+      requestStop(sessionId);
+      const sessionRoom = `session-${sessionId}`;
+      io.to(sessionRoom).emit('test-log', {
+        id: `stop-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        level: 'warning',
+        message: 'Stop requested by user. Cancelling execution…',
       });
     });
 

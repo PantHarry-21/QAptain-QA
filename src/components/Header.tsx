@@ -23,7 +23,7 @@ export default function Header() {
       <div className="container mx-auto px-4 py-3">
         <div className="flex items-center justify-between">
           <Link href="/" className="flex items-center gap-2">
-            <Image src="/logo.png" alt="QAptain Logo" width={35} height={25} />
+            <Image src="" alt="QAptain Logo" width={35} height={25} />
             <span className="text-2xl font-bold">QAptain</span>
           </Link>
           <div className="flex items-center gap-4">

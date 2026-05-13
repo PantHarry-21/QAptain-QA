@@ -10,6 +10,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Separator } from "@/components/ui/separator";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import { 
   Loader2, 
   ArrowLeft, 
@@ -22,15 +23,13 @@ import {
   ShieldAlert, 
   Monitor,
   Camera,
-  Download
+  Download,
+  FileText,
+  Video
 } from "lucide-react";
 import Link from 'next/link';
 import Image from 'next/image';
-
 import { io, Socket } from "socket.io-client";
-import dynamic from 'next/dynamic';
-
-
 
 interface TestSession {
   id: string;
@@ -45,16 +44,14 @@ interface TestSession {
   failed_scenarios?: number;
   passed_steps?: number;
   failed_steps?: number;
+  video_url?: string;
 }
 
 interface TestScenario {
   id: string;
   title: string;
   description: string;
-  priority: 'high' | 'medium' | 'low';
-  category: string;
   steps: string[];
-  estimated_time: string;
   status: string;
   started_at?: string;
   completed_at?: string;
@@ -67,25 +64,24 @@ interface TestLog {
   timestamp: string;
   level: 'info' | 'success' | 'error' | 'warning';
   message: string;
-  step_id?: string;
   scenario_id?: string;
   metadata?: { screenshot?: string };
 }
 
 interface TestReport {
   id: string;
-  session_id: string;
   summary: string;
   key_findings: string[];
   recommendations: string[];
   risk_level: 'low' | 'medium' | 'high';
-  performance_metrics: {
-    averageStepTime: number;
-    fastestStep: string;
-    slowestStep: string;
-    totalExecutionTime: number;
-  };
   quality_score: number;
+}
+
+interface ScenarioReport {
+  scenario_id: string;
+  summary: string;
+  issues: string[];
+  recommendations: string[];
 }
 
 export default function ResultsPage() {
@@ -96,11 +92,10 @@ export default function ResultsPage() {
   const [scenarios, setScenarios] = useState<TestScenario[]>([]);
   const [logs, setLogs] = useState<TestLog[]>([]);
   const [report, setReport] = useState<TestReport | null>(null);
-  const [scenarioReports, setScenarioReports] = useState<any[]>([]);
+  const [scenarioReports, setScenarioReports] = useState<ScenarioReport[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
-  const [socket, setSocket] = useState<Socket | null>(null);
 
   useEffect(() => {
     const newSocket = io(process.env.NEXT_PUBLIC_SOCKET_URL || 'http://localhost:3000', {
@@ -108,9 +103,7 @@ export default function ResultsPage() {
       transports: ['websocket', 'polling']
     });
 
-    newSocket.on('connect', () => {
-      newSocket.emit('join-session', { sessionId });
-    });
+    newSocket.on('connect', () => newSocket.emit('join-session', { sessionId }));
 
     newSocket.on('session-data', (data) => {
       if (data) {
@@ -123,82 +116,29 @@ export default function ResultsPage() {
       setLoading(false);
     });
 
-    newSocket.on('test-log', (log: TestLog) => {
-      setLogs(prev => [...prev, log]);
-    });
-
+    newSocket.on('test-log', (log: TestLog) => setLogs(prev => [...prev, log]));
     newSocket.on('test-scenario-update', (updatedScenario: TestScenario) => {
-      setScenarios(prevScenarios =>
-        prevScenarios.map(scenario =>
-          scenario.id === updatedScenario.id ? updatedScenario : scenario
-        )
-      );
+      setScenarios(prev => prev.map(s => s.id === updatedScenario.id ? updatedScenario : s));
     });
-
-    newSocket.on('test-report-update', (updatedReport: TestReport) => {
-      setReport(updatedReport);
-    });
-
+    newSocket.on('test-report-update', (updatedReport: TestReport) => setReport(updatedReport));
     newSocket.on('test-completed', (data: { results: TestSession, scenarios: TestScenario[] }) => {
       setSession(prev => ({ ...prev, ...data.results, status: 'completed' }));
-      if (data.scenarios) {
-        setScenarios(data.scenarios);
-      }
+      if (data.scenarios) setScenarios(data.scenarios);
     });
 
-    setSocket(newSocket);
-
-    // Initial data is now fetched via the 'session-data' websocket event.
-
-    return () => {
-      newSocket.disconnect();
-    };
+    return () => { newSocket.disconnect(); };
   }, [sessionId]);
-
-  const handleViewResults = () => {
-    router.push(`/results/${sessionId}`);
-  };
-
+  
   const handleDownloadReport = async () => {
     if (!session) return;
     setIsDownloading(true);
     try {
       const response = await fetch('/api/generate-pdf', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          sessionId: session.id,
-          testResult: {
-            status: session.status,
-            startTime: session.started_at || '',
-            endTime: session.completed_at || '',
-            duration: session.duration || 0,
-            totalScenarios: scenarios.length,
-            passedScenarios: scenarios.filter(s => s.status === 'passed').length,
-            failedScenarios: scenarios.filter(s => s.status === 'failed').length,
-            totalSteps: (session.passed_steps || 0) + (session.failed_steps || 0),
-            passedSteps: session.passed_steps || 0,
-            failedSteps: session.failed_steps || 0,
-          },
-          logs,
-          scenarioResults: scenarios.map(s => ({
-            id: s.id,
-            title: s.title,
-            status: s.status as 'passed' | 'failed',
-            duration: s.duration || 0,
-            steps: s.steps,
-          })),
-          aiAnalysis: report,
-          url: session.url,
-        }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: session.id }),
       });
-
-      if (!response.ok) {
-        throw new Error('Failed to generate PDF from server.');
-      }
-
+      if (!response.ok) throw new Error('Failed to generate PDF from server.');
       const pdfBlob = await response.blob();
       const url = window.URL.createObjectURL(pdfBlob);
       const a = document.createElement('a');
@@ -208,7 +148,6 @@ export default function ResultsPage() {
       a.click();
       a.remove();
       window.URL.revokeObjectURL(url);
-
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to download report');
     } finally {
@@ -216,364 +155,212 @@ export default function ResultsPage() {
     }
   };
 
-  const formatTime = (dateString?: string) => {
-    if (!dateString) return 'N/A';
-    return new Date(dateString).toLocaleTimeString();
+  const getStatusBadge = (status: string) => {
+    const colorMap = {
+      passed: 'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-300',
+      failed: 'bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-300',
+      running: 'bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-300 animate-pulse',
+      pending: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-300',
+    };
+    return <Badge className={`capitalize ${colorMap[status] || 'bg-gray-100 text-gray-800'}`}>{status}</Badge>;
   };
 
-  const formatDate = (dateString?: string) => {
-    if (!dateString) return 'N/A';
-    return new Date(dateString).toLocaleDateString();
-  };
+  const StatCard = ({ title, value, icon, color }) => (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between pb-2">
+        <CardTitle className="text-sm font-medium">{title}</CardTitle>
+        {icon}
+      </CardHeader>
+      <CardContent>
+        <div className={`text-2xl font-bold ${color || ''}`}>{value}</div>
+      </CardContent>
+    </Card>
+  );
 
-
-
-  const getLogIcon = (level: string) => {
-    switch (level) {
-      case 'success': return <CheckCircle className="w-4 h-4 text-green-500" />;
-      case 'error': return <XCircle className="w-4 h-4 text-red-500" />;
-      case 'warning': return <Clock className="w-4 h-4 text-yellow-500" />;
-      default: return <Activity className="w-4 h-4 text-blue-500" />;
-    }
-  };
-
-  const getLogColor = (level: string) => {
-    switch (level) {
-      case 'success': return 'text-green-700 bg-green-50 dark:text-green-300 dark:bg-green-900/20';
-      case 'error': return 'text-red-700 bg-red-50 dark:text-red-300 dark:bg-red-900/20';
-      case 'warning': return 'text-yellow-700 bg-yellow-50 dark:text-yellow-300 dark:bg-yellow-900/20';
-      default: return 'text-blue-700 bg-blue-50 dark:text-blue-300 dark:bg-blue-900/20';
-    }
-  };
-
-  const getStatusColor = (status: string) => {
-    switch (status) {
-      case 'passed': return 'bg-green-500';
-      case 'failed': return 'bg-red-500';
-      case 'running': return 'bg-blue-500';
-      case 'pending': return 'bg-yellow-500';
-      default: return 'bg-gray-500';
-    }
-  };
-
-  if (loading) {
+  const renderScenarioItem = (scenario: TestScenario) => {
+    const scenarioReport = scenarioReports.find(r => r.scenario_id === scenario.id);
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-900 dark:to-slate-800">
-        <div className="text-center">
-          <Loader2 className="w-12 h-12 animate-spin mx-auto mb-4" />
-          <p className="text-lg text-slate-700 dark:text-slate-300">Loading test results...</p>
-        </div>
-      </div>
+      <AccordionItem value={scenario.id} key={scenario.id}>
+        <AccordionTrigger>
+          <div className="flex items-center justify-between w-full">
+            <div className="flex items-center gap-3">
+              {scenario.status === 'passed' ? <CheckCircle className="w-5 h-5 text-green-500" /> : <XCircle className="w-5 h-5 text-red-500" />}
+              <span className="font-semibold">{scenario.title}</span>
+            </div>
+            {getStatusBadge(scenario.status)}
+          </div>
+        </AccordionTrigger>
+        <AccordionContent className="p-4 bg-muted/50 rounded-b-md">
+          <p className="text-sm text-muted-foreground mb-4">{scenario.description}</p>
+          <div className="mb-4">
+            <h4 className="font-semibold mb-2">Steps:</h4>
+            <ul className="list-decimal list-inside text-sm space-y-1">
+              {scenario.steps.map((step, i) => <li key={i}>{step}</li>)}
+            </ul>
+          </div>
+          {scenario.error_message && (
+            <Alert variant="destructive">
+              <AlertTitle>Failure Reason</AlertTitle>
+              <AlertDescription>{scenario.error_message}</AlertDescription>
+            </Alert>
+          )}
+          {scenarioReport && (
+            <div className="mt-4 border-t pt-4">
+                <h4 className="font-semibold mb-2 flex items-center gap-2"><Lightbulb className="w-4 h-4" /> AI Analysis</h4>
+                <p className="text-sm italic text-muted-foreground mb-2">{scenarioReport.summary}</p>
+                {scenarioReport.issues?.length > 0 && <div className="mt-2">
+                    <h5 className="font-semibold text-sm">Issues Found:</h5>
+                    <ul className="list-disc list-inside text-sm text-red-600 dark:text-red-400">
+                        {scenarioReport.issues.map((issue, i) => <li key={i}>{issue}</li>)}
+                    </ul>
+                </div>}
+            </div>
+          )}
+        </AccordionContent>
+      </AccordionItem>
     );
-  }
+  };
+  
+  if (loading) return (
+    <div className="flex items-center justify-center py-20"><Loader2 className="w-12 h-12 animate-spin" /></div>
+  );
+  if (error) return (
+    <div className="flex items-center justify-center py-20"><Alert variant="destructive" className="max-w-md"><AlertTitle>Error</AlertTitle><AlertDescription>{error}</AlertDescription></Alert></div>
+  );
+  if (!session) return (
+    <div className="flex items-center justify-center py-20"><Alert className="max-w-md"><AlertTitle>No Results Found</AlertTitle><AlertDescription>Session {sessionId} not found.</AlertDescription></Alert></div>
+  );
 
-  if (error) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-900 dark:to-slate-800">
-        <Alert variant="destructive" className="max-w-md">
-          <AlertTitle>Error</AlertTitle>
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
-      </div>
-    );
-  }
-
-  if (!session) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-900 dark:to-slate-800">
-        <Alert className="max-w-md">
-          <AlertTitle>No Results Found</AlertTitle>
-          <AlertDescription>No test session found for ID: {sessionId}. It might not exist or has been deleted.</AlertDescription>
-        </Alert>
-      </div>
-    );
-  }
-
-  const totalScenarios = scenarios.length;
   const passedScenarios = scenarios.filter(s => s.status === 'passed').length;
   const failedScenarios = scenarios.filter(s => s.status === 'failed').length;
-  const totalSteps = (session.passed_steps || 0) + (session.failed_steps || 0);
-  const passedSteps = session.passed_steps || 0;
-  const failedSteps = session.failed_steps || 0;
-
-  const overallProgress = totalScenarios > 0 ? Math.round((passedScenarios / totalScenarios) * 100) : 0;
-
+  const overallProgress = scenarios.length > 0 ? Math.round(((passedScenarios + failedScenarios) / scenarios.length) * 100) : 0;
   const screenshotLogs = logs.filter(log => log.metadata?.screenshot);
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-900 dark:to-slate-800">
-      <div className="container mx-auto px-4 py-8">
-        <div className="mb-8">
-          <div className="flex justify-between items-start">
-            <Link href="/" passHref>
-              <Button variant="ghost" className="mb-4">
-                <ArrowLeft className="w-4 h-4 mr-2" />
-                Back to Home
-              </Button>
-            </Link>
-            <Button onClick={handleDownloadReport} disabled={isDownloading}>
-              {isDownloading ? (
-                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-              ) : (
-                <Download className="w-4 h-4 mr-2" />
-              )}
-              Download Report
-            </Button>
-          </div>
-          <div className="flex items-center justify-between mb-4">
-            <div>
-              <h1 className="text-4xl font-bold text-slate-900 dark:text-slate-100 mb-2">Test Results</h1>
-              <p className="text-slate-600 dark:text-slate-400">Session ID: <span className="font-mono">{sessionId}</span></p>
-              <p className="text-slate-600 dark:text-slate-400">URL: <span className="font-mono">{session.url}</span></p>
-            </div>
-            <Badge className={`text-lg px-4 py-2 ${getStatusColor(session.status)}`}>
-              {session.status.charAt(0).toUpperCase() + session.status.slice(1)}
-            </Badge>
-          </div>
+    <div className="container mx-auto max-w-7xl px-4 py-8">
+      {/* Header */}
+      <div className="mb-8">
+        <div className="flex justify-between items-center mb-4">
+          <Link href="/" passHref><Button variant="ghost"><ArrowLeft className="w-4 h-4 mr-2" /> Back to Home</Button></Link>
+          <Button onClick={handleDownloadReport} disabled={isDownloading}>
+            {isDownloading ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Download className="w-4 h-4 mr-2" />}
+            Download PDF Report
+          </Button>
         </div>
-
-        <Tabs defaultValue="overview" className="w-full">
-          <TabsList className="grid w-full grid-cols-4">
-            <TabsTrigger value="overview">Overview</TabsTrigger>
-<TabsTrigger value="library">Library</TabsTrigger>
-            <TabsTrigger value="logs">Test Logs</TabsTrigger>
-            <TabsTrigger value="ai-analysis">AI Analysis</TabsTrigger>
-          </TabsList>
-
-          <TabsContent value="overview" className="mt-4">
-            {/* Overview Cards */}
-            <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-6 mb-8">
-              <Card>
-                <CardHeader><CardTitle className="text-lg">Total Scenarios</CardTitle></CardHeader>
-                <CardContent><p className="text-4xl font-bold">{totalScenarios}</p></CardContent>
-              </Card>
-              <Card>
-                <CardHeader><CardTitle className="text-lg">Passed Scenarios</CardTitle></CardHeader>
-                <CardContent><p className="text-4xl font-bold text-green-500">{passedScenarios}</p></CardContent>
-              </Card>
-              <Card>
-                <CardHeader><CardTitle className="text-lg">Failed Scenarios</CardTitle></CardHeader>
-                <CardContent><p className="text-4xl font-bold text-red-500">{failedScenarios}</p></CardContent>
-              </Card>
-              <Card>
-                <CardHeader><CardTitle className="text-lg">Overall Progress</CardTitle></CardHeader>
-                <CardContent>
-                  <Progress value={overallProgress} className="h-3 mb-2" />
-                  <p className="text-sm text-slate-600 dark:text-slate-400">{overallProgress}% Completed</p>
-                </CardContent>
-              </Card>
+        <div className="flex items-center justify-between">
+            <div>
+                <h1 className="text-3xl font-bold tracking-tight">Test Run Results</h1>
+                <p className="text-muted-foreground text-sm mt-1">
+                    Tested <a href={session.url} className="font-medium text-primary hover:underline" target="_blank" rel="noreferrer">{session.url}</a> on {new Date(session.created_at).toLocaleString()}
+                </p>
             </div>
+            {getStatusBadge(session.status)}
+        </div>
+      </div>
 
-            {/* Scenarios Details */}
-            <Card className="mb-8">
-              <CardHeader><CardTitle className="flex items-center gap-2"><Activity className="w-5 h-5" />Scenarios Details</CardTitle></CardHeader>
-              <CardContent className="space-y-4">
-                {scenarios.length > 0 ? (
-                  scenarios.map((scenario) => (
-                    <Card key={scenario.id} className="border-slate-200 dark:border-slate-700">
-                      <CardContent className="p-4">
-                        <div className="flex items-center justify-between mb-2">
-                          <h3 className="text-lg font-semibold">{scenario.title}</h3>
-                          <Badge className={`${getStatusColor(scenario.status)} text-white`}>{scenario.status.charAt(0).toUpperCase() + scenario.status.slice(1)}</Badge>
-                        </div>
-                        <p className="text-sm text-slate-600 dark:text-slate-400 mb-2">{scenario.description}</p>
-                        <div className="flex items-center gap-4 text-sm text-slate-500 dark:text-slate-400">
-                          <div className="flex items-center gap-1"><Clock className="w-4 h-4" />{scenario.estimated_time}</div>
-                          <div>{scenario.steps.length} steps</div>
-                        </div>
-                        {scenario.error_message && (
-                          <Alert variant="destructive" className="mt-3">
-                            <AlertTitle>Error</AlertTitle>
-                            <AlertDescription>{scenario.error_message}</AlertDescription>
-                          </Alert>
-                        )}
-                      </CardContent>
-                    </Card>
-                  ))
-                ) : logs.length > 0 ? (
-                  <div className="text-sm text-slate-600 dark:text-slate-400">
-                    <p className="mb-4">This was a dynamic workflow run. The execution log below contains the step-by-step details.</p>
-                    <ScrollArea className="h-64 w-full">
-                      <div className="space-y-2 font-mono">
-                        {logs.filter(l => l.level !== 'info').map(log => (
-                          <div key={log.id} className={`p-2 rounded-md ${getLogColor(log.level)}`}>
-                            <span className="font-bold">{log.level.toUpperCase()}:</span> {log.message}
-                          </div>
-                        ))}
-                      </div>
-                    </ScrollArea>
-                  </div>
-                ) : (
-                  <p className="text-center text-slate-500">No scenarios or logs found for this session.</p>
-                )}
-              </CardContent>
-            </Card>
-          </TabsContent>
-
-          <TabsContent value="library" className="mt-4">
+      {/* Main Content */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <div className="lg:col-span-2">
+            {/* Summary Stats */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+                <StatCard title="Scenarios" value={`${passedScenarios} / ${scenarios.length}`} icon={<FileText className="w-4 h-4 text-muted-foreground" />} />
+                <StatCard title="Passed" value={passedScenarios} icon={<CheckCircle className="w-4 h-4 text-muted-foreground" />} color="text-green-500" />
+                <StatCard title="Failed" value={failedScenarios} icon={<XCircle className="w-4 h-4 text-muted-foreground" />} color="text-red-500" />
+                <Card>
+                    <CardHeader className="flex flex-row items-center justify-between pb-2"><CardTitle className="text-sm font-medium">Progress</CardTitle><Activity className="w-4 h-4 text-muted-foreground" /></CardHeader>
+                    <CardContent>
+                        <div className="text-2xl font-bold">{overallProgress}%</div>
+                        <Progress value={overallProgress} className="h-2 mt-1" />
+                    </CardContent>
+                </Card>
+            </div>
+            
+            {/* Scenarios List */}
             <Card>
-              <CardHeader><CardTitle className="flex items-center gap-2"><Camera className="w-5 h-5" />Library</CardTitle></CardHeader>
+              <CardHeader><CardTitle>Test Scenarios</CardTitle></CardHeader>
               <CardContent>
-                <Tabs defaultValue="screenshots" className="w-full">
-                  <TabsList className="grid w-full grid-cols-2">
-                    <TabsTrigger value="screenshots">Screenshots</TabsTrigger>
-                    <TabsTrigger value="videos">Videos</TabsTrigger>
-                  </TabsList>
-                  <TabsContent value="screenshots" className="mt-4">
-                    {screenshotLogs.length === 0 ? (
-                      <p className="text-center text-slate-500">No screenshots available for this session.</p>
-                    ) : (
-                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                        {screenshotLogs.map((log) => (
-                          <div key={log.id} className="border rounded-lg overflow-hidden">
-                            <Image 
-                              src={log.metadata!.screenshot!} 
-                              alt={`Screenshot from log ${log.id}`} 
-                              width={800} 
-                              height={600} 
-                              layout="responsive"
-                              className="w-full h-auto"
-                            />
-                            <p className="p-2 text-sm text-slate-600 dark:text-slate-400">{log.message} ({formatTime(log.timestamp)})</p>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </TabsContent>
-                  <TabsContent value="videos" className="mt-4">
-                    {session.video_url ? (
-                      <div className="border rounded-lg overflow-hidden">
-                        <video controls className="w-full h-auto rounded-lg">
-                          <source src={`/api/videos/${session.video_url}`} type="video/webm" />
-                          Your browser does not support the video tag.
-                        </video>
-                      </div>
-                    ) : (
-                      <p className="text-center text-slate-500">No video available for this session.</p>
-                    )}
-                  </TabsContent>
-                </Tabs>
+                <Accordion type="single" collapsible className="w-full">
+                  {scenarios.map(renderScenarioItem)}
+                </Accordion>
+                {scenarios.length === 0 && <p className="text-center text-muted-foreground py-8">No scenarios were executed for this test run.</p>}
               </CardContent>
             </Card>
-          </TabsContent>
-
-          <TabsContent value="logs" className="mt-4">
-            {/* Test Logs */}
-            <Card>
-              <CardHeader><CardTitle className="flex items-center gap-2"><Monitor className="w-5 h-5" />Test Logs</CardTitle></CardHeader>
-              <CardContent>
-                <ScrollArea className="h-96 w-full">
-                  <div className="space-y-2">
-                    {logs.length === 0 ? (
-                      <div className="text-center py-8 text-slate-500">No logs found for this session.</div>
-                    ) : (
-                      logs.map((log) => (
-                        <div key={log.id} className={`p-3 rounded-lg border ${getLogColor(log.level)}`}>
-                          <div className="flex items-start gap-3">
-                            {getLogIcon(log.level)}
-                            <div className="flex-1 space-y-1">
-                              <div className="flex items-center justify-between">
-                                <p className="text-sm font-medium">{log.message}</p>
-                                <span className="text-xs opacity-70">{formatTime(log.timestamp)}</span>
-                              </div>
-                              {log.metadata?.screenshot && (
-                                <div className="mt-2">
-                                  <img src={log.metadata.screenshot} alt="Screenshot" className="max-w-full h-auto rounded-md" />
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </ScrollArea>
-              </CardContent>
-            </Card>
-          </TabsContent>
-
-          <TabsContent value="ai-analysis" className="mt-4">
-            {/* AI Analysis & Report */}
-            {report && (
-              <Card className="mb-6">
-                <CardHeader><CardTitle className="flex items-center gap-2"><BarChart3 className="w-5 h-5" />Overall AI Test Report</CardTitle></CardHeader>
+        </div>
+        <div className="lg:col-span-1">
+          <Tabs defaultValue="ai-analysis" className="sticky top-8">
+            <TabsList className="grid w-full grid-cols-3">
+              <TabsTrigger value="ai-analysis">AI Report</TabsTrigger>
+              <TabsTrigger value="logs">Logs</TabsTrigger>
+              <TabsTrigger value="media">Media</TabsTrigger>
+            </TabsList>
+            <TabsContent value="ai-analysis" className="mt-4">
+              <Card>
+                <CardHeader><CardTitle className="flex items-center gap-2"><Lightbulb className="w-5 h-5 text-primary" />AI Analysis</CardTitle></CardHeader>
                 <CardContent className="space-y-4">
-                  <div>
-                    <h3 className="text-lg font-semibold mb-2">Summary</h3>
-                    <p className="text-slate-700 dark:text-slate-300">{report.summary}</p>
-                  </div>
-                  <div>
-                    <h3 className="text-lg font-semibold mb-2 flex items-center gap-2"><Lightbulb className="w-5 h-5" />Key Findings</h3>
-                    <ul className="list-disc pl-5 space-y-1 text-slate-700 dark:text-slate-300">
-                      {(Array.isArray(report.key_findings) ? report.key_findings : (report.key_findings ? [report.key_findings] : [])).map((finding: string, index: number) => (
-                        <li key={index}>{finding}</li>
-                      ))}
-                    </ul>
-                  </div>
-                  <div>
-                    <h3 className="text-lg font-semibold mb-2 flex items-center gap-2"><ShieldAlert className="w-5 h-5" />Recommendations</h3>
-                    <ul className="list-disc pl-5 space-y-1 text-slate-700 dark:text-slate-300">
-                      {(Array.isArray(report.recommendations) ? report.recommendations : (report.recommendations ? [report.recommendations] : [])).map((rec: string, index: number) => (
-                        <li key={index}>{rec}</li>
-                      ))}
-                    </ul>
-                  </div>
-                  <Separator />
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {report ? <>
                     <div>
-                      <p className="font-medium">Risk Level:</p>
-                      <Badge className={`${getStatusColor(report.risk_level)} text-white`}>{report.risk_level.toUpperCase()}</Badge>
+                      <h3 className="font-semibold mb-1">Overall Summary</h3>
+                      <p className="text-sm text-muted-foreground">{report.summary}</p>
                     </div>
                     <div>
-                      <p className="font-medium">Quality Score:</p>
-                      <Progress value={report.quality_score} className="h-3 mb-2" />
-                      <p className="text-sm text-slate-600 dark:text-slate-400">{report.quality_score}/100</p>
+                      <h3 className="font-semibold mb-1">Key Findings</h3>
+                      <ul className="list-disc pl-5 text-sm space-y-1">
+                        {report.key_findings?.map((f, i) => <li key={i}>{f}</li>)}
+                      </ul>
                     </div>
-                  </div>
+                     <div>
+                      <h3 className="font-semibold mb-1">Recommendations</h3>
+                      <ul className="list-disc pl-5 text-sm space-y-1">
+                        {report.recommendations?.map((r, i) => <li key={i}>{r}</li>)}
+                      </ul>
+                    </div>
+                  </> : <p className="text-center text-muted-foreground py-8">AI analysis is not yet available.</p>}
                 </CardContent>
               </Card>
-            )}
-
-            <h3 className="text-2xl font-bold mb-4">Per-Scenario AI Analysis</h3>
-            {scenarios.map(scenario => {
-              const scenarioReport = scenarioReports.find(r => r.scenario_id === scenario.id);
-              return (
-                <Card key={scenario.id} className="mb-4">
-                  <CardHeader>
-                    <CardTitle>{scenario.title}</CardTitle>
-                    <CardDescription>Status: {scenario.status}</CardDescription>
-                  </CardHeader>
+            </TabsContent>
+            <TabsContent value="logs" className="mt-4">
+               <Card>
+                <CardHeader><CardTitle className="flex items-center gap-2"><Monitor className="w-5 h-5" />Execution Logs</CardTitle></CardHeader>
+                <CardContent>
+                    <ScrollArea className="h-96">
+                        {logs.map(log => (
+                            <div key={log.id} className="text-xs font-mono py-1 border-b">
+                                <span className={`mr-2 ${log.level === 'error' ? 'text-red-500' : log.level === 'success' ? 'text-green-500' : ''}`}>{log.level.toUpperCase()}</span>
+                                {log.message}
+                            </div>
+                        ))}
+                        {logs.length === 0 && <p className="text-center text-muted-foreground py-8">No logs for this session.</p>}
+                    </ScrollArea>
+                </CardContent>
+               </Card>
+            </TabsContent>
+            <TabsContent value="media" className="mt-4">
+              <Card>
+                  <CardHeader><CardTitle className="flex items-center gap-2"><Camera className="w-5 h-5" />Media Gallery</CardTitle></CardHeader>
                   <CardContent>
-                    {scenarioReport ? (
-                      <div className="space-y-4">
-                        <div>
-                          <h4 className="font-semibold">Summary</h4>
-                          <p>{scenarioReport.summary}</p>
-                        </div>
-                        <div>
-                          <h4 className="font-semibold">Issues</h4>
-                          {Array.isArray(scenarioReport.issues) ? scenarioReport.issues.map((issue: string, i: number) => <li key={i}>{issue}</li>) : (scenarioReport.issues ? <li>{scenarioReport.issues}</li> : <p>No issues found.</p>)}
-                        </div>
-                        <div>
-                          <h4 className="font-semibold">Recommendations</h4>
-                          {Array.isArray(scenarioReport.recommendations) && scenarioReport.recommendations.length > 0 ? (
-                            <ul className="list-disc pl-5">
-                              {scenarioReport.recommendations.map((rec: string, i: number) => <li key={i}>{rec}</li>)}
-                            </ul>
-                          ) : (
-                            <p>{scenarioReport.recommendations || 'No recommendations.'}</p>
-                          )}
-                        </div>
+                      {session.video_url && <div className="mb-4">
+                          <h3 className="font-semibold mb-2 flex items-center gap-2"><Video className="w-4 h-4"/> Session Video</h3>
+                          <video controls className="w-full rounded-lg">
+                              <source src={`/api/videos/${session.video_url}`} type="video/webm" />
+                          </video>
+                      </div>}
+                      <Separator />
+                      <div className="mt-4">
+                        <h3 className="font-semibold mb-2 flex items-center gap-2"><Camera className="w-4 h-4" /> Screenshots</h3>
+                        <ScrollArea className="h-80">
+                          <div className="grid grid-cols-2 gap-2">
+                            {screenshotLogs.map((log) => (
+                              <Image key={log.id} src={log.metadata!.screenshot!} alt={log.message} width={400} height={300} className="rounded-md" />
+                            ))}
+                          </div>
+                        </ScrollArea>
+                        {screenshotLogs.length === 0 && <p className="text-center text-muted-foreground py-8">No screenshots were captured.</p>}
                       </div>
-                    ) : (
-                      <p>No AI analysis available for this scenario.</p>
-                    )}
                   </CardContent>
-                </Card>
-              );
-            })}
-          </TabsContent>
-        </Tabs>
+              </Card>
+            </TabsContent>
+          </Tabs>
+        </div>
       </div>
     </div>
   );

@@ -9,20 +9,44 @@ import { TestLog } from './types';
 
 // --- Configuration ---
 
-const modelName = process.env.OPENAI_MODEL_NAME || 'gpt-4-turbo';
+const modelName =
+  process.env.OPENAI_MODEL_NAME ||
+  process.env.AZURE_OPENAI_DEPLOYMENT ||
+  'gpt-4-turbo';
 
 // Lazy initialization of OpenAI client to ensure env vars are loaded
-let client: OpenAI | null = null;
+let client: any = null;
 
-function getClient(): OpenAI {
+function getClient(): any {
   if (!client) {
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      const errorMessage = 'The OPENAI_API_KEY environment variable is missing. Please add it to your .env file or Vercel project environment variables. The application cannot function without it.';
-      console.error(errorMessage);
-      throw new Error(errorMessage);
+    // Prefer Azure when configured (even if OPENAI_API_KEY is also set).
+    const azureApiKey = process.env.AZURE_OPENAI_API_KEY;
+    const azureEndpoint = process.env.AZURE_OPENAI_ENDPOINT;
+    const azureDeployment = process.env.AZURE_OPENAI_DEPLOYMENT;
+
+    const openaiApiKey = process.env.OPENAI_API_KEY;
+
+    const wantAzure = Boolean(azureEndpoint && azureApiKey);
+
+    if (wantAzure) {
+      const apiVersion = process.env.AZURE_OPENAI_API_VERSION || '2024-02-15-preview';
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { AzureOpenAI } = require('openai');
+      client = new AzureOpenAI({
+        apiKey: azureApiKey,
+        endpoint: azureEndpoint,
+        deployment: azureDeployment || modelName,
+        apiVersion,
+      });
+    } else {
+      if (!openaiApiKey) {
+        const errorMessage =
+          'Missing credentials: set either Azure OpenAI (AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT) or OPENAI_API_KEY.';
+        console.error(errorMessage);
+        throw new Error(errorMessage);
+      }
+      client = new OpenAI({ apiKey: openaiApiKey });
     }
-    client = new OpenAI({ apiKey });
   }
   return client;
 }
@@ -76,7 +100,7 @@ interface TestResults {
 // Interfaces for method return types
 interface WorkflowPlan {
   plan: {
-    skill: 'CLICK' | 'NAVIGATE' | 'FILL_FORM_HAPPY_PATH' | 'TEST_FORM_VALIDATION';
+    skill: 'CLICK' | 'NAVIGATE' | 'FILL_FORM_HAPPY_PATH' | 'TEST_FEATURE_COMPREHENSIVELY';
     target?: string;
     url?: string;
   }[];
@@ -221,7 +245,12 @@ export class OpenAIService {
    */
   async generateScenarios(pageContext: PageContext): Promise<{ scenarios: { title: string; description: string; steps: string[] }[] }> {
     const prompt = prompts.generateScenarios(pageContext);
-    return this._generateAndParseJSON<{ scenarios: { title: string; description: string; steps: string[] }[] }>(prompt);
+    // Reduce token budget to make URL analysis faster.
+    return this._generateAndParseJSON<{ scenarios: { title: string; description: string; steps: string[] }[] }>(prompt, {
+      temperature: 0.3,
+      maxTokens: 1500,
+      topP: 0.9,
+    });
   }
 }
 

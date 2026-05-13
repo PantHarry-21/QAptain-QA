@@ -4,7 +4,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { openAIService } from './openai';
 import { Server } from 'socket.io';
 
-import { skillFillFormHappyPath } from './skills/fill-form';
+import { skillFillFormHappyPath, type FillFormResult } from './skills/fill-form';
+import { ensureLoggedIn } from './skills/ensure-login';
 import { getDomContextSelector } from './utils';
 import { goldenScenarios } from './golden-scenarios';
 import { databaseService } from './database-service';
@@ -21,6 +22,9 @@ interface ParsedCommand {
   option?: string;
   source?: string;
   destination?: string;
+  // For "If <text> is visible, then <step>"
+  conditionText?: string;
+  thenStep?: string;
   username?: string;
   password?: string;
 }
@@ -28,6 +32,12 @@ interface ParsedCommand {
 interface CommandDefinition {
     regex: RegExp;
     parser: (matches: RegExpMatchArray) => ParsedCommand;
+}
+
+const stopRequests = new Set<string>();
+
+export function requestStop(sessionId: string) {
+  stopRequests.add(sessionId);
 }
 
 // --- Helper Functions ---
@@ -56,7 +66,7 @@ async function findLocator(page: Page, identifier: string): Promise<Locator> {
         if (await locator.count() > 0) {
             // Check if the first match is visible.
             if (await locator.first().isVisible()) {
-                console.log(`Found visible element for "${cleanedIdentifier}" using a priority strategy.`);
+                // Keep this quiet; locator resolution runs frequently during long test runs.
                 return locator; // Return the locator group for this strategy
             }
         }
@@ -85,8 +95,8 @@ const commandDefinitions: CommandDefinition[] = [
         regex: /^If\s+(?:the\s+)?(?:text\s+)?['"]?(.+?)['"]?\s+(?:is\s+visible|appears|exists|is\s+present),?\s*(?:then\s+)?(.+)$/i,
         parser: m => ({
             type: 'conditional',
-            target: { step: `Verify text \"${m[1]}\" is visible` },
-            value: { step: m[2] }
+            conditionText: m[1],
+            thenStep: m[2]
         })
     },
 
@@ -102,9 +112,15 @@ const commandDefinitions: CommandDefinition[] = [
         parser: m => ({ type: 'navigateUrl', target: m[1] })
     },
 
-    // CLICK / PRESS / TAP / SELECT
+    // SELECT OPTION (dropdown/select elements)
     {
-        regex: /^(?:Click|Press|Tap|Select)\s*(?:the)?\s*(?:button|link|element)?\s*(?:named|called|with\s+text|with\s+label|with\s+selector)?\s*['"]?(.+?)['"]?(?:\s+button|\s+link|\s+element|\s+tab|\s+option|\s+item)?$/i,
+        regex: /^(?:Select)\s*(?:the\s+)?['"]?(.+?)['"]?\s+option\s*(?:in|from)\s*(?:the\s*)?['"]?(.+?)['"]?$/i,
+        parser: m => ({ type: 'select', value: m[1], target: m[2] }),
+    },
+
+    // CLICK / PRESS / TAP
+    {
+        regex: /^(?:Click|Press|Tap)\s*(?:the)?\s*(?:button|link|element)?\s*(?:named|called|with\s+text|with\s+label|with\s+selector)?\s*['"]?(.+?)['"]?(?:\s+button|\s+link|\s+element|\s+tab|\s+option|\s+item)?$/i,
         parser: m => ({ type: 'click', target: m[1].trim() })
     },
 
@@ -186,6 +202,12 @@ function parseSingleCommand(step: string): ParsedCommand | null {
 }
 
 function parseStep(step: string): (ParsedCommand | null)[] {
+    // If the whole step is already a conditional, don't split it by "then".
+    const maybeConditional = parseSingleCommand(step);
+    if (maybeConditional?.type === 'conditional') {
+        return [maybeConditional];
+    }
+
     const commands: (ParsedCommand | null)[] = [];
     // Split command string by 'then' or 'and then'
     const subSteps = step.split(/\s*,\s*then\s*|\s+and then\s+|\s*;\s*/i);
@@ -200,9 +222,9 @@ function parseStep(step: string): (ParsedCommand | null)[] {
 }
 
 export async function executeSingleCommand(command: ParsedCommand, page: Page, baseUrl: string, sessionId: string, scenarioId: string): Promise<void> {
-  console.log('Executing command:', command);
+  // Intentionally no verbose logging here; tests can generate many commands.
   // Add a small delay before each command
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(100);
 
   switch (command.type) {
     case 'navigateSpecific':
@@ -212,7 +234,7 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
       else if (pageName.includes('login')) urlObject.pathname = '/login';
       else if (pageName.includes('contact')) urlObject.pathname = '/contact';
       else if (pageName.includes('register')) urlObject.pathname = '/register';
-      await page.goto(urlObject.toString(), { waitUntil: 'networkidle' });
+      await page.goto(urlObject.toString(), { waitUntil: 'domcontentloaded', timeout: 30000 });
       break;
 
     case 'navigateUrl':
@@ -220,7 +242,7 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
       if (!urlToNavigate.startsWith('http')) {
         throw new Error(`Invalid URL for navigation: "${urlToNavigate}". URL must start with http:// or https://.`);
       }
-      await page.goto(urlToNavigate, { waitUntil: 'networkidle' });
+      await page.goto(urlToNavigate, { waitUntil: 'domcontentloaded', timeout: 30000 });
       break;
 
     case 'click':
@@ -229,6 +251,9 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
       // This prevents false positives where a click is reported on a non-interactive element.
       // The click action now auto-waits for the element to be visible, stable, and enabled.
       await locator.first().click({ timeout: 30000 });
+      // Avoid slow "networkidle" waits; settle quickly for most UI flows.
+      await page.waitForLoadState('domcontentloaded', { timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(200);
       break;
 
     case 'press':
@@ -259,7 +284,7 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
         ];
         for (const locator of inputLocators) {
             try {
-                await locator.first().fill(value!, { timeout: 1000 }); // Use a shorter timeout for each attempt
+                await locator.first().fill(value!, { timeout: 3000 });
                 inputFilled = true;
                 break;
             } catch (e) {
@@ -307,13 +332,23 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
       break;
     }
 
+    case 'assertUrlIs': {
+      const currentUrl = page.url();
+      const expectedUrl = command.value!;
+      if (currentUrl !== expectedUrl) {
+        throw new Error(`Expected URL to be "${expectedUrl}" but it was "${currentUrl}"`);
+      }
+      break;
+    }
+
     case 'assertVisible': {
         await findLocator(page, command.target!); 
         break;
     }
 
     case 'assertPageContains': {
-        await page.locator(`body:has-text("${command.value}")`).waitFor();
+        const text = command.value?.toString() ?? '';
+        await page.getByText(text, { exact: false }).first().waitFor({ timeout: 5000 });
         break;
     }
 
@@ -360,11 +395,20 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
     }
 
     case 'conditional': {
-        try {
-            await executeStep(page, command.target.step, baseUrl, sessionId, scenarioId);
-            await executeStep(page, command.value.step, baseUrl, sessionId, scenarioId);
-        } catch (error) {
-            console.log(`Conditional step skipped: ${command.target.step}`);
+        const conditionText = command.conditionText?.toString() ?? '';
+        const thenStep = command.thenStep?.toString() ?? '';
+
+        if (!conditionText || !thenStep) {
+          throw new Error('Invalid conditional command: missing conditionText/thenStep');
+        }
+
+        const condLocator = page.getByText(conditionText, { exact: false }).first();
+        const isVisible = await condLocator.isVisible().catch(() => false);
+
+        if (isVisible) {
+          await executeStep(page, thenStep, baseUrl, sessionId, scenarioId);
+        } else {
+          console.log(`Conditional skipped: "${conditionText}" not visible`);
         }
         break;
     }
@@ -375,7 +419,13 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
 }
 
 async function executeStep(page: Page, step: string, baseUrl: string, sessionId: string, scenarioId: string): Promise<void> {
-  const commands = parseStep(step);
+  // Normalize human-written "multi-step in one line" patterns.
+  const normalizedPieces = step
+    .split(/\s*\|\s*|\s*→\s*|\s*->\s*/g)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const commands = normalizedPieces.flatMap((piece) => parseStep(piece));
   for (const command of commands) {
     if (!command) {
       throw new Error(`Unrecognized command in step: "${step}"`);
@@ -386,7 +436,14 @@ async function executeStep(page: Page, step: string, baseUrl: string, sessionId:
 
 // --- Test Execution Engine ---
 
-const saveScreenshotToDatabase = async (page: Page, sessionId: string, scenarioId?: string, stepId?: string, message: string = 'Screenshot captured') => {
+const saveScreenshotToDatabase = async (
+  page: Page,
+  sessionId: string,
+  scenarioId?: string,
+  stepId?: string,
+  message: string = 'Screenshot captured',
+  extraMetadata: Record<string, unknown> = {},
+) => {
     try {
       const screenshot = await page.screenshot({ type: 'png' });
       await databaseService.createTestLog({
@@ -396,7 +453,10 @@ const saveScreenshotToDatabase = async (page: Page, sessionId: string, scenarioI
         level: 'info',
         message: message,
         timestamp: new Date().toISOString(),
-        metadata: { screenshot: `data:image/png;base64,${screenshot.toString('base64')}` }
+        metadata: {
+          screenshot: `data:image/png;base64,${screenshot.toString('base64')}`,
+          ...extraMetadata,
+        },
       });
     } catch (e) {
       console.error('Failed to save screenshot to database:', e);
@@ -410,6 +470,11 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
   const MAX_STEP_RETRIES = 1;
   let completedSteps = 0;
   const finalScenarios: TestScenario[] = [];
+  const memory: {
+    lastPrimaryValue?: string;
+    lastPrimaryField?: string;
+    lastFilled?: Record<string, string>;
+  } = {};
 
   const logs: TestLog[] = [];
   const emitLog = (log: Partial<TestLog>) => {
@@ -484,10 +549,10 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
   try {
     emitLog({ level: 'info', message: `Initializing test session with Playwright...` });
 
-    const isVercel = process.env.VERCEL || process.env.LAMBDA_TASK_ROOT;
-    emitLog({ level: 'info', message: `Environment detected as ${isVercel ? 'Vercel' : 'Local'}.` });
+    const isServerless = process.env.VERCEL || process.env.LAMBDA_TASK_ROOT || process.env.RENDER;
+    emitLog({ level: 'info', message: `Environment detected as ${isServerless ? 'Serverless' : 'Local'}.` });
 
-    if (isVercel) {
+    if (isServerless) {
       emitLog({ level: 'info', message: 'Launching browser with @sparticuz/chromium for serverless environment.' });
       browser = await chromium.launch({
         args: sparticuzChromium.args,
@@ -501,17 +566,27 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
       });
     }
     const context = await browser.newContext({
-      recordVideo: { dir: isVercel ? `/tmp/videos/${sessionId}` : `videos/${sessionId}` }
+      recordVideo: { dir: isServerless ? `/tmp/videos/${sessionId}` : `videos/${sessionId}` }
     });
     const page = await context.newPage();
+    page.setDefaultTimeout(8000);
+    page.setDefaultNavigationTimeout(20000);
 
     emitLog({ level: 'info', message: `Playwright browser initialized. Starting execution for ${processedScenarios.length} scenarios.` });
     await emitScreenshot(page);
 
+    // Ensure user is authenticated before running scenarios (prevents running on login page).
+    await ensureLoggedIn(page, url, sessionId).catch(() => {});
+
     for (let i = 0; i < processedScenarios.length; i++) {
+      if (stopRequests.has(sessionId)) {
+        throw new Error('Stopped by user');
+      }
       const scenario = processedScenarios[i];
       const scenarioStartTime = new Date();
       let scenarioPassed = true;
+      let scenarioErrorMessage: string | null = null;
+      let scenarioFailedStep: string | null = null;
 
       const updatedScenarioWithRunningStatus = await databaseService.updateTestScenario(scenario.id, {
         status: 'running',
@@ -523,11 +598,15 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
 
       emitLog({ level: 'info', message: `Starting scenario: "${scenario.title}"`, scenario_id: scenario.id });
 
-      await page.goto(url, { waitUntil: 'load' });
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await ensureLoggedIn(page, url, sessionId, scenario.id).catch(() => {});
       await saveScreenshotToDatabase(page, sessionId, scenario.id, undefined, `Initial state for scenario: ${scenario.title}`);
       await emitScreenshot(page);
 
       for (let j = 0; j < scenario.steps.length; j++) {
+        if (stopRequests.has(sessionId)) {
+          throw new Error('Stopped by user');
+        }
         const stepDescription = scenario.steps[j];
         completedSteps++;
         io.to(sessionRoom).emit('test-progress', {
@@ -546,9 +625,12 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
 
         for (let retry = 0; retry <= MAX_STEP_RETRIES; retry++) {
           try {
+            if (stopRequests.has(sessionId)) {
+              throw new Error('Stopped by user');
+            }
             if (retry > 0) {
               emitLog({ level: 'warning', message: `Retrying step: ${stepDescription} (Attempt ${retry + 1}/${MAX_STEP_RETRIES + 1})`, scenario_id: scenario.id });
-              await page.waitForTimeout(1000);
+              await page.waitForTimeout(500);
             }
 
             // --- SMART DISPATCHER LOGIC ---
@@ -586,7 +668,11 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
                 });
               }
 
-              emitLog({ level: 'info', message: `Engaging AI orchestrator with context: ${JSON.stringify(pageContext)}`, scenario_id: scenario.id });
+              emitLog({
+                level: 'info',
+                message: `Engaging AI orchestrator (forms=${pageContext?.formInputs?.length ?? 0}, buttons=${pageContext?.visibleButtons?.length ?? 0})`,
+                scenario_id: scenario.id,
+              });
               const plan = await openAIService.createWorkflowPlan(stepDescription, pageContext);
               emitLog({ level: 'info', message: `AI has generated a sub-plan: ${JSON.stringify(plan.plan)}`, scenario_id: scenario.id });
 
@@ -601,8 +687,94 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
                     await executeSingleCommand({ type: 'navigateUrl', target: subStep.url }, page, url, sessionId, scenario.id);
                     break;
                   case 'FILL_FORM_HAPPY_PATH':
-                    await skillFillFormHappyPath(page);
+                    {
+                      const res: FillFormResult = await skillFillFormHappyPath(page, 'create');
+                      memory.lastPrimaryValue = res.primaryValue;
+                      memory.lastPrimaryField = res.primaryField;
+                      memory.lastFilled = Object.fromEntries(res.filled.map((f) => [f.field, f.value]));
+                      if (memory.lastPrimaryValue) {
+                        emitLog({
+                          level: 'info',
+                          message: `Remembered primary value: "${memory.lastPrimaryValue}"`,
+                          scenario_id: scenario.id,
+                        });
+                      }
+                    }
                     break;
+                  case 'VERIFY_LAST_CREATED_VISIBLE':
+                    if (!memory.lastPrimaryValue) throw new Error('No remembered primary value for verification.');
+                    await page.getByText(memory.lastPrimaryValue, { exact: false }).first().waitFor({ timeout: 8000 });
+                    break;
+                  case 'VERIFY_LAST_CREATED_NOT_VISIBLE':
+                    if (!memory.lastPrimaryValue) throw new Error('No remembered primary value for verification.');
+                    if (await page.getByText(memory.lastPrimaryValue, { exact: false }).first().isVisible().catch(() => false)) {
+                      throw new Error(`Expected "${memory.lastPrimaryValue}" to be removed, but it is still visible.`);
+                    }
+                    break;
+                  case 'SEARCH_LAST_CREATED': {
+                    if (!memory.lastPrimaryValue) throw new Error('No remembered primary value for search.');
+                    const searchBox = page.getByRole('textbox', { name: /search|filter/i }).first();
+                    if (await searchBox.count().catch(() => 0)) {
+                      await searchBox.fill(memory.lastPrimaryValue);
+                      await page.keyboard.press('Enter').catch(() => {});
+                      await page.waitForTimeout(300);
+                    } else {
+                      // Fallback: try any input with placeholder containing search
+                      const alt = page.locator('input[placeholder*="Search" i], input[placeholder*="Filter" i]').first();
+                      if (await alt.count().catch(() => 0)) {
+                        await alt.fill(memory.lastPrimaryValue);
+                        await page.keyboard.press('Enter').catch(() => {});
+                        await page.waitForTimeout(300);
+                      }
+                    }
+                    break;
+                  }
+                  case 'DELETE_LAST_CREATED': {
+                    if (!memory.lastPrimaryValue) throw new Error('No remembered primary value for delete.');
+                    const row = page.locator('tr', { hasText: memory.lastPrimaryValue }).first();
+                    const container = (await row.count().catch(() => 0)) > 0 ? row : page.locator('body');
+                    const deleteBtn = container.getByRole('button', { name: /delete|remove|trash/i }).first();
+                    if ((await deleteBtn.count().catch(() => 0)) === 0) {
+                      // fallback icons
+                      const iconBtn = container.locator('button:has(svg)').first();
+                      await iconBtn.click({ timeout: 5000 });
+                    } else {
+                      await deleteBtn.click({ timeout: 5000 });
+                    }
+                    // confirm dialogs
+                    const confirm = page.getByRole('button', { name: /confirm|delete|yes|ok/i }).first();
+                    if ((await confirm.count().catch(() => 0)) > 0) {
+                      await confirm.click({ timeout: 5000 });
+                    }
+                    await page.waitForTimeout(600);
+                    break;
+                  }
+                  case 'EDIT_LAST_CREATED': {
+                    if (!memory.lastPrimaryValue) throw new Error('No remembered primary value for edit.');
+                    const row = page.locator('tr', { hasText: memory.lastPrimaryValue }).first();
+                    const container = (await row.count().catch(() => 0)) > 0 ? row : page.locator('body');
+                    const editBtn = container.getByRole('button', { name: /edit|update/i }).first();
+                    if ((await editBtn.count().catch(() => 0)) > 0) {
+                      await editBtn.click({ timeout: 5000 });
+                    } else {
+                      // Sometimes "..." menu contains edit
+                      const menu = container.getByRole('button', { name: /more|actions|menu|options/i }).first();
+                      if ((await menu.count().catch(() => 0)) > 0) {
+                        await menu.click({ timeout: 5000 });
+                        const editItem = page.getByRole('menuitem', { name: /edit|update/i }).first();
+                        if ((await editItem.count().catch(() => 0)) > 0) await editItem.click({ timeout: 5000 });
+                      }
+                    }
+
+                    // Update values (fresh fill)
+                    const res: FillFormResult = await skillFillFormHappyPath(page, 'edit');
+                    // Keep same primary if it still exists; otherwise update it.
+                    memory.lastPrimaryValue = res.primaryValue || memory.lastPrimaryValue;
+                    memory.lastPrimaryField = res.primaryField || memory.lastPrimaryField;
+                    memory.lastFilled = { ...(memory.lastFilled || {}), ...Object.fromEntries(res.filled.map((f) => [f.field, f.value])) };
+                    await page.waitForTimeout(600);
+                    break;
+                  }
                   case 'TEST_FEATURE_COMPREHENSIVELY':
                     emitLog({ level: 'info', message: `Comprehensive test requested for "${subStep.target}". Generating sub-scenarios...`, scenario_id: scenario.id });
                     const { scenarios: subScenarios } = await openAIService.generateScenarios(pageContext);
@@ -620,7 +792,7 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
                         emitLog({ level: 'warning', message: `Sub-scenario failed: "${subScenario.title}" - ${subError instanceof Error ? subError.message : 'Unknown error'}` });
                       }
                       // Reset page state for the next sub-scenario to ensure independence
-                      await page.goto(url, { waitUntil: 'load' });
+                      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
                     }
                     break;
                   default:
@@ -630,30 +802,46 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
               }
             }
             // --- END SMART DISPATCHER LOGIC ---
-
-            await saveScreenshotToDatabase(page, sessionId, scenario.id, undefined, `Screenshot after: ${stepDescription}`);
-
-            await emitScreenshot(page);
             emitLog({ level: 'success', message: `✅ Step completed: ${stepDescription}`, scenario_id: scenario.id });
             sessionResults.passedSteps++;
             stepPassed = true;
             break;
           } catch (stepError) {
             lastError = stepError;
+            const errorMessage = stepError instanceof Error ? stepError.message : 'Unknown error';
+            const errorStack = stepError instanceof Error ? stepError.stack : undefined;
+            const pageUrl = page.url();
+            let expectedText: string | undefined;
+            const m = stepDescription.match(/verify.*contains\s+["'](.+?)["']/i);
+            if (m?.[1]) expectedText = m[1];
+            let pageTextSample: string | undefined;
+            try {
+              const bodyText = await page.evaluate(() => document.body?.innerText || '');
+              pageTextSample = bodyText.trim().slice(0, 800);
+            } catch {}
             emitLog({ level: 'warning', message: `Step failed: ${stepDescription} - ${stepError instanceof Error ? stepError.message : 'Unknown error'}`, scenario_id: scenario.id });
-            await saveScreenshotToDatabase(page, sessionId, scenario.id, undefined, `Failure state for step: ${stepDescription}`);
+            await saveScreenshotToDatabase(
+              page,
+              sessionId,
+              scenario.id,
+              undefined,
+              `Failure state for step: ${stepDescription}`,
+              { stepDescription, errorMessage, errorStack, pageUrl, expectedText, pageTextSample }
+            );
             await emitScreenshot(page);
           }
         }
 
         if (!stepPassed) {
           const errorMessage = lastError instanceof Error ? lastError.message : 'Unknown error';
+          scenarioErrorMessage = errorMessage;
+          scenarioFailedStep = stepDescription;
           scenarioPassed = false;
           sessionResults.failedSteps++;
           emitLog({ level: 'error', message: `❌ Step failed after ${MAX_STEP_RETRIES + 1} attempts: ${stepDescription} - ${errorMessage}`, scenario_id: scenario.id });
           break;
         }
-        await page.waitForTimeout(500);
+        await page.waitForTimeout(200);
       }
 
             const scenarioDuration = new Date().getTime() - scenarioStartTime.getTime();
@@ -671,7 +859,9 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
               updatePayload = {
                 status: 'failed',
                 completed_at: new Date().toISOString(),
-                error_message: `Scenario failed due to step error.`
+                error_message: scenarioErrorMessage
+                  ? `Step failed: "${scenarioFailedStep}". Error: ${scenarioErrorMessage}`
+                  : 'Scenario failed due to step error.'
               };
               emitLog({ level: 'error', message: `❌ Scenario failed: "${scenario.title}"`, scenario_id: scenario.id });
             }
@@ -774,6 +964,7 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
     });
 
   } finally {
+    stopRequests.delete(sessionId);
     if (browser) {
       await browser.close();
     }
