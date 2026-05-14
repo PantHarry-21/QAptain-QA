@@ -1,211 +1,34 @@
-'use client';
+import { redirect } from 'next/navigation';
+import { getServerSession } from 'next-auth/next';
+import Link from 'next/link';
+import { getAuthOptions } from '@/lib/auth';
+import { Button } from '@/components/ui/button';
+import { Sparkles } from 'lucide-react';
 
-import { useState } from "react";
-import { useRouter } from "next/navigation";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Label } from "@/components/ui/label";
-import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Loader2, Globe, Zap, BarChart3, Play, ArrowRight } from "lucide-react";
-import { useSession } from 'next-auth/react';
-
-export default function Home() {
-  const [url, setUrl] = useState("");
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [error, setError] = useState("");
-  const router = useRouter();
-  const { status } = useSession();
-
-  const validateUrl = (inputUrl: string) => {
-    try {
-      const urlObj = new URL(inputUrl.startsWith('http') ? inputUrl : `https://${inputUrl}`);
-      return urlObj.protocol === 'http:' || urlObj.protocol === 'https:';
-    } catch {
-      return false;
-    }
-  };
-
-  const proceedDirectRun = () => {
-    setError("");
-    if (status === 'unauthenticated') {
-      router.push('/login?error=Please log in to start a test.');
-      return;
-    }
-    if (!url.trim()) {
-      setError("Please enter a URL");
-      return;
-    }
-    if (!validateUrl(url)) {
-      setError("Please enter a valid URL (e.g., https://example.com)");
-      return;
-    }
-    const formattedUrl = url.startsWith('http') ? url : `https://${url}`;
-    sessionStorage.setItem('targetUrl', formattedUrl);
-    // Mark as direct-run: Scenarios page will skip analyze-url.
-    sessionStorage.setItem('directRun', 'true');
-    sessionStorage.setItem('pageAnalysis', JSON.stringify({ scenarios: [], pageContext: null }));
-    router.push('/scenarios');
-  };
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError("");
-
-    if (status === 'unauthenticated') {
-      router.push('/login?error=Please log in to start a test.');
-      return;
-    }
-
-    if (!url.trim()) {
-      setError("Please enter a URL");
-      return;
-    }
-
-    if (!validateUrl(url)) {
-      setError("Please enter a valid URL (e.g., https://example.com)");
-      return;
-    }
-
-    setIsSubmitting(true);
-    
-    try {
-      const formattedUrl = url.startsWith('http') ? url : `https://${url}`;
-      
-      const response = await fetch('/api/analyze-url', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: formattedUrl }),
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.details || 'Failed to analyze URL.');
-      }
-
-      const analysis = await response.json();
-
-      sessionStorage.setItem('targetUrl', formattedUrl);
-      sessionStorage.setItem('pageAnalysis', JSON.stringify(analysis));
-      sessionStorage.setItem('directRun', 'false');
-      
-      router.push('/scenarios');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to process URL. Please try again.");
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
+export default async function HomePage() {
+  const session = await getServerSession(getAuthOptions());
+  if (session) redirect('/dashboard');
 
   return (
-    <div className="container mx-auto px-4 py-16">
-      <div className="text-center mb-12">
-        <h1 className="text-4xl md:text-5xl font-bold mb-4">
-          AI Test Runner
-        </h1>
-        <p className="text-xl text-muted-foreground mb-8 max-w-3xl mx-auto">
-          Transform your web testing with AI-powered automation, real-time execution, and comprehensive reporting.
+    <div className="relative flex min-h-screen flex-col items-center justify-center overflow-hidden bg-slate-950 px-6 text-slate-50">
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-violet-600/40 via-slate-950 to-slate-950" />
+      <div className="relative z-10 max-w-xl text-center">
+        <div className="mx-auto mb-6 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-violet-500 to-indigo-600 shadow-lg shadow-violet-500/30">
+          <Sparkles className="h-8 w-8 text-white" />
+        </div>
+        <h1 className="text-4xl font-semibold tracking-tight sm:text-5xl">QAPtain</h1>
+        <p className="mt-4 text-lg text-slate-300">
+          AI-native quality engineering: progressive discovery, scenario intelligence, structured Playwright execution,
+          and workspace-scoped memory.
         </p>
-      </div>
-
-      <div className="max-w-2xl mx-auto mb-12">
-        <Card>
-          <CardHeader className="text-center">
-            <CardTitle className="text-2xl flex items-center justify-center gap-2">
-              <Zap className="w-6 h-6 text-primary" />
-              Start Your Test
-            </CardTitle>
-            <CardDescription>
-              Enter a website URL to begin AI-powered automated testing
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <form onSubmit={handleSubmit} className="space-y-4">
-              <div className="space-y-2">
-                <Label htmlFor="url">Website URL</Label>
-                <div className="flex gap-2">
-                  <Input
-                    id="url"
-                    type="text"
-                    placeholder="https://example.com"
-                    value={url}
-                    onChange={(e) => setUrl(e.target.value)}
-                    className="flex-1"
-                  />
-                  <Button type="submit" disabled={isSubmitting} className="flex items-center gap-2">
-                    {isSubmitting ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Play className="w-4 h-4" />
-                    )}
-                    Analyze URL
-                  </Button>
-                </div>
-                <div className="flex justify-end">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={proceedDirectRun}
-                    disabled={isSubmitting}
-                    className="mt-2"
-                  >
-                    <ArrowRight className="w-4 h-4 mr-2" />
-                    Continue without analysis
-                  </Button>
-                </div>
-              </div>
-              {error && (
-                <Alert variant="destructive">
-                  <AlertDescription>{error}</AlertDescription>
-                </Alert>
-              )}
-            </form>
-          </CardContent>
-        </Card>
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-8 max-w-6xl mx-auto">
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Globe className="w-5 h-5 text-blue-500" />
-              AI-Powered Analysis
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-muted-foreground">
-              Our AI analyzes your website structure and generates intelligent test scenarios automatically.
-            </p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Zap className="w-5 h-5 text-yellow-500" />
-              Real-time Execution
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-muted-foreground">
-              Watch your tests run in real-time with live updates and detailed execution logs.
-            </p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <BarChart3 className="w-5 h-5 text-green-500" />
-              Comprehensive Reports
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-muted-foreground">
-              Get detailed reports with insights, recommendations, and performance metrics.
-            </p>
-          </CardContent>
-        </Card>
+        <div className="mt-10 flex flex-wrap items-center justify-center gap-3">
+          <Button asChild size="lg" className="bg-white text-slate-900 hover:bg-slate-100">
+            <Link href="/login">Sign in</Link>
+          </Button>
+          <Button asChild size="lg" variant="outline" className="border-slate-600 text-slate-100 hover:bg-slate-800">
+            <Link href="/signup">Create account</Link>
+          </Button>
+        </div>
       </div>
     </div>
   );

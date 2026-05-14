@@ -1,5 +1,5 @@
 import { Server } from 'socket.io';
-import { executeTests, requestStop } from './test-executor';
+import { executeTests, requestStop, requestStopExecutionRun } from './test-executor';
 
 interface StartTestPayload {
   sessionId: string;
@@ -45,6 +45,29 @@ export const setupSocket = (io: Server) => {
         return;
       }
 
+      const sessionRoom = `session-${sessionId}`;
+      const totalSteps = scenarios.reduce(
+        (acc, s: { steps?: unknown[] }) => acc + (Array.isArray(s?.steps) ? s.steps.length : 0),
+        0,
+      );
+      const now = new Date().toISOString();
+      io.to(sessionRoom).emit('test-log', {
+        id: `start-${Date.now()}`,
+        timestamp: now,
+        level: 'info',
+        message: 'Test run started — launching browser and signing in…',
+      });
+      io.to(sessionRoom).emit('test-progress', {
+        currentScenario: 1,
+        totalScenarios: scenarios.length,
+        currentStep: 1,
+        totalSteps: Math.max(1, totalSteps),
+        currentScenarioTitle: (scenarios[0] as { title?: string })?.title || '—',
+        currentStepDescription: 'Initializing…',
+        status: 'running',
+        startTime: now,
+      });
+
       // Start the test execution in the background.
       // Make sure we handle rejections so they don't surface as unhandledRejection.
       executeTests(io, sessionId, scenarios, url).catch((err) => {
@@ -63,6 +86,16 @@ export const setupSocket = (io: Server) => {
         level: 'warning',
         message: 'Stop requested by user. Cancelling execution…',
       });
+    });
+
+    socket.on('join-run', ({ runId }: { runId: string }) => {
+      if (!runId) return;
+      socket.join(`run-${runId}`);
+    });
+
+    socket.on('stop-run', ({ runId }: { runId: string }) => {
+      if (!runId) return;
+      requestStopExecutionRun(runId);
     });
 
     // Handle client disconnection

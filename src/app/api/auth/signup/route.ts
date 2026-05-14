@@ -1,10 +1,10 @@
 // app/api/auth/signup/route.ts
 import "server-only";
 import { NextResponse } from "next/server";
-import getPool from "@/lib/db";
 import bcrypt from "bcrypt";
-import { v4 as uuidv4 } from 'uuid';
+import { v4 as uuidv4 } from "uuid";
 import { sendActivationEmail } from "@/lib/email";
+import { prisma } from "@/lib/prisma";
 
 
 export const dynamic = "force-dynamic";
@@ -25,14 +25,11 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "All fields are required" }, { status: 400 });
     }
 
-    const pool = getPool();
-    // Check if user already exists
-    const { rows: existingUsers } = await pool.query(
-      "SELECT id FROM users WHERE email = $1",
-      [email]
-    );
+    const normalizedEmail = String(email).trim().toLowerCase();
 
-    if (existingUsers.length > 0) {
+    const existing = await prisma.user.findUnique({ where: { email: normalizedEmail } });
+
+    if (existing) {
       return NextResponse.json({ error: "User with this email already exists" }, { status: 409 });
     }
 
@@ -40,16 +37,21 @@ export async function POST(req: Request) {
     const activationToken = makeActivationToken();
     const userId = uuidv4();
 
-
-    await pool.query(
-      "INSERT INTO users (id, first_name, last_name, email, password, activation_token) VALUES ($1, $2, $3, $4, $5, $6)",
-      [userId, firstName, lastName, email, hashedPassword, activationToken]
-    );
+    await prisma.user.create({
+      data: {
+        id: userId,
+        firstName: firstName,
+        lastName: lastName,
+        email: normalizedEmail,
+        password: hashedPassword,
+        activationToken,
+      },
+    });
 
     // Send activation email
     try {
       const activationUrl = `${new URL(req.url).origin}/api/auth/activate/${activationToken}`;
-      await sendActivationEmail(email, firstName, activationToken, activationUrl);
+      await sendActivationEmail(normalizedEmail, firstName, activationToken, activationUrl);
       console.log(`[signup] Activation email sent to ${email}`);
     } catch (emailError: any) {
       console.error("[signup] Failed to send activation email:", emailError);

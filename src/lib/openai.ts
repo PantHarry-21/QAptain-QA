@@ -116,6 +116,24 @@ interface InterpretedScenario {
   steps: string[];
 }
 
+export interface AiRunnerMicroAction {
+  type: string;
+  target?: string;
+  field?: string;
+  value?: string;
+  optionText?: string;
+  url?: string;
+  ms?: number;
+  text?: string;
+  substring?: string;
+  key?: string;
+}
+
+export interface AiRunnerMicroPlan {
+  intent_summary: string;
+  actions: AiRunnerMicroAction[];
+}
+
 interface TestAnalysis {
   summary: string;
   keyFindings: string[];
@@ -205,6 +223,21 @@ export class OpenAIService {
   async createWorkflowPlan(userCommand: string, context: any): Promise<WorkflowPlan> {
     const prompt = prompts.createWorkflowPlan(userCommand, context);
     return this._generateAndParseJSON<WorkflowPlan>(prompt, { maxTokens: 1000 });
+  }
+
+  /**
+   * AI test runner: natural language → ordered micro-actions using live DOM snapshot.
+   */
+  async planMicroSteps(
+    userIntent: string,
+    domSnapshot: unknown,
+    meta: { scenarioTitle?: string } = {},
+  ): Promise<AiRunnerMicroPlan> {
+    const prompt = prompts.aiRunnerMicroPlan(userIntent, domSnapshot, meta);
+    return this._generateAndParseJSON<AiRunnerMicroPlan>(prompt, {
+      temperature: 0.25,
+      maxTokens: 2800,
+    });
   }
 
   /**

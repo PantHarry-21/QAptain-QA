@@ -1,7 +1,7 @@
 import type { NextAuthOptions } from "next-auth";
 import CredentialsProvider from "next-auth/providers/credentials";
-import getPool from "./db";
 import bcrypt from "bcrypt";
+import { prisma } from "./prisma";
 
 /** helpers: never throw at module scope (important for Vercel/build) */
 const has = (k: string) => Boolean(process.env[k]);
@@ -34,36 +34,31 @@ export const getAuthOptions = (): NextAuthOptions => {
         }
 
         const normalizedEmail = credentials.email.trim().toLowerCase();
-        const pool = getPool();
         try {
-          const { rows } = await pool.query(
-            "SELECT id, email, password, first_name, last_name, email_verified FROM users WHERE LOWER(email) = LOWER($1)",
-            [normalizedEmail]
-          );
-          const user = rows[0];
+          const user = await prisma.user.findUnique({
+            where: { email: normalizedEmail },
+          });
 
           if (!user) {
             return null;
           }
 
-          // Block login until activation link is used.
-          if (!user.email_verified) {
+          if (!user.emailVerified) {
             return null;
           }
 
-          // Compare password asynchronously
           const passwordMatch = await bcrypt.compare(credentials.password, user.password);
-          
+
           if (passwordMatch) {
-            const fullName = user.first_name && user.last_name 
-              ? `${user.first_name} ${user.last_name}` 
-              : user.first_name || user.last_name || user.email || "User";
-            const userObj = {
+            const fullName =
+              user.firstName && user.lastName
+                ? `${user.firstName} ${user.lastName}`
+                : user.firstName || user.lastName || user.email || "User";
+            return {
               id: user.id,
               email: user.email,
               name: fullName,
             };
-            return userObj;
           }
         } catch (error) {
           console.error("[auth] Error during authorization:", error);
@@ -87,7 +82,6 @@ export const getAuthOptions = (): NextAuthOptions => {
       strategy: "jwt",
     },
     debug: process.env.NODE_ENV === "development", // Enable debug in development
-    trustHost: true, // Required for Next.js 15 App Router & Auth.js
     callbacks: {
       async session({ session, token }) {
         // Attach the user id from the JWT into the session object

@@ -1,12 +1,17 @@
 import { Page, Browser, Locator, chromium } from 'playwright';
 import sparticuzChromium from '@sparticuz/chromium';
 import { v4 as uuidv4 } from 'uuid';
-import { openAIService } from './openai';
+import { openAIService, type AiRunnerMicroAction } from './openai';
 import { Server } from 'socket.io';
 
 import { skillFillFormHappyPath, type FillFormResult } from './skills/fill-form';
 import { ensureLoggedIn } from './skills/ensure-login';
-import { getDomContextSelector } from './utils';
+import {
+  extractModulePathFromScenario,
+  navigateModulePathHuman,
+  stepsHaveExplicitNavigate,
+} from './skills/navigate-modules';
+import { gatherDomSnapshot, snapshotSummaryForLog } from './skills/dom-snapshot';
 import { goldenScenarios } from './golden-scenarios';
 import { databaseService } from './database-service';
 import type { TestLog, TestScenario } from './types';
@@ -35,28 +40,52 @@ interface CommandDefinition {
 }
 
 const stopRequests = new Set<string>();
+const runStopRequests = new Set<string>();
 
 export function requestStop(sessionId: string) {
   stopRequests.add(sessionId);
 }
 
+/** Stops workspace execution runs driven by BullMQ / plan executor */
+export function requestStopExecutionRun(runId: string) {
+  runStopRequests.add(runId);
+}
+
+export function isExecutionRunStopped(runId: string) {
+  return runStopRequests.has(runId);
+}
+
+export function clearExecutionRunStop(runId: string) {
+  runStopRequests.delete(runId);
+}
+
 // --- Helper Functions ---
 
-async function findLocator(page: Page, identifier: string): Promise<Locator> {
+function escapeForRegex(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export async function findLocator(page: Page, identifier: string): Promise<Locator> {
     const cleanedIdentifier = identifier.replace(/['"“”]/g, '').replace(/\b(tab|button|link|page|the|field|input)\b/gi, '').trim();
-    const searchRegex = new RegExp(cleanedIdentifier.replace(/[.*+?^${}()|[\\]/g, '\\$&'), 'i');
+    const searchRegex = new RegExp(escapeForRegex(cleanedIdentifier), 'i');
 
     // --- Locator Priority List ---
     // Tries locators in order of reliability. The first one that finds a visible element is used.
     const strategies = [
         () => page.getByRole('button', { name: searchRegex }),
+        () => page.getByRole('menuitem', { name: searchRegex }),
+        () => page.getByRole('tab', { name: searchRegex }),
+        () => page.getByRole('option', { name: searchRegex }),
         () => page.getByRole('link', { name: searchRegex }),
         () => page.getByLabel(searchRegex),
         () => page.getByPlaceholder(searchRegex),
+        () => page.getByTitle(searchRegex),
         () => page.getByTestId(cleanedIdentifier),
         () => page.getByText(searchRegex),
         // Fallback for buttons that aren't properly labeled for accessibility
-        () => page.locator(`button:has-text("${cleanedIdentifier}")`),
+        () => page.locator(`button:has-text("${cleanedIdentifier.replace(/"/g, '\\"')}")`),
+        () => page.locator(`a:has-text("${cleanedIdentifier.replace(/"/g, '\\"')}")`),
+        () => page.locator(`[aria-label*="${cleanedIdentifier.replace(/"/g, '\\"').slice(0, 80)}"]`),
     ];
 
     for (const getLocator of strategies) {
@@ -190,7 +219,7 @@ const commandDefinitions: CommandDefinition[] = [
     },
 ];
 
-function parseSingleCommand(step: string): ParsedCommand | null {
+export function parseSingleCommand(step: string): ParsedCommand | null {
     const trimmedStep = step.trim().replace(/^\d+\.\s*/, ''); // Remove leading "1. ", "2. ", etc.
     for (const def of commandDefinitions) {
         const matches = trimmedStep.match(def.regex);
@@ -418,7 +447,147 @@ export async function executeSingleCommand(command: ParsedCommand, page: Page, b
   }
 }
 
-async function executeStep(page: Page, step: string, baseUrl: string, sessionId: string, scenarioId: string): Promise<void> {
+async function executeMicroActions(
+  page: Page,
+  actions: AiRunnerMicroAction[],
+  baseUrl: string,
+  sessionId: string,
+  scenarioId: string,
+  emitLog: (log: Partial<TestLog>) => void,
+) {
+  for (let idx = 0; idx < actions.length; idx++) {
+    const a = actions[idx];
+    const rawType = String(a.type || '').trim();
+    const t = rawType.toLowerCase().replace(/[\s-]+/g, '_');
+    emitLog({
+      level: 'info',
+      message: `[AI runner ${idx + 1}/${actions.length}] ${rawType}${a.target ? `: ${a.target}` : a.field ? `: ${a.field}` : ''}`,
+      scenario_id: scenarioId,
+    });
+
+    switch (t) {
+      case 'click':
+        await executeSingleCommand(
+          { type: 'click', target: a.target || a.text || '' },
+          page,
+          baseUrl,
+          sessionId,
+          scenarioId,
+        );
+        break;
+      case 'fill':
+        await executeSingleCommand(
+          { type: 'fill', target: a.field || a.target || '', value: a.value ?? '' },
+          page,
+          baseUrl,
+          sessionId,
+          scenarioId,
+        );
+        break;
+      case 'select_option': {
+        const field = (a.field || a.target || '').replace(/['"']/g, '').trim();
+        const opt = (a.optionText || a.value || '').trim();
+        if (!field || !opt) throw new Error('select_option requires field and optionText');
+        const reField = new RegExp(escapeForRegex(field), 'i');
+        const reOpt = new RegExp(escapeForRegex(opt), 'i');
+        const byLabel = page.getByLabel(reField).first();
+        if ((await byLabel.count().catch(() => 0)) > 0 && (await byLabel.isVisible().catch(() => false))) {
+          await byLabel.selectOption({ label: opt }).catch(() => byLabel.selectOption({ value: opt }));
+        } else {
+          const combo = page.getByRole('combobox', { name: reField }).first();
+          if ((await combo.count().catch(() => 0)) > 0) {
+            await combo.click({ timeout: 10000 });
+            await page.getByRole('option', { name: reOpt }).first().click({ timeout: 10000 });
+          } else {
+            await executeSingleCommand({ type: 'select', target: field, value: opt }, page, baseUrl, sessionId, scenarioId);
+          }
+        }
+        break;
+      }
+      case 'press_key':
+      case 'presskey': {
+        const k = (a.key || 'Enter').replace(/\s+/g, '');
+        await page.keyboard.press(k);
+        break;
+      }
+      case 'navigate': {
+        const u = (a.url || '').trim();
+        if (!u.startsWith('http')) throw new Error(`navigate requires full URL, got: "${u}"`);
+        await executeSingleCommand({ type: 'navigateUrl', target: u }, page, baseUrl, sessionId, scenarioId);
+        break;
+      }
+      case 'wait_ms':
+      case 'waitms': {
+        const ms = Math.min(8000, Math.max(50, Number(a.ms) || 500));
+        await page.waitForTimeout(ms);
+        break;
+      }
+      case 'wait_seconds':
+      case 'waitseconds': {
+        const sec = Math.min(30, Math.max(0.1, Number((a as any).seconds) || 1));
+        await page.waitForTimeout(sec * 1000);
+        break;
+      }
+      case 'assert_text_visible':
+      case 'assert_visible':
+      case 'asserttextvisible': {
+        const txt = a.text || '';
+        if (!txt) throw new Error('assert_text_visible requires text');
+        await executeSingleCommand({ type: 'assertPageContains', value: txt }, page, baseUrl, sessionId, scenarioId);
+        break;
+      }
+      case 'assert_text_not_visible':
+      case 'asserttextnotvisible': {
+        const txt = a.text || '';
+        if (!txt) throw new Error('assert_text_not_visible requires text');
+        const vis = await page.getByText(txt, { exact: false }).first().isVisible().catch(() => false);
+        if (vis) throw new Error(`Bug: expected "${txt}" to be absent but it is visible (possible regression).`);
+        break;
+      }
+      case 'assert_url_contains':
+      case 'asserturlcontains': {
+        const sub = a.substring || '';
+        if (!sub) throw new Error('assert_url_contains requires substring');
+        await executeSingleCommand({ type: 'assertUrlContains', value: sub }, page, baseUrl, sessionId, scenarioId);
+        break;
+      }
+      case 'hover': {
+        const loc = await findLocator(page, a.target || '');
+        await loc.first().hover({ timeout: 15000 });
+        break;
+      }
+      case 'double_click':
+      case 'doubleclick': {
+        const loc = await findLocator(page, a.target || '');
+        await loc.first().dblclick({ timeout: 15000 });
+        break;
+      }
+      case 'scroll_to':
+      case 'scrollto': {
+        const loc = await findLocator(page, a.target || '');
+        await loc.first().scrollIntoViewIfNeeded();
+        await page.waitForTimeout(150);
+        break;
+      }
+      default:
+        throw new Error(`Unknown AI micro-action type: "${rawType}"`);
+    }
+
+    await page.waitForLoadState('domcontentloaded', { timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(100);
+  }
+}
+
+function normalizeScenarioSteps(scenario: any) {
+  const raw = Array.isArray(scenario.steps) ? scenario.steps : [];
+  const steps = raw.map((s: unknown) => String(s).trim()).filter(Boolean);
+  if (steps.length > 0) return { ...scenario, steps };
+  const blob = [scenario.title, scenario.description].filter(Boolean).join('\n\n').trim();
+  if (!blob) return { ...scenario, steps: [] as string[] };
+  return { ...scenario, steps: [blob] };
+}
+
+export async function executeStep(page: Page, step: string, baseUrl: string, sessionId: string, scenarioId: string): Promise<void> {
   // Normalize human-written "multi-step in one line" patterns.
   const normalizedPieces = step
     .split(/\s*\|\s*|\s*→\s*|\s*->\s*/g)
@@ -486,27 +655,28 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
       .catch(err => console.error('Failed to persist test log', err));
   };
 
-  const processedScenarios = scenarios.map(scenario => {
-    const goldenMatch = goldenScenarios.find(golden => 
-      golden.title.toLowerCase() === scenario.title.toLowerCase()
+  const processedScenarios = scenarios.map((scenario) => {
+    const goldenMatch = goldenScenarios.find(
+      (golden) => golden.title.toLowerCase() === scenario.title.toLowerCase(),
     );
 
+    let sc = scenario;
     if (goldenMatch) {
-      emitLog({ 
-        level: 'info', 
+      emitLog({
+        level: 'info',
         message: `Golden scenario matched: "${scenario.title}". Overriding AI-generated steps with predefined steps.`,
-        scenario_id: scenario.id 
+        scenario_id: scenario.id,
       });
-      return { ...scenario, steps: goldenMatch.steps };
+      sc = { ...scenario, steps: goldenMatch.steps };
     }
-    
-    return scenario;
+
+    return normalizeScenarioSteps(sc);
   });
 
   const emitScreenshot = async (page: Page) => {
     try {
-      const screenshot = await page.screenshot({ type: 'png' });
-      io.to(sessionRoom).emit('browser-view-update', `data:image/png;base64,${screenshot.toString('base64')}`);
+      const screenshot = await page.screenshot({ type: 'jpeg', quality: 52 });
+      io.to(sessionRoom).emit('browser-view-update', `data:image/jpeg;base64,${screenshot.toString('base64')}`);
     } catch (e) {}
   };
 
@@ -518,65 +688,81 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
     passedSteps: 0,
     failedSteps: 0
   };
-  const scenarioIds = processedScenarios.map(s => s.id);
-  await databaseService.seedSessionData(sessionId, {
-    session: {
-      id: sessionId,
-      url,
-      status: 'running',
-      total_scenarios: processedScenarios.length,
-      passed_scenarios: 0,
-      failed_scenarios: 0,
-      total_steps: sessionResults.totalSteps,
-      passed_steps: 0,
-      failed_steps: 0,
-      started_at: startTime.toISOString(),
-      created_at: startTime.toISOString(),
-      updated_at: startTime.toISOString(),
-      selected_scenario_ids: scenarioIds,
-    },
-    scenarios: processedScenarios.map((scenario) => ({
-      id: scenario.id,
-      session_id: sessionId,
-      title: scenario.title,
-      description: scenario.description,
-      steps: scenario.steps,
-      status: 'pending',
-    })),
-  });
-  await databaseService.updateTestSession(sessionId, { selected_scenario_ids: scenarioIds });
+  const scenarioIds = processedScenarios.map((s) => s.id);
+
+  emitLog({ level: 'info', message: 'Preparing session and browser (parallel)…' });
+
+  const isServerless = Boolean(process.env.VERCEL || process.env.LAMBDA_TASK_ROOT || process.env.RENDER);
+  const recordVideoDir = isServerless ? `/tmp/videos/${sessionId}` : `videos/${sessionId}`;
+  const recordVideo =
+    process.env.RECORD_PLAYWRIGHT_VIDEO === 'true' ? { dir: recordVideoDir } : undefined;
 
   try {
-    emitLog({ level: 'info', message: `Initializing test session with Playwright...` });
+    await Promise.all([
+    databaseService.seedSessionData(sessionId, {
+      session: {
+        id: sessionId,
+        url,
+        status: 'running',
+        total_scenarios: processedScenarios.length,
+        passed_scenarios: 0,
+        failed_scenarios: 0,
+        total_steps: sessionResults.totalSteps,
+        passed_steps: 0,
+        failed_steps: 0,
+        started_at: startTime.toISOString(),
+        created_at: startTime.toISOString(),
+        updated_at: startTime.toISOString(),
+        selected_scenario_ids: scenarioIds,
+      },
+      scenarios: processedScenarios.map((scenario) => ({
+        id: scenario.id,
+        session_id: sessionId,
+        title: scenario.title,
+        description: scenario.description,
+        steps: scenario.steps,
+        status: 'pending',
+      })),
+    }),
+    (async () => {
+      if (isServerless) {
+        browser = await chromium.launch({
+          args: sparticuzChromium.args,
+          executablePath: await sparticuzChromium.executablePath(),
+          headless: sparticuzChromium.headless,
+        });
+      } else {
+        browser = await chromium.launch({
+          headless: true,
+          args: ['--disable-dev-shm-usage'],
+        });
+      }
+    })(),
+  ]);
 
-    const isServerless = process.env.VERCEL || process.env.LAMBDA_TASK_ROOT || process.env.RENDER;
-    emitLog({ level: 'info', message: `Environment detected as ${isServerless ? 'Serverless' : 'Local'}.` });
+  await databaseService.updateTestSession(sessionId, { selected_scenario_ids: scenarioIds });
 
-    if (isServerless) {
-      emitLog({ level: 'info', message: 'Launching browser with @sparticuz/chromium for serverless environment.' });
-      browser = await chromium.launch({
-        args: sparticuzChromium.args,
-        executablePath: await sparticuzChromium.executablePath(),
-        headless: sparticuzChromium.headless,
-      });
-    } else {
-      emitLog({ level: 'info', message: 'Launching browser with local Playwright installation.' });
-      browser = await chromium.launch({
-        headless: true
-      });
-    }
-    const context = await browser.newContext({
-      recordVideo: { dir: isServerless ? `/tmp/videos/${sessionId}` : `videos/${sessionId}` }
+    emitLog({ level: 'info', message: `Playwright browser ready (${isServerless ? 'serverless' : 'local'}).` });
+
+    const context = await browser!.newContext({
+      ...(recordVideo ? { recordVideo } : {}),
     });
     const page = await context.newPage();
     page.setDefaultTimeout(8000);
     page.setDefaultNavigationTimeout(20000);
 
-    emitLog({ level: 'info', message: `Playwright browser initialized. Starting execution for ${processedScenarios.length} scenarios.` });
+    await ensureLoggedIn(page, url, sessionId).catch((e) => {
+      const msg = e instanceof Error ? e.message : String(e);
+      emitLog({ level: 'error', message: `Login failed: ${msg}` });
+      throw e instanceof Error ? e : new Error(msg);
+    });
+
     await emitScreenshot(page);
 
-    // Ensure user is authenticated before running scenarios (prevents running on login page).
-    await ensureLoggedIn(page, url, sessionId).catch(() => {});
+    emitLog({
+      level: 'info',
+      message: `Signed in. Running ${processedScenarios.length} scenario(s).`,
+    });
 
     for (let i = 0; i < processedScenarios.length; i++) {
       if (stopRequests.has(sessionId)) {
@@ -599,8 +785,36 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
       emitLog({ level: 'info', message: `Starting scenario: "${scenario.title}"`, scenario_id: scenario.id });
 
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await ensureLoggedIn(page, url, sessionId, scenario.id).catch(() => {});
-      await saveScreenshotToDatabase(page, sessionId, scenario.id, undefined, `Initial state for scenario: ${scenario.title}`);
+      await ensureLoggedIn(page, url, sessionId, scenario.id).catch((e) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        emitLog({ level: 'error', message: `Session re-login failed: ${msg}`, scenario_id: scenario.id });
+        throw e instanceof Error ? e : new Error(msg);
+      });
+
+      const modulePath = extractModulePathFromScenario(
+        scenario.title || '',
+        typeof scenario.description === 'string' ? scenario.description : undefined,
+      );
+      if (modulePath.length > 0 && !stepsHaveExplicitNavigate(scenario.steps || [])) {
+        emitLog({
+          level: 'info',
+          message: `No explicit Navigate step; exploring menus for: ${modulePath.join(' → ')}`,
+          scenario_id: scenario.id,
+        });
+        await navigateModulePathHuman(page, modulePath, (msg) =>
+          emitLog({ level: 'info', message: msg, scenario_id: scenario.id }),
+        );
+      }
+
+      if (process.env.QAPTAIN_FULL_INITIAL_SCREENSHOTS === 'true') {
+        await saveScreenshotToDatabase(
+          page,
+          sessionId,
+          scenario.id,
+          undefined,
+          `Initial state for scenario: ${scenario.title}`,
+        );
+      }
       await emitScreenshot(page);
 
       for (let j = 0; j < scenario.steps.length; j++) {
@@ -640,9 +854,50 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
               // It's a basic, low-level command
               await executeStep(page, stepDescription, url, sessionId, scenario.id);
             } else {
-              // It's a high-level, abstract command
-              emitLog({ level: 'info', message: `High-level command detected: "${stepDescription}". Analyzing page context...`, scenario_id: scenario.id });
+              emitLog({
+                level: 'info',
+                message: `Natural-language step (AI runner): "${stepDescription.length > 220 ? `${stepDescription.slice(0, 220)}…` : stepDescription}"`,
+                scenario_id: scenario.id,
+              });
 
+              const useAiMicro =
+                process.env.QAPTAIN_AI_MICRO_RUNNER !== '0' &&
+                process.env.QAPTAIN_AI_MICRO_RUNNER !== 'false';
+
+              let handledNl = false;
+              if (useAiMicro) {
+                try {
+                  const domSnap = await gatherDomSnapshot(page);
+                  emitLog({
+                    level: 'info',
+                    message: `AI runner DOM: ${snapshotSummaryForLog(domSnap)}`,
+                    scenario_id: scenario.id,
+                  });
+                  const micro = await openAIService.planMicroSteps(stepDescription, domSnap, {
+                    scenarioTitle: scenario.title,
+                  });
+                  if (micro?.intent_summary) {
+                    emitLog({
+                      level: 'info',
+                      message: `AI runner plan summary: ${micro.intent_summary}`,
+                      scenario_id: scenario.id,
+                    });
+                  }
+                  if (micro?.actions?.length) {
+                    await executeMicroActions(page, micro.actions, url, sessionId, scenario.id, emitLog);
+                    await emitScreenshot(page);
+                    handledNl = true;
+                  }
+                } catch (aiErr) {
+                  emitLog({
+                    level: 'warning',
+                    message: `AI micro-runner failed (${aiErr instanceof Error ? aiErr.message : 'unknown'}); using skill orchestrator fallback.`,
+                    scenario_id: scenario.id,
+                  });
+                }
+              }
+
+              if (!handledNl) {
               // Determine the active DOM context (main page or modal)
               const activeContextSelector = await getDomContextSelector(page);
 
@@ -799,6 +1054,7 @@ export async function executeTests(io: Server, sessionId: string, scenarios: any
                     throw new Error(`Unknown AI skill in sub-plan: ${skill}`);
                 }
                 await emitScreenshot(page);
+              }
               }
             }
             // --- END SMART DISPATCHER LOGIC ---

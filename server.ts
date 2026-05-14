@@ -49,6 +49,8 @@ async function createCustomServer() {
     });
 
     setupSocket(io);
+    const { attachRunEventBridge } = await import('@/server/events/socket-bridge');
+    attachRunEventBridge(io);
 
     // Start the server
     server.listen(currentPort, hostname, () => {

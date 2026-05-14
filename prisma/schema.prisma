@@ -1,0 +1,654 @@
+// QAPtain — workspace-centric data model (PostgreSQL)
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum WorkspaceRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum DiscoveryStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum ExecutionRunStatus {
+  PENDING
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+/// Matches legacy `users` table (NextAuth credentials)
+model User {
+  id              String    @id
+  firstName       String?   @map("first_name")
+  lastName        String?   @map("last_name")
+  email           String    @unique
+  password        String
+  emailVerified   DateTime? @map("email_verified")
+  activationToken String?   @map("activation_token")
+  image           String?
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  ownedWorkspaces Workspace[]       @relation("WorkspaceOwner")
+  memberships     WorkspaceMember[]
+
+  @@map("users")
+}
+
+model Workspace {
+  id          String   @id @default(cuid())
+  ownerId     String   @map("owner_id")
+  owner       User     @relation("WorkspaceOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  members                WorkspaceMember[]
+  environments           Environment[]
+  authProfiles           AuthProfile[]
+  discoveryRuns          DiscoveryRun[]
+  modules                ApplicationModule[]
+  scenarios              Scenario[]
+  executionPlans         ExecutionPlan[]
+  executionRuns          ExecutionRun[]
+  fieldDefinitions       FieldDefinition[]
+  selectorMemories       SelectorMemory[]
+  aiMemoryChunks         AiMemoryChunk[]
+  validationRules        ValidationRule[]
+  scenarioModuleMappings ScenarioModuleMapping[]
+  applicationIntelGraphs ApplicationIntelGraph[]
+  workflowIntel          WorkflowIntel[]
+  apiEndpointIntel       ApiEndpointIntel[]
+
+  @@index([ownerId])
+  @@map("workspaces")
+}
+
+model WorkspaceMember {
+  id          String        @id @default(cuid())
+  workspaceId String        @map("workspace_id")
+  userId      String        @map("user_id")
+  role        WorkspaceRole @default(MEMBER)
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+  @@map("workspace_members")
+}
+
+model Environment {
+  id            String         @id @default(cuid())
+  workspaceId   String         @map("workspace_id")
+  name          String
+  baseUrl       String         @map("base_url")
+  workspace     Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  discoveryRuns DiscoveryRun[]
+  executionRuns ExecutionRun[]
+
+  @@map("environments")
+}
+
+model AuthProfile {
+  id               String    @id @default(cuid())
+  workspaceId      String    @map("workspace_id")
+  name             String
+  blueprint        Json /// multi-step auth definition
+  usernameCipher   String?   @map("username_cipher")
+  passwordCipher   String?   @map("password_cipher")
+  labName          String?   @map("lab_name")
+  roleHint         String?   @map("role_hint") /// ADMIN | USER — drives location picker flow
+  storageStatePath String?   @map("storage_state_path")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+  workspace        Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@map("auth_profiles")
+}
+
+model DiscoveryRun {
+  id            String              @id @default(cuid())
+  workspaceId   String              @map("workspace_id")
+  environmentId String              @map("environment_id")
+  phase         Int                 @default(1)
+  status        DiscoveryStatus     @default(PENDING)
+  progress      Int                 @default(0)
+  totalItems    Int?                @map("total_items")
+  summary       Json?
+  error         String?
+  startedAt     DateTime?           @map("started_at")
+  completedAt   DateTime?           @map("completed_at")
+  createdAt     DateTime            @default(now()) @map("created_at")
+  workspace     Workspace           @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  environment   Environment         @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  modules       ApplicationModule[]
+
+  @@index([workspaceId, status])
+  @@map("discovery_runs")
+}
+
+model ApplicationModule {
+  id             String             @id @default(cuid())
+  workspaceId    String             @map("workspace_id")
+  discoveryRunId String?            @map("discovery_run_id")
+  name           String
+  routePattern   String?            @map("route_pattern")
+  metadata       Json?
+  createdAt      DateTime           @default(now()) @map("created_at")
+  workspace      Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  discoveryRun   DiscoveryRun?      @relation(fields: [discoveryRunId], references: [id], onDelete: SetNull)
+  routes         ApplicationRoute[]
+  apiEndpointIntel ApiEndpointIntel[]
+
+  @@index([workspaceId])
+  @@map("application_modules")
+}
+
+model ApplicationRoute {
+  id            String            @id @default(cuid())
+  moduleId      String            @map("module_id")
+  path          String
+  title         String?
+  fingerprint   String?
+  buttons       Json? /// string[] snapshot
+  formCount     Int?              @map("form_count")
+  apiPatterns   Json?             @map("api_patterns")
+  /// Phase 2: pageType, formClassification, workflowHints, sampledApis
+  discoveryMeta Json?             @map("discovery_meta")
+  createdAt     DateTime          @default(now()) @map("created_at")
+  module        ApplicationModule @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+
+  @@index([moduleId])
+  @@map("application_routes")
+}
+
+model Scenario {
+  id             String          @id @default(cuid())
+  workspaceId    String          @map("workspace_id")
+  title          String
+  source         String          @default("manual") /// manual | excel | ai
+  rawText        String?         @map("raw_text")
+  steps          String[]        @default([])
+  intent         Json?
+  mappedModuleId String?         @map("mapped_module_id")
+  riskScore      Int?            @map("risk_score")
+  createdAt      DateTime        @default(now()) @map("created_at")
+  updatedAt      DateTime        @updatedAt @map("updated_at")
+  workspace      Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  plans          ExecutionPlan[]
+
+  @@index([workspaceId])
+  @@map("scenarios")
+}
+
+model ExecutionPlan {
+  id          String         @id @default(cuid())
+  workspaceId String         @map("workspace_id")
+  scenarioId  String?        @map("scenario_id")
+  version     Int            @default(1)
+  plan        Json /// structured ExecutionPlan JSON
+  createdAt   DateTime       @default(now()) @map("created_at")
+  workspace   Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  scenario    Scenario?      @relation(fields: [scenarioId], references: [id], onDelete: SetNull)
+  runs        ExecutionRun[]
+
+  @@index([workspaceId])
+  @@map("execution_plans")
+}
+
+model ExecutionRun {
+  id            String             @id @default(cuid())
+  workspaceId   String             @map("workspace_id")
+  environmentId String?            @map("environment_id")
+  planId        String?            @map("plan_id")
+  status        ExecutionRunStatus @default(PENDING)
+  /// smoke | functional | validation_heavy | regression | deep_validation
+  executionMode String             @default("functional") @map("execution_mode")
+  totalSteps    Int                @default(0) @map("total_steps")
+  passedSteps   Int                @default(0) @map("passed_steps")
+  failedSteps   Int                @default(0) @map("failed_steps")
+  videoPath     String?            @map("video_path")
+  artifacts     Json?
+  error         String?
+  aiReasoning   Json?              @map("ai_reasoning")
+  startedAt     DateTime?          @map("started_at")
+  completedAt   DateTime?          @map("completed_at")
+  createdAt     DateTime           @default(now()) @map("created_at")
+  workspace     Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  environment   Environment?       @relation(fields: [environmentId], references: [id], onDelete: SetNull)
+  plan          ExecutionPlan?     @relation(fields: [planId], references: [id], onDelete: SetNull)
+  steps         ExecutionStep[]
+  logs          ExecutionLog[]
+  report        ExecutionReport?
+
+  @@index([workspaceId, status])
+  @@map("execution_runs")
+}
+
+model ExecutionStep {
+  id             String       @id @default(cuid())
+  runId          String       @map("run_id")
+  stepOrder      Int          @map("step_order")
+  action         String
+  payload        Json?
+  status         String /// pending | running | passed | failed
+  durationMs     Int?         @map("duration_ms")
+  error          String?
+  screenshotPath String?      @map("screenshot_path")
+  healAttempts   Int          @default(0) @map("heal_attempts")
+  /// Phase 2: selector attempts, AI suggestion metadata (deterministic replay)
+  recoveryLog    Json?        @map("recovery_log")
+  startedAtStep  DateTime?    @map("started_at_step")
+  createdAt      DateTime     @default(now()) @map("created_at")
+  run            ExecutionRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@map("execution_steps")
+}
+
+model ExecutionLog {
+  id        String       @id @default(cuid())
+  runId     String       @map("run_id")
+  level     String
+  message   String
+  metadata  Json?
+  createdAt DateTime     @default(now()) @map("created_at")
+  run       ExecutionRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@map("execution_logs")
+}
+
+model ExecutionReport {
+  id                     String       @id @default(cuid())
+  runId                  String       @unique @map("run_id")
+  summary                String
+  riskLevel              String?      @map("risk_level")
+  findings               Json?
+  validations            Json?
+  /// Phase 2 reporting
+  aiSummary              String?      @map("ai_summary")
+  fieldValidationSummary Json?        @map("field_validation_summary")
+  selectorDiagnostics    Json?        @map("selector_diagnostics")
+  recoverySummary        Json?        @map("recovery_summary")
+  timeline               Json?
+  generatedDataLog       Json?        @map("generated_data_log")
+  createdAt              DateTime     @default(now()) @map("created_at")
+  run                    ExecutionRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@map("execution_reports")
+}
+
+model FieldDefinition {
+  id               String           @id @default(cuid())
+  workspaceId      String           @map("workspace_id")
+  routeFingerprint String           @map("route_fingerprint")
+  fieldKey         String           @map("field_key")
+  label            String?
+  /// Raw HTML input type or tag-derived type
+  fieldType        String           @map("field_type")
+  /// Phase 2: normalized semantic class (email, phone, currency, …)
+  semanticClass    String?          @map("semantic_class")
+  semanticMeaning  String?          @map("semantic_meaning")
+  required         Boolean          @default(false)
+  minLength        Int?             @map("min_length")
+  maxLength        Int?             @map("max_length")
+  pattern          String?
+  inputMode        String?          @map("input_mode")
+  ariaLabel        String?          @map("aria_label")
+  placeholderText  String?          @map("placeholder_text")
+  optionsJson      Json?            @map("options_json")
+  /// Higher = more important for risk-based testing (1–100)
+  testPriority     Int              @default(25) @map("test_priority")
+  metadata         Json?
+  createdAt        DateTime         @default(now()) @map("created_at")
+  updatedAt        DateTime         @updatedAt @map("updated_at")
+  workspace        Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  validations      ValidationRule[]
+
+  @@unique([workspaceId, routeFingerprint, fieldKey])
+  @@index([workspaceId, semanticClass])
+  @@map("field_definitions")
+}
+
+/// Inferred validation rules (deterministic + optional AI source tag)
+model ValidationRule {
+  id                String           @id @default(cuid())
+  workspaceId       String           @map("workspace_id")
+  fieldDefinitionId String?          @map("field_definition_id")
+  routeFingerprint  String           @map("route_fingerprint")
+  fieldKey          String           @map("field_key")
+  ruleType          String           @map("rule_type")
+  source            String           @default("html") /// html | api | observed | ai
+  details           Json?
+  createdAt         DateTime         @default(now()) @map("created_at")
+  workspace         Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  fieldDefinition   FieldDefinition? @relation(fields: [fieldDefinitionId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, fieldKey])
+  @@index([fieldDefinitionId])
+  @@map("validation_rules")
+}
+
+model SelectorMemory {
+  id             String    @id @default(cuid())
+  workspaceId    String    @map("workspace_id")
+  targetKey      String    @map("target_key")
+  strategies     String[]
+  /// Score 0–1 per strategy index (same length as strategies); defaults filled server-side
+  strategyScores Json?     @map("strategy_scores")
+  lastSuccessIdx Int       @default(0) @map("last_success_idx")
+  /// Rolling confidence for best-known selector (0–1)
+  confidence     Float     @default(0.5)
+  fingerprint    String?
+  healingHistory Json?     @map("healing_history")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  workspace      Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, targetKey])
+  @@map("selector_memories")
+}
+
+/// Successful phrase → module mappings for scenario intelligence
+model ScenarioModuleMapping {
+  id               String    @id @default(cuid())
+  workspaceId      String    @map("workspace_id")
+  phraseNormalized String    @map("phrase_normalized")
+  moduleId         String    @map("module_id")
+  score            Float     @default(1)
+  successCount     Int       @default(1) @map("success_count")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+  workspace        Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, phraseNormalized])
+  @@index([workspaceId, moduleId])
+  @@map("scenario_module_mappings")
+}
+
+model AiMemoryChunk {
+  id          String    @id @default(cuid())
+  workspaceId String    @map("workspace_id")
+  kind        String /// module | workflow | selector | field
+  refId       String?   @map("ref_id")
+  content     Json
+  embeddingId String?   @map("embedding_id")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, kind])
+  @@map("ai_memory_chunks")
+}
+
+/// Phase 3+: persisted application graph (modules, routes, APIs — deterministic layout)
+model ApplicationIntelGraph {
+  id                String    @id @default(cuid())
+  workspaceId       String    @map("workspace_id")
+  label             String    @default("navigation")
+  graph             Json
+  confidence        Float?
+  source            String    @default("discovery")
+  sourceDiscoveryId String?   @map("source_discovery_id")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+  workspace         Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, label])
+  @@index([workspaceId])
+  @@map("application_intel_graphs")
+}
+
+/// Phase 3+: business workflow hypotheses (filled by deterministic + future AI inference)
+model WorkflowIntel {
+  id            String    @id @default(cuid())
+  workspaceId String    @map("workspace_id")
+  workflowKey String    @map("workflow_key")
+  displayName String?   @map("display_name")
+  steps         Json
+  dependencies  Json
+  confidence    Float     @default(0.5)
+  source        String    @default("inferred")
+  metadata      Json?
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+  workspace     Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, workflowKey])
+  @@index([workspaceId])
+  @@map("workflow_intel")
+}
+
+/// Phase 3+: API endpoint rollup (URLs observed during discovery / execution)
+model ApiEndpointIntel {
+  id             String             @id @default(cuid())
+  workspaceId    String             @map("workspace_id")
+  moduleId       String?            @map("module_id")
+  method         String             @default("GET")
+  pathPattern    String             @map("path_pattern")
+  lastStatusCode Int?               @map("last_status_code")
+  sampleCount    Int                @default(0) @map("sample_count")
+  meta           Json?
+  firstSeenAt    DateTime           @default(now()) @map("first_seen_at")
+  updatedAt      DateTime           @updatedAt @map("updated_at")
+  workspace      Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  module         ApplicationModule? @relation(fields: [moduleId], references: [id], onDelete: SetNull)
+
+  @@unique([workspaceId, method, pathPattern])
+  @@index([workspaceId, moduleId])
+  @@map("api_endpoint_intel")
+}
+
+// --- Legacy tables (keep in schema so `prisma db push` does not drop existing data) ---
+
+enum LegacyTestStatus {
+  pending
+  running
+  completed
+  failed
+
+  @@map("test_status")
+}
+
+enum LegacyScenarioStatus {
+  pending
+  running
+  passed
+  failed
+
+  @@map("scenario_status")
+}
+
+enum LegacyLogLevel {
+  info
+  success
+  error
+  warning
+
+  @@map("log_level")
+}
+
+enum LegacyRiskLevel {
+  low
+  medium
+  high
+
+  @@map("risk_level")
+}
+
+model LegacyTestSession {
+  id                  String            @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId              String?           @map("user_id")
+  url                 String?
+  status              LegacyTestStatus? @default(pending)
+  updatedAt           DateTime?         @default(now()) @map("updated_at")
+  startedAt           DateTime?         @map("started_at")
+  completedAt         DateTime?         @map("completed_at")
+  totalScenarios      Int?              @map("total_scenarios")
+  passedScenarios     Int?              @map("passed_scenarios")
+  failedScenarios     Int?              @map("failed_scenarios")
+  totalSteps          Int?              @map("total_steps")
+  passedSteps         Int?              @map("passed_steps")
+  failedSteps         Int?              @map("failed_steps")
+  duration            BigInt?
+  pageAnalysis        Json?             @map("page_analysis")
+  aiAnalysis          Json?             @map("ai_analysis")
+  selectedScenarioIds Json?             @map("selected_scenario_ids")
+  videoUrl            String?           @map("video_url")
+  createdAt           DateTime?         @default(now()) @map("created_at")
+
+  scenarios       LegacyTestScenario[]
+  logs            LegacyTestLog[]
+  report          LegacyTestReport?
+  scenarioReports LegacyScenarioReport[]
+
+  @@map("test_sessions")
+}
+
+model LegacyTestScenario {
+  id             String                @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  sessionId      String                @map("session_id") @db.Uuid
+  title          String?
+  description    String?
+  steps          String[]
+  status         LegacyScenarioStatus? @default(pending)
+  updatedAt      DateTime?             @default(now()) @map("updated_at")
+  startedAt      DateTime?             @map("started_at")
+  completedAt    DateTime?             @map("completed_at")
+  duration       BigInt?
+  errorMessage   String?               @map("error_message")
+  createdAt      DateTime?             @default(now()) @map("created_at")
+  session        LegacyTestSession     @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  stepsRel       LegacyTestStep[]
+  scenarioReport LegacyScenarioReport?
+
+  @@map("test_scenarios")
+}
+
+model LegacyTestStep {
+  id            String                @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  scenarioId    String                @map("scenario_id") @db.Uuid
+  description   String?
+  order         Int?                  @map("order")
+  status        LegacyScenarioStatus? @default(pending)
+  startedAt     DateTime?             @map("started_at")
+  completedAt   DateTime?             @map("completed_at")
+  duration      BigInt?
+  errorMessage  String?               @map("error_message")
+  screenshotUrl String?               @map("screenshot_url")
+  updatedAt     DateTime?             @default(now()) @map("updated_at")
+  createdAt     DateTime?             @default(now()) @map("created_at")
+  scenario      LegacyTestScenario    @relation(fields: [scenarioId], references: [id], onDelete: Cascade)
+
+  @@map("test_steps")
+}
+
+model LegacyTestLog {
+  id         String            @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  sessionId  String            @map("session_id") @db.Uuid
+  scenarioId String?           @map("scenario_id") @db.Uuid
+  stepId     String?           @map("step_id") @db.Uuid
+  level      LegacyLogLevel?
+  message    String?
+  timestamp  DateTime?         @default(now()) @map("timestamp")
+  metadata   Json?
+  createdAt  DateTime?         @default(now()) @map("created_at")
+  session    LegacyTestSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@map("test_logs")
+}
+
+model LegacyTestReport {
+  id                   String            @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  sessionId            String            @unique @map("session_id") @db.Uuid
+  title                String?
+  summary              String?
+  keyFindings          String[]          @map("key_findings")
+  recommendations      String[]
+  riskLevel            LegacyRiskLevel?  @map("risk_level")
+  riskAssessmentIssues String[]          @map("risk_assessment_issues")
+  performanceMetrics   Json?             @map("performance_metrics")
+  qualityScore         Int?              @map("quality_score")
+  pdfUrl               String?           @map("pdf_url")
+  updatedAt            DateTime?         @default(now()) @map("updated_at")
+  createdAt            DateTime?         @default(now()) @map("created_at")
+  session              LegacyTestSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@map("test_reports")
+}
+
+model LegacyScenarioReport {
+  id              String             @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  sessionId       String             @map("session_id") @db.Uuid
+  scenarioId      String             @unique @map("scenario_id") @db.Uuid
+  summary         String?
+  issues          String[]
+  recommendations String[]
+  createdAt       DateTime?          @default(now()) @map("created_at")
+  session         LegacyTestSession  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  scenario        LegacyTestScenario @relation(fields: [scenarioId], references: [id], onDelete: Cascade)
+
+  @@map("scenario_reports")
+}
+
+model LegacySavedScenario {
+  id        String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId    String?   @map("user_id")
+  url       String?
+  title     String?
+  userStory String?   @map("user_story")
+  steps     String[]
+  createdAt DateTime? @default(now()) @map("created_at")
+
+  @@map("saved_scenarios")
+}
+
+model LegacyAccount {
+  id                String  @id
+  userId            String  @map("user_id")
+  type              String
+  provider          String
+  providerAccountId String  @map("provider_account_id")
+  refreshToken      String? @map("refresh_token")
+  accessToken       String? @map("access_token")
+  expiresAt         BigInt? @map("expires_at")
+  tokenType         String? @map("token_type")
+  scope             String?
+  idToken           String? @map("id_token")
+  sessionState      String? @map("session_state")
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model LegacySession {
+  id           String   @id
+  sessionToken String   @unique @map("session_token")
+  userId       String   @map("user_id")
+  expires      DateTime
+
+  @@map("sessions")
+}
+
+model LegacyVerificationToken {
+  identifier String
+  token      String
+  expires    DateTime
+
+  @@id([identifier, token])
+  @@map("verification_tokens")
+}

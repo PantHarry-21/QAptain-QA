@@ -42,7 +42,7 @@ function LoginForm() {
       } else if (result?.ok) {
         // Manual redirect on success
         console.log('[Login] Sign in successful, manually redirecting...');
-        router.push('/');
+        router.push(searchParams.get('callbackUrl') || '/dashboard');
       } else {
         setError('Login failed. Please try again.');
         console.error('[Login] Sign in failed - no error but not ok');

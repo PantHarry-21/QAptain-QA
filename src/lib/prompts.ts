@@ -336,4 +336,51 @@ export const prompts = {
       "qualityScore": 0
     }
   `,
+
+  /**
+   * AI test runner: turn plain-language intent + live DOM into executable micro-actions.
+   */
+  aiRunnerMicroPlan: (userIntent: string, domSnapshot: unknown, meta: { scenarioTitle?: string }) => {
+    const snap = JSON.stringify(domSnapshot, null, 2);
+    const title = meta.scenarioTitle ? `Scenario title: "${meta.scenarioTitle}"\n` : '';
+    return `You are an expert AI test runner (like a senior manual QA + Playwright engineer). The user described what to do in natural language. Your job is to produce a short, ordered list of concrete UI actions that will accomplish their intent on the CURRENT page and follow-up screens that appear after those actions.
+
+${title}User intent (may be one step or a whole mini-scenario):
+"""
+${userIntent}
+"""
+
+Current page DOM summary (only trust controls/text that appear here for targeting; prefer exact visible labels):
+\`\`\`json
+${snap}
+\`\`\`
+
+RULES:
+1. Output ONLY valid JSON (no markdown) with this shape:
+{"intent_summary":"one sentence","actions":[{"type":"...","...": "..."}]}
+
+2. "actions" is 1–25 steps. Each step must be executable by a browser automation runner. Prefer human-like exploration: open menus, click visible text, fill labeled fields, assert outcomes (bugs = failed assertions).
+
+3. Allowed action types (use these exact type strings):
+- "click" — requires "target" (visible button/link/tab text or menu item label from the snapshot)
+- "fill" — requires "field" (label/placeholder/name hint) and "value" (string to type)
+- "select_option" — requires "field" (dropdown/combobox label) and "optionText" (visible option)
+- "press_key" — requires "key" (e.g. "Enter", "Escape", "Tab")
+- "navigate" — requires "url" (full https URL only if user gave one or it appears in snapshot url)
+- "wait_ms" — requires "ms" (number, 100–8000) use sparingly after navigation or heavy UI
+- "assert_text_visible" — requires "text" (substring user expects to see — finds bugs if missing)
+- "assert_text_not_visible" — requires "text"
+- "assert_url_contains" — requires "substring"
+- "hover" — requires "target"
+- "double_click" — requires "target"
+- "scroll_to" — requires "target" (label/text to bring into view before click)
+
+4. Map the user's intent to controls visible in the snapshot. If the user mentions a module/menu not visible, first add clicks that expand navigation (use button/link text from snapshot). Do not invent control labels that are not plausibly on the page — use the closest match from the snapshot.
+
+5. Include verification steps ("assert_text_visible") when the user implies expected outcome, success message, column headers, error messages, or "should see".
+
+6. Keep values realistic. If the user did not specify a value for a required field, use plausible test data (emails, names, codes).
+
+Now produce the JSON plan.`;
+  },
 };

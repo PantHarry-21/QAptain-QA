@@ -1,0 +1,36 @@
+# QAPtain local stack — PostgreSQL, Redis, ChromaDB (free / OSS)
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: qaptain
+      POSTGRES_PASSWORD: qaptain
+      POSTGRES_DB: qaptain
+    ports:
+      - "5432:5432"
+    volumes:
+      - qaptain_pg:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - qaptain_redis:/data
+
+  chroma:
+    image: chromadb/chroma:0.5.23
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      ANONYMIZED_TELEMETRY: "false"
+    volumes:
+      - qaptain_chroma:/chroma/chroma
+
+volumes:
+  qaptain_pg:
+  qaptain_redis:
+  qaptain_chroma:
