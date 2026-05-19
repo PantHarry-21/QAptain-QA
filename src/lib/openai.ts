@@ -30,14 +30,18 @@ function getClient(): any {
 
     if (wantAzure) {
       const apiVersion = process.env.AZURE_OPENAI_API_VERSION || '2024-02-15-preview';
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { AzureOpenAI } = require('openai');
-      client = new AzureOpenAI({
-        apiKey: azureApiKey,
-        endpoint: azureEndpoint,
-        deployment: azureDeployment || modelName,
-        apiVersion,
-      });
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { AzureOpenAI } = require('openai');
+        client = new AzureOpenAI({
+          apiKey: azureApiKey,
+          endpoint: azureEndpoint,
+          deployment: azureDeployment || modelName,
+          apiVersion,
+        });
+      } catch (e) {
+        throw new Error('Failed to load AzureOpenAI - openai package may not be installed properly');
+      }
     } else {
       if (!openaiApiKey) {
         const errorMessage =

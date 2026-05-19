@@ -28,70 +28,71 @@ export class RequirementIntelligenceEngine {
    * @param text The requirement text (PRD, story, etc).
    */
   static async analyze(workspaceId: string, text: string): Promise<RequirementAnalysisResult> {
-    console.log(`[Requirement Engine] Analyzing requirement for workspace ${workspaceId}...`);
+    try {
+      console.log(`[Requirement Engine] Analyzing requirement for workspace ${workspaceId}...`);
 
-    // 1. Gather Workspace Context (Modules, Fields)
-    const modules = await prisma.module.findMany({
-      where: { workspaceId },
-      include: { routes: true },
-    });
-
-    const context = {
-      modules: modules.map(m => ({
-        name: m.name,
-        routes: m.routes.map(r => r.path),
-      })),
-    };
-
-    // 2. Multi-Agent Orchestration Flow
-    
-    // Agent 1: PRD Analysis (Business Context)
-    console.log('[Requirement Engine] Agent 1: PRD Analyst starting...');
-    const prdPrompt = prompts.prdAnalystAgent(text);
-    const businessAnalysis = await openAIService['_generateAndParseJSON']<{
-      personas: string[];
-      workflows: any[];
-      businessRules: string[];
-    }>(prdPrompt);
-
-    // Agent 2: Test Architecture (Scenario Strategy)
-    console.log('[Requirement Engine] Agent 2: Test Architect starting...');
-    const archPrompt = prompts.testArchitectAgent(businessAnalysis.workflows, context.modules);
-    const strategy = await openAIService['_generateAndParseJSON']<{
-      scenarios: any[];
-    }>(archPrompt);
-
-    // Agent 3: SDET (Step Generation with Workspace Intel)
-    console.log('[Requirement Engine] Agent 3: SDET starting...');
-    const finalScenarios: any[] = [];
-    
-    // Process in parallel for speed
-    await Promise.all(strategy.scenarios.map(async (s: any) => {
-      const sdetPrompt = prompts.sdetAgent(s, { modules: context.modules });
-      const { steps } = await openAIService['_generateAndParseJSON']<{ steps: string[] }>(sdetPrompt);
-      finalScenarios.push({
-        ...s,
-        steps,
+      // 1. Gather Workspace Context (Modules, Fields)
+      const modules = await prisma.module.findMany({
+        where: { workspaceId },
+        include: { routes: true },
       });
-    }));
 
-    const result: RequirementAnalysisResult = {
-      summary: `Analyzed ${businessAnalysis.workflows.length} workflows and generated ${finalScenarios.length} test scenarios.`,
-      workflows: businessAnalysis.workflows,
-      testingMap: {
-        modules: strategy.scenarios.map((s: any) => s.module),
-        criticalPaths: businessAnalysis.workflows.map((w: any) => w.name),
-      },
-      scenarios: finalScenarios,
-      validationRules: businessAnalysis.businessRules.map(r => ({ field: 'N/A', rule: r })),
-    };
+      const context = {
+        modules: modules.map(m => ({
+          name: m.name,
+          routes: m.routes.map(r => r.path),
+        })),
+      };
 
-    return result;
-  } catch (error) {
-    console.error('[Requirement Engine] Multi-agent orchestration failed:', error);
-    throw new Error('Agentic analysis failed: ' + (error instanceof Error ? error.message : String(error)));
+      // 2. Multi-Agent Orchestration Flow
+
+      // Agent 1: PRD Analysis (Business Context)
+      console.log('[Requirement Engine] Agent 1: PRD Analyst starting...');
+      const prdPrompt = prompts.prdAnalystAgent(text);
+      const businessAnalysis = await openAIService['_generateAndParseJSON']<{
+        personas: string[];
+        workflows: any[];
+        businessRules: string[];
+      }>(prdPrompt);
+
+      // Agent 2: Test Architecture (Scenario Strategy)
+      console.log('[Requirement Engine] Agent 2: Test Architect starting...');
+      const archPrompt = prompts.testArchitectAgent(businessAnalysis.workflows, context.modules);
+      const strategy = await openAIService['_generateAndParseJSON']<{
+        scenarios: any[];
+      }>(archPrompt);
+
+      // Agent 3: SDET (Step Generation with Workspace Intel)
+      console.log('[Requirement Engine] Agent 3: SDET starting...');
+      const finalScenarios: any[] = [];
+
+      // Process in parallel for speed
+      await Promise.all(strategy.scenarios.map(async (s: any) => {
+        const sdetPrompt = prompts.sdetAgent(s, { modules: context.modules });
+        const { steps } = await openAIService['_generateAndParseJSON']<{ steps: string[] }>(sdetPrompt);
+        finalScenarios.push({
+          ...s,
+          steps,
+        });
+      }));
+
+      const result: RequirementAnalysisResult = {
+        summary: `Analyzed ${businessAnalysis.workflows.length} workflows and generated ${finalScenarios.length} test scenarios.`,
+        workflows: businessAnalysis.workflows,
+        testingMap: {
+          modules: strategy.scenarios.map((s: any) => s.module),
+          criticalPaths: businessAnalysis.workflows.map((w: any) => w.name),
+        },
+        scenarios: finalScenarios,
+        validationRules: businessAnalysis.businessRules.map(r => ({ field: 'N/A', rule: r })),
+      };
+
+      return result;
+    } catch (error) {
+      console.error('[Requirement Engine] Multi-agent orchestration failed:', error);
+      throw new Error('Agentic analysis failed: ' + (error instanceof Error ? error.message : String(error)));
+    }
   }
-}
 
   /**
    * Persists the analysis result by creating scenarios in the workspace.

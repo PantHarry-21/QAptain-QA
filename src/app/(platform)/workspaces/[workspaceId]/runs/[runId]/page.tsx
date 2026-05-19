@@ -154,6 +154,8 @@ export default function RunDetailPage() {
                 <span className={s.status === 'failed' ? 'text-red-600' : 'text-emerald-600'}>{s.status}</span>
               </div>
               {s.error && <div className="text-xs text-red-600">{s.error}</div>}
+              {s.recoveryLog && (
+                <pre className="max-h-[200px] overflow-auto rounded-md border bg-slate-50 p-2 text-[11px] dark:bg-slate-900">
                   {typeof s.recoveryLog === 'string' ? s.recoveryLog : JSON.stringify(s.recoveryLog, null, 2)}
                 </pre>
               )}

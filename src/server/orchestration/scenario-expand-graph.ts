@@ -5,14 +5,18 @@ function getJsonClient(): OpenAI {
   const azureEndpoint = process.env.AZURE_OPENAI_ENDPOINT;
   const deployment = process.env.AZURE_OPENAI_DEPLOYMENT || process.env.OPENAI_MODEL_NAME;
   if (azureKey && azureEndpoint && deployment) {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { AzureOpenAI } = require('openai');
-    return new AzureOpenAI({
-      apiKey: azureKey,
-      endpoint: azureEndpoint,
-      deployment,
-      apiVersion: process.env.AZURE_OPENAI_API_VERSION || '2024-02-15-preview',
-    });
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { AzureOpenAI } = require('openai');
+      return new AzureOpenAI({
+        apiKey: azureKey,
+        endpoint: azureEndpoint,
+        deployment,
+        apiVersion: process.env.AZURE_OPENAI_API_VERSION || '2024-02-15-preview',
+      });
+    } catch (e) {
+      throw new Error('Failed to load AzureOpenAI - openai package may not be installed properly');
+    }
   }
   const key = process.env.OPENAI_API_KEY;
   if (!key) throw new Error('Configure Azure OpenAI or OPENAI_API_KEY for scenario expansion.');

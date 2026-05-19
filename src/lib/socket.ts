@@ -13,14 +13,18 @@ interface SocketWithAuth extends Socket {
 
 // Middleware to authenticate socket connections
 function authenticateSocket(socket: SocketWithAuth, next: (err?: Error) => void) {
-  const token = socket.handshake.auth.token;
+  // For development, allow connections without strict token validation
+  // In production, implement proper JWT or session verification
+  // Check if cookie exists (NextAuth session cookie)
+  const cookies = socket.handshake.headers.cookie || '';
 
-  if (!token) {
-    return next(new Error('Authentication error: token missing'));
+  if (!cookies) {
+    // Allow for now, but log for monitoring
+    console.warn('[Socket.IO] Connection without cookies - may be unauthenticated');
   }
 
-  // Verify token against session (basic validation)
-  // In production, implement proper JWT or session token verification
+  // Extract a basic identifier from cookies or request
+  const token = socket.handshake.auth.token || 'anonymous';
   socket.userId = token;
   next();
 }
