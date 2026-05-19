@@ -12,6 +12,7 @@ import { settleDom, waitForNavigationStable, attachApiPatternCollector } from '@
 import { recordApiObservations } from '@/server/intelligence/persist-workspace-intel';
 import { findFieldDefinitionForHint } from '@/server/intelligence/persist-field-intelligence';
 import { normalizeExecutionMode } from '@/server/execution/execution-modes';
+import { RcaEngine } from '@/server/intelligence/rca-engine';
 
 type PlanStep = Record<string, unknown>;
 
@@ -236,6 +237,9 @@ export async function runExecutionJob(executionRunId: string) {
       recordVideo: process.env.RECORD_PLAYWRIGHT_VIDEO === 'true' ? { dir: videoDir } : undefined,
     });
     const page = await context.newPage();
+    await page.addInitScript(() => {
+      (window as any).__name = (t: any) => t;
+    });
     page.setDefaultTimeout(15000);
     page.setDefaultNavigationTimeout(40000);
     apiCollector = attachApiPatternCollector(page, new URL(baseUrl).origin, 80);
@@ -345,6 +349,17 @@ export async function runExecutionJob(executionRunId: string) {
           },
         });
         await appendLog(executionRunId, 'error', `Step ${i + 1} failed: ${msg}`, { step, executionMode });
+        
+        // --- RCA Engine Integration ---
+        try {
+          const screenshot = await page.screenshot({ type: 'png', fullPage: false }).catch(() => null);
+          const screenshotBase64 = screenshot ? screenshot.toString('base64') : undefined;
+          await RcaEngine.analyzeFailure(page, step, msg, executionMode, executionRunId, screenshotBase64);
+        } catch (rcaErr) {
+          console.error('[execution] RCA Analysis failed', rcaErr);
+        }
+        // ------------------------------
+
         failed++;
         await prisma.executionRun.update({
           where: { id: executionRunId },

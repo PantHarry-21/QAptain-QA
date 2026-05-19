@@ -381,6 +381,169 @@ RULES:
 
 6. Keep values realistic. If the user did not specify a value for a required field, use plausible test data (emails, names, codes).
 
-Now produce the JSON plan.`;
+    Now produce the JSON plan.`;
+  },
+
+  /**
+   * Root Cause Analysis (RCA) prompt to diagnose a specific test failure.
+   */
+  analyzeRootCause: (data: {
+    step: any;
+    error: string;
+    domSummary: string;
+    consoleLogs: string[];
+    networkFailures: any[];
+    executionMode: string;
+  }) => {
+    return `You are an expert AI Root Cause Analysis (RCA) Engineer. A test step has failed in an automated Playwright execution. Your job is to analyze the failure context and determine the probable cause, impact, and remediation steps.
+
+**Failed Step:**
+\`\`\`json
+${JSON.stringify(data.step, null, 2)}
+\`\`\`
+
+**Error Message:**
+"""
+${data.error}
+"""
+
+**DOM Context at Failure:**
+\`\`\`
+${data.domSummary}
+\`\`\`
+
+**Recent Console Logs:**
+${data.consoleLogs.map(l => `- ${l}`).join('\n')}
+
+**Recent Network Failures:**
+${JSON.stringify(data.networkFailures, null, 2)}
+
+**Execution Mode:** ${data.executionMode}
+
+**CRITICAL INSTRUCTIONS:**
+1. **Categorize the Failure:** Determine if this is an "Application Bug", "Test Script Issue", "Environment Issue", or "Flaky Test (Race Condition/Timeout)".
+2. **Determine Root Cause:** Explain *exactly* why it failed. (e.g., "The 'Save' button was disabled because the 'Email' field was invalid," or "The locator 'button:text(\"Submit\")' failed because the button text changed to 'Confirm'.")
+3. **Assess Impact:** Which feature is broken? How severe is it?
+4. **Suggest Remediation:** Provide a specific, actionable fix for either the developer (to fix the app) or the QA engineer (to fix the test).
+5. **Healability:** Can this be fixed automatically by the Self-Healing Engine?
+
+**Output Format:**
+You MUST return a single JSON object with the following structure:
+{
+  "category": "Bug | Script | Environment | Flaky",
+  "summary": "One sentence summary",
+  "rootCause": "Detailed explanation",
+  "impact": "Severity and feature affected",
+  "remediation": "Suggested fix",
+  "isHealable": true/false,
+  "confidence": 0.0 to 1.0
+}
+`;
+  },
+
+  /**
+   * AI Requirement Analyzer: PRD/Text -> Testing Map & Scenarios.
+   */
+  analyzeRequirement: (text: string, workspaceContext: any) => {
+    return `You are an expert AI Requirement Analyzer for QAPtain. Your job is to parse a software requirement (PRD, User Story, or Text) and extract a comprehensive testing strategy.
+
+**Requirement Text:**
+"""
+${text}
+"""
+
+**Workspace Context (Discovered Modules):**
+${JSON.stringify(workspaceContext.modules || [], null, 2)}
+
+**CRITICAL INSTRUCTIONS:**
+1. **Understand Workflows:** Extract the primary business workflows described in the requirement.
+2. **Identify Modules:** Map these workflows to existing application modules if possible, or suggest new ones.
+3. **Generate Scenarios:** Create 5-10 detailed test scenarios including Happy Path, Negative Path, and Edge Cases.
+4. **Validation Rules:** Extract any specific validation rules mentioned (e.g., "Email must be unique", "Age > 18").
+
+**Output Format:**
+You MUST return a single JSON object:
+{
+  "summary": "One sentence summary",
+  "workflows": [
+    { "name": "Workflow Name", "steps": ["step1", "step2"], "priority": "high/medium/low" }
+  ],
+  "testingMap": {
+    "modules": ["Module A", "Module B"],
+    "criticalPaths": ["Path 1", "Path 2"]
+  },
+  "scenarios": [
+    {
+      "title": "Scenario Title",
+      "type": "positive/negative/edge",
+      "steps": ["Executable step 1", "Executable step 2"]
+    }
+  ],
+  "validationRules": [
+    { "field": "Field Name", "rule": "Rule description" }
+  ]
+}
+`;
+  },
+
+  /**
+   * Agent 1: PRD Analyst - Extracts business logic and workflows.
+   */
+  prdAnalystAgent: (text: string) => {
+    return `You are a Senior Business Analyst Agent. Your goal is to parse the following requirement and extract the core business logic, user personas, and high-level workflows.
+
+**Requirement:**
+"""
+${text}
+"""
+
+**Output Format (JSON):**
+{
+  "personas": ["string"],
+  "workflows": [
+    { "name": "string", "description": "string", "steps": ["string"] }
+  ],
+  "businessRules": ["string"]
+}`;
+  },
+
+  /**
+   * Agent 2: Test Architect - Converts workflows into a testing strategy.
+   */
+  testArchitectAgent: (workflows: any, modules: any) => {
+    return `You are a Senior Test Architect Agent. Take these business workflows and map them to the application's module surface.
+
+**Workflows:**
+${JSON.stringify(workflows, null, 2)}
+
+**Application Modules:**
+${JSON.stringify(modules, null, 2)}
+
+**Goal:** Identify which modules are affected and define a list of test scenarios (Positive, Negative, Edge).
+
+**Output Format (JSON):**
+{
+  "scenarios": [
+    { "title": "string", "module": "string", "type": "positive/negative/edge", "intent": "string" }
+  ]
+}`;
+  },
+
+  /**
+   * Agent 3: SDET - Generates executable steps for a scenario.
+   */
+  sdetAgent: (scenario: any, workspaceIntel: any) => {
+    return `You are a Senior SDET Agent. Generate concrete, executable Playwright-style steps for this test scenario.
+
+**Scenario:**
+${JSON.stringify(scenario, null, 2)}
+
+**Workspace Intel (Fields & Routes):**
+${JSON.stringify(workspaceIntel, null, 2)}
+
+**Output Format (JSON):**
+{
+  "steps": ["Executable step 1", "Executable step 2"]
+}`;
   },
 };

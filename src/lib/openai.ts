@@ -285,6 +285,41 @@ export class OpenAIService {
       topP: 0.9,
     });
   }
+
+  /**
+   * Performs vision-based analysis of a screenshot.
+   */
+  async analyzeImage<T>(prompt: string, base64Image: string): Promise<T> {
+    const client = getClient();
+    try {
+      const response = await client.chat.completions.create({
+        model: modelName,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: prompt },
+              {
+                type: 'image_url',
+                image_url: {
+                  url: `data:image/png;base64,${base64Image}`,
+                },
+              },
+            ],
+          },
+        ],
+        response_format: { type: 'json_object' },
+        max_tokens: 1500,
+      });
+
+      const rawContent = response.choices[0]?.message?.content;
+      if (!rawContent) throw new Error('Vision analysis returned empty response');
+      return JSON.parse(rawContent) as T;
+    } catch (error) {
+      console.error('Vision analysis error:', error);
+      throw error;
+    }
+  }
 }
 
 export const openAIService = new OpenAIService();

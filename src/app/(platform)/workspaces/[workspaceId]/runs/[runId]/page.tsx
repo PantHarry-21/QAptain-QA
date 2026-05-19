@@ -18,6 +18,15 @@ type RunDetail = {
     status: string;
     error: string | null;
     recoveryLog?: unknown;
+    rcaAnalysis?: {
+      category: string;
+      summary: string;
+      rootCause: string;
+      impact: string;
+      remediation: string;
+      isHealable: boolean;
+      confidence: number;
+    } | null;
     screenshotPath?: string | null;
   }[];
   logs: { level: string; message: string; createdAt: string }[];
@@ -145,10 +154,33 @@ export default function RunDetailPage() {
                 <span className={s.status === 'failed' ? 'text-red-600' : 'text-emerald-600'}>{s.status}</span>
               </div>
               {s.error && <div className="text-xs text-red-600">{s.error}</div>}
-              {s.recoveryLog != null && (
-                <pre className="max-h-32 overflow-auto rounded bg-amber-50/80 p-2 text-[11px] text-amber-950 dark:bg-amber-950/30 dark:text-amber-100">
                   {typeof s.recoveryLog === 'string' ? s.recoveryLog : JSON.stringify(s.recoveryLog, null, 2)}
                 </pre>
+              )}
+              {s.rcaAnalysis && (
+                <div className="mt-2 space-y-2 rounded-lg border border-red-100 bg-red-50/50 p-3 dark:border-red-900/30 dark:bg-red-950/20">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-bold uppercase tracking-wider text-red-600 dark:text-red-400">
+                      AI Root Cause Analysis
+                    </span>
+                    <Badge variant="outline" className="bg-white dark:bg-slate-900">
+                      {s.rcaAnalysis.category}
+                    </Badge>
+                  </div>
+                  <div className="text-sm font-medium">{s.rcaAnalysis.summary}</div>
+                  <div className="text-xs text-muted-foreground">
+                    <span className="font-semibold">Reason:</span> {s.rcaAnalysis.rootCause}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    <span className="font-semibold">Remediation:</span> {s.rcaAnalysis.remediation}
+                  </div>
+                  <div className="flex items-center gap-3 pt-1 text-[10px] font-medium uppercase text-muted-foreground">
+                    <span>Confidence: {Math.round(s.rcaAnalysis.confidence * 100)}%</span>
+                    {s.rcaAnalysis.isHealable && (
+                      <span className="text-emerald-600 dark:text-emerald-400">✓ Auto-Healable</span>
+                    )}
+                  </div>
+                </div>
               )}
             </div>
           ))}

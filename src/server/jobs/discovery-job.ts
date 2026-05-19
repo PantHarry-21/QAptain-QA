@@ -5,7 +5,7 @@ import { decryptSecret } from '@/lib/crypto-secrets';
 import { ensureLoggedIn } from '@/lib/skills/ensure-login';
 import type { DiscoveryJobData } from '@/server/queues/bullmq';
 import { publishRunIoEvent } from '@/server/events/redis-io';
-import { ingestModuleMemory } from '@/server/memory/chroma-memory';
+import { ingestModuleMemory } from '@/server/memory/supabase-memory';
 import { extractRawFieldsFromPage } from '@/server/intelligence/dom-field-extract';
 import { classifyField } from '@/server/intelligence/field-classifier';
 import { upsertFieldIntelligence } from '@/server/intelligence/persist-field-intelligence';
@@ -21,6 +21,9 @@ import { persistInferredWorkflowsV1 } from '@/server/intelligence/infer-workflow
 
 async function extractLightGraph(page: import('playwright').Page, baseUrl: string, maxNavItems: number) {
   const origin = new URL(baseUrl).origin;
+  await page.addInitScript(() => {
+    (window as any).__name = (t: any) => t;
+  });
   const items = await page.evaluate((limit) => {
     const out: { text: string; href: string }[] = [];
     const seen = new Set<string>();
@@ -97,6 +100,9 @@ export async function processDiscoveryJob(data: DiscoveryJobData) {
   try {
     const context = await browser.newContext();
     const page = await context.newPage();
+    await page.addInitScript(() => {
+      (window as any).__name = (t: any) => t;
+    });
     page.setDefaultTimeout(20000);
 
     const origin = new URL(env.baseUrl).origin;
@@ -110,8 +116,15 @@ export async function processDiscoveryJob(data: DiscoveryJobData) {
     };
 
     await ensureLoggedIn(page, env.baseUrl, discoveryRunId, undefined, workspaceCreds);
-    await page.goto(env.baseUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    try {
+      await page.goto(env.baseUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    } catch (e) {
+      console.warn(`[discovery] Soft timeout navigating to baseUrl: ${e}`);
+    }
     await settleDom(page, 8000);
+    await page.addInitScript(() => {
+      (window as any).__name = (t: any) => t;
+    });
     await ingestFieldsForCurrentPage(workspaceId, page);
 
     const maxItems = Number(process.env.QAPTAIN_DISCOVERY_MAX_NAV || '40');

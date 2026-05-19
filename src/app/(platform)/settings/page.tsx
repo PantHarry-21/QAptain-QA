@@ -6,7 +6,7 @@ export default function SettingsPage() {
         Profile and tenant settings will live here. Execution defaults (video recording, discovery depth) are controlled
         via environment variables such as <code className="rounded bg-muted px-1">RECORD_PLAYWRIGHT_VIDEO</code>,{' '}
         <code className="rounded bg-muted px-1">QAPTAIN_DISCOVERY_MAX_NAV</code>, and{' '}
-        <code className="rounded bg-muted px-1">CHROMA_URL</code>.
+        <code className="rounded bg-muted px-1">NEXT_PUBLIC_SUPABASE_URL</code>.
       </p>
     </div>
   );

@@ -39,12 +39,17 @@ async function createCustomServer() {
       handle(req, res);
     });
 
-    // Setup Socket.IO
+    // Setup Socket.IO with proper CORS configuration
+    const allowedOrigins = dev
+      ? ['http://localhost:3000', 'http://localhost:3001']
+      : [process.env.NEXTAUTH_URL || 'https://yourdomain.com'];
+
     const io = new Server(server, {
       path: '/api/socketio',
       cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
+        origin: allowedOrigins,
+        methods: ['GET', 'POST'],
+        credentials: true
       }
     });
 

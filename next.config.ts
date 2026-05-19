@@ -7,13 +7,13 @@ const withBundleAnalyzer = require('@next/bundle-analyzer')({
 const nextConfig: NextConfig = {
   /* config options here */
   typescript: {
-    ignoreBuildErrors: true,
+    ignoreBuildErrors: false, // Fail build on TypeScript errors
   },
-  // 禁用 Next.js 热重载，由 nodemon 处理重编译
-  reactStrictMode: false,
+  // Use React Strict Mode to catch potential issues
+  reactStrictMode: true,
   eslint: {
-    // 构建时忽略ESLint错误
-    ignoreDuringBuilds: true,
+    // Fail build on ESLint errors
+    ignoreDuringBuilds: false,
   },
 };
 

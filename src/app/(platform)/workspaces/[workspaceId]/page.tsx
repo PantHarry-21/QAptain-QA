@@ -113,6 +113,11 @@ export default function WorkspaceHubPage() {
   const [live, setLive] = useState<{ progress?: number; status?: string; log?: string }>({});
   const [boot, setBoot] = useState(true);
 
+  // Settings tab state
+  const [editName, setEditName] = useState('');
+  const [editDesc, setEditDesc] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
+
   const refresh = useCallback(async () => {
     if (!workspaceId) return;
     try {
@@ -133,6 +138,10 @@ export default function WorkspaceHubPage() {
         scenarioCount: w.scenarioCount ?? 0,
         readiness: w.readiness ?? 0,
       });
+      if (w.workspace) {
+        setEditName(w.workspace.name || '');
+        setEditDesc(w.workspace.description || '');
+      }
       setScenarios(s.scenarios || []);
       setRuns(r.runs || []);
       setInsights(ins);
@@ -233,17 +242,39 @@ export default function WorkspaceHubPage() {
     }
   };
 
+  const saveWorkspace = async () => {
+    setIsSaving(true);
+    try {
+      await fetch(`/api/v1/workspaces/${workspaceId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: editName, description: editDesc }),
+      });
+      void refresh();
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const deleteWorkspace = async () => {
+    if (!confirm('Are you sure you want to delete this workspace? This cannot be undone.')) return;
+    await fetch(`/api/v1/workspaces/${workspaceId}`, {
+      method: 'DELETE',
+    });
+    window.location.href = '/workspaces';
+  };
+
   const header = useMemo(
     () => (
-      <div className="space-y-1 border-b border-slate-200/80 bg-white/80 px-6 py-6 backdrop-blur dark:border-slate-800 dark:bg-slate-950/80 lg:px-10">
+      <div className="space-y-1 border-b border-slate-800 bg-slate-900/40 px-6 py-6 backdrop-blur-xl lg:px-10">
         <div className="flex flex-wrap items-center gap-3">
-          <h1 className="text-2xl font-semibold tracking-tight">{data?.workspace.name || '…'}</h1>
-          {data && <Badge variant="outline">Readiness {data.readiness}%</Badge>}
+          <h1 className="text-2xl font-semibold tracking-tight text-white">{data?.workspace.name || '…'}</h1>
+          {data && <Badge variant="outline" className="border-violet-500/30 text-violet-300">Readiness {data.readiness}%</Badge>}
         </div>
-        <p className="max-w-3xl text-sm text-muted-foreground">{data?.workspace.description || '—'}</p>
+        <p className="max-w-3xl text-sm text-slate-400">{data?.workspace.description || '—'}</p>
         {data && (
           <div className="max-w-md pt-2">
-            <Progress value={data.readiness} className="h-2" />
+            <Progress value={data.readiness} className="h-2 bg-slate-800 [&>div]:bg-violet-500" />
           </div>
         )}
       </div>
@@ -252,17 +283,17 @@ export default function WorkspaceHubPage() {
   );
 
   if (boot && !data) {
-    return <div className="flex min-h-[40vh] items-center justify-center text-muted-foreground">Loading workspace…</div>;
+    return <div className="flex min-h-[40vh] items-center justify-center text-slate-400 animate-pulse">Loading workspace…</div>;
   }
 
   if (!data) return null;
 
   return (
-    <div className="min-h-screen bg-slate-50 dark:bg-slate-950">
+    <div className="min-h-screen bg-transparent relative z-10">
       {header}
       <div className="mx-auto max-w-6xl px-4 py-6 lg:px-8">
-        <Tabs defaultValue="overview" className="space-y-6">
-          <TabsList className="flex flex-wrap gap-1 bg-white dark:bg-slate-900">
+        <Tabs defaultValue={searchParams.get('tab') || 'overview'} className="space-y-6">
+          <TabsList className="flex flex-wrap gap-1 bg-slate-900/60 backdrop-blur-xl border border-slate-800 p-1">
             <TabsTrigger value="overview">Overview</TabsTrigger>
             <TabsTrigger value="discovery">Discovery</TabsTrigger>
             <TabsTrigger value="modules">Modules</TabsTrigger>
@@ -271,7 +302,9 @@ export default function WorkspaceHubPage() {
             <TabsTrigger value="runs">Executions</TabsTrigger>
             <TabsTrigger value="reports">Reports</TabsTrigger>
             <TabsTrigger value="intel">Intel</TabsTrigger>
+            <TabsTrigger value="requirements">Requirements</TabsTrigger>
             <TabsTrigger value="insights">AI insights</TabsTrigger>
+            <TabsTrigger value="settings">Settings</TabsTrigger>
           </TabsList>
 
           <TabsContent value="overview" className="space-y-4">
@@ -690,6 +723,167 @@ export default function WorkspaceHubPage() {
               </CardContent>
             </Card>
           </TabsContent>
+          <TabsContent value="requirements" className="space-y-4">
+            <Card>
+              <CardHeader>
+                <CardTitle>Requirement Intelligence</CardTitle>
+                <CardDescription>
+                  Paste your PRD, User Story, or requirement text below. QAPtain will analyze the workflows and generate a
+                  comprehensive testing strategy.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div
+                  className="flex flex-col items-center justify-center rounded-lg border-2 border-dashed border-slate-200 p-8 transition-colors hover:border-violet-400 dark:border-slate-800"
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const file = e.dataTransfer.files[0];
+                    if (file) {
+                      const reader = new FileReader();
+                      reader.onload = (re) => {
+                        const text = re.target?.result as string;
+                        (document.getElementById('requirement-text') as HTMLTextAreaElement).value = text;
+                      };
+                      reader.readAsText(file);
+                    }
+                  }}
+                >
+                  <Label htmlFor="requirement-file" className="mb-2 cursor-pointer text-sm text-muted-foreground">
+                    Drag and drop a PRD (.txt, .md, .json) or
+                  </Label>
+                  <Input
+                    id="requirement-file"
+                    type="file"
+                    className="hidden"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) {
+                        const reader = new FileReader();
+                        reader.onload = (re) => {
+                          const text = re.target?.result as string;
+                          (document.getElementById('requirement-text') as HTMLTextAreaElement).value = text;
+                        };
+                        reader.readAsText(file);
+                      }
+                    }}
+                  />
+                  <Button variant="outline" size="sm" onClick={() => document.getElementById('requirement-file')?.click()}>
+                    Choose file
+                  </Button>
+                </div>
+                <div className="text-xs font-medium text-muted-foreground">OR PASTE TEXT</div>
+                <Textarea
+                  placeholder="Paste PRD or User Story here..."
+                  className="min-h-[200px] font-mono text-sm"
+                  id="requirement-text"
+                />
+                <div className="flex gap-2">
+                  <Button
+                    onClick={async () => {
+                      const text = (document.getElementById('requirement-text') as HTMLTextAreaElement).value;
+                      if (!text) return;
+                      setLive((prev) => ({ ...prev, status: 'Analyzing requirement...' }));
+                      const r = await fetch(`/api/v1/workspaces/${workspaceId}/analyze-requirement`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ text }),
+                      });
+                      const j = await r.json();
+                      if (j.result) {
+                        setInsights((prev) => ({ ...prev, requirementAnalysis: j.result }));
+                      }
+                      setLive((prev) => ({ ...prev, status: 'Analysis complete.' }));
+                    }}
+                  >
+                    Analyze with AI
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+
+            {insights?.requirementAnalysis && (
+              <div className="grid gap-4 lg:grid-cols-2">
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-base text-violet-600">Testing Map & Workflows</CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-4">
+                    <div>
+                      <div className="text-xs font-bold uppercase text-muted-foreground">Workflows</div>
+                      <div className="mt-2 space-y-2">
+                        {(insights.requirementAnalysis as any).workflows.map((w: any, idx: number) => (
+                          <div key={idx} className="rounded-md border p-2 text-sm">
+                            <div className="font-medium">{w.name}</div>
+                            <div className="text-xs text-muted-foreground">{w.steps.join(' → ')}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-xs font-bold uppercase text-muted-foreground">Validation Rules</div>
+                      <ul className="mt-2 list-inside list-disc text-xs text-muted-foreground">
+                        {(insights.requirementAnalysis as any).validationRules.map((r: any, idx: number) => (
+                          <li key={idx}>
+                            <span className="font-medium text-foreground">{r.field}:</span> {r.rule}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-base text-emerald-600">Generated Scenarios</CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-4">
+                    <div className="space-y-3">
+                      {(insights.requirementAnalysis as any).scenarios.map((s: any, idx: number) => (
+                        <div key={idx} className="group relative rounded-lg border p-3">
+                          <div className="flex items-center justify-between">
+                            <div className="font-medium">{s.title}</div>
+                            <Badge variant="outline" className="capitalize">
+                              {s.type}
+                            </Badge>
+                          </div>
+                          <div className="mt-2 max-h-24 overflow-auto text-xs text-muted-foreground">
+                            {s.steps.map((step: string, sIdx: number) => (
+                              <div key={sIdx}>
+                                {sIdx + 1}. {step}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    <Button
+                      className="w-full bg-emerald-600 hover:bg-emerald-700"
+                      onClick={async () => {
+                        setLive((prev) => ({ ...prev, status: 'Committing to library...' }));
+                        await fetch(`/api/v1/workspaces/${workspaceId}/analyze-requirement`, {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            text: (document.getElementById('requirement-text') as HTMLTextAreaElement).value,
+                            commit: true,
+                          }),
+                        });
+                        setLive((prev) => ({ ...prev, status: 'Scenarios saved.' }));
+                        void refresh();
+                      }}
+                    >
+                      Commit scenarios to library
+                    </Button>
+                  </CardContent>
+                </Card>
+              </div>
+            )}
+          </TabsContent>
 
           <TabsContent value="insights">
             <Card>
@@ -719,6 +913,47 @@ export default function WorkspaceHubPage() {
                 </div>
               </CardContent>
             </Card>
+          </TabsContent>
+
+          <TabsContent value="settings">
+            <div className="grid gap-4 md:grid-cols-2">
+              <Card>
+                <CardHeader>
+                  <CardTitle>Edit workspace</CardTitle>
+                  <CardDescription>Update the name and description of this workspace.</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="ws-name">Name</Label>
+                    <Input id="ws-name" value={editName} onChange={(e) => setEditName(e.target.value)} />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="ws-desc">Description</Label>
+                    <Textarea
+                      id="ws-desc"
+                      value={editDesc}
+                      onChange={(e) => setEditDesc(e.target.value)}
+                      rows={3}
+                    />
+                  </div>
+                  <Button onClick={saveWorkspace} disabled={isSaving}>
+                    {isSaving ? 'Saving...' : 'Save changes'}
+                  </Button>
+                </CardContent>
+              </Card>
+
+              <Card className="border-red-200 dark:border-red-900">
+                <CardHeader>
+                  <CardTitle className="text-red-600 dark:text-red-400">Danger zone</CardTitle>
+                  <CardDescription>Permanently delete this workspace and all associated data (modules, scenarios, runs).</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <Button variant="destructive" onClick={deleteWorkspace}>
+                    Delete workspace
+                  </Button>
+                </CardContent>
+              </Card>
+            </div>
           </TabsContent>
         </Tabs>
       </div>

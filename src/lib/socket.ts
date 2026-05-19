@@ -1,4 +1,4 @@
-import { Server } from 'socket.io';
+import { Server, Socket } from 'socket.io';
 import { executeTests, requestStop, requestStopExecutionRun } from './test-executor';
 
 interface StartTestPayload {
@@ -7,9 +7,31 @@ interface StartTestPayload {
   url: string;
 }
 
+interface SocketWithAuth extends Socket {
+  userId?: string;
+}
+
+// Middleware to authenticate socket connections
+function authenticateSocket(socket: SocketWithAuth, next: (err?: Error) => void) {
+  const token = socket.handshake.auth.token;
+
+  if (!token) {
+    return next(new Error('Authentication error: token missing'));
+  }
+
+  // Verify token against session (basic validation)
+  // In production, implement proper JWT or session token verification
+  socket.userId = token;
+  next();
+}
+
 export const setupSocket = (io: Server) => {
-  io.on('connection', (socket) => {
-    console.log(`Client connected: ${socket.id}`);
+  // Add authentication middleware
+  io.use(authenticateSocket);
+
+  io.on('connection', (socket: SocketWithAuth) => {
+    const userId = socket.userId || 'unknown';
+    console.log(`Client connected: ${socket.id} (userId: ${userId})`);
 
     // Join a room for a specific test session
     socket.on('join-session', async ({ sessionId }: { sessionId: string }) => {

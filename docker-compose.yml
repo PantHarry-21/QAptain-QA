@@ -1,4 +1,4 @@
-# QAPtain local stack — PostgreSQL, Redis, ChromaDB (free / OSS)
+# QAPtain local stack — PostgreSQL, Redis (Supabase replaces ChromaDB)
 services:
   postgres:
     image: postgres:16-alpine
@@ -20,17 +20,7 @@ services:
     volumes:
       - qaptain_redis:/data
 
-  chroma:
-    image: chromadb/chroma:0.5.23
-    restart: unless-stopped
-    ports:
-      - "8000:8000"
-    environment:
-      ANONYMIZED_TELEMETRY: "false"
-    volumes:
-      - qaptain_chroma:/chroma/chroma
-
 volumes:
   qaptain_pg:
   qaptain_redis:
-  qaptain_chroma:
+

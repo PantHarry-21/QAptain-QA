@@ -9,17 +9,16 @@ export async function GET() {
     const pool = getPool();
     await pool.query('SELECT 1');
 
-    return NextResponse.json({ 
-      status: "ok", 
-      message: "API is healthy and database connection is successful." 
+    return NextResponse.json({
+      status: "ok",
+      message: "Service healthy"
     });
   } catch (error) {
     console.error("Health check failed:", error);
-    const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
-    return NextResponse.json({ 
-      status: "error", 
-      message: "API is running, but the database connection failed.",
-      error: errorMessage
-    }, { status: 500 });
+    // Do not expose internal error details
+    return NextResponse.json({
+      status: "error",
+      message: "Service unavailable"
+    }, { status: 503 });
   }
 }

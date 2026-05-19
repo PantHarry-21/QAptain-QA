@@ -2,7 +2,7 @@ import { prisma } from '@/lib/prisma';
 import type { Prisma } from '@prisma/client';
 import type { ScenarioExpandJobData } from '@/server/queues/bullmq';
 import { runScenarioExpandGraph } from '@/server/orchestration/scenario-expand-graph';
-import { queryModuleContext } from '@/server/memory/chroma-memory';
+import { queryModuleContext } from '@/server/memory/supabase-memory';
 import { publishRunIoEvent } from '@/server/events/redis-io';
 import {
   EXPANSION_CASE_CAP,

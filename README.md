@@ -1,141 +1,287 @@
-# 🚀 Welcome to Z.ai Code Scaffold
+<![CDATA[# 🧭 QAPtain
 
-A modern, production-ready web application scaffold powered by cutting-edge technologies, designed to accelerate your development with [Z.ai](https://chat.z.ai)'s AI-powered coding assistance.
+**AI-native quality engineering platform** — progressive discovery, scenario intelligence, structured Playwright execution, and workspace-scoped memory.
 
-## ✨ Technology Stack
+QAPtain automatically discovers your web application's modules, generates intelligent test scenarios, and executes them via Playwright with self-healing selectors, AI-powered form filling, and detailed execution reports — all within a collaborative workspace model.
 
-This scaffold provides a robust foundation built with:
+---
 
-### 🎯 Core Framework
-- **⚡ Next.js 15** - The React framework for production with App Router
-- **📘 TypeScript 5** - Type-safe JavaScript for better developer experience
-- **🎨 Tailwind CSS 4** - Utility-first CSS framework for rapid UI development
+## ✨ Key Features
 
-### 🧩 UI Components & Styling
-- **🧩 shadcn/ui** - High-quality, accessible components built on Radix UI
-- **🎯 Lucide React** - Beautiful & consistent icon library
-- **🌈 Framer Motion** - Production-ready motion library for React
-- **🎨 Next Themes** - Perfect dark mode in 2 lines of code
+| Feature | Description |
+| --- | --- |
+| **Progressive Discovery** | Crawls your application to map modules, routes, forms, fields, and API endpoints automatically |
+| **Scenario Intelligence** | AI-generated test scenarios with support for manual entry, Excel import, and natural-language expansion |
+| **Playwright Execution** | Structured test execution with multiple modes — smoke, functional, validation-heavy, regression, deep validation |
+| **Self-Healing Selectors** | Selector memory with confidence scoring and automatic healing when elements change |
+| **AI Form Filling** | Context-aware fake data generation for form fields based on semantic classification |
+| **Field Validation Inference** | Automatically detects validation rules from HTML, API responses, and observed behavior |
+| **Workspace Collaboration** | Multi-workspace, multi-member model with owner/admin/member roles |
+| **Real-time Execution Logs** | Live test progress via Socket.IO with step-by-step screenshots and video recording |
+| **PDF Reports** | Auto-generated executive test reports with risk assessment and recommendations |
+| **Background Job Queue** | BullMQ-powered async processing for discovery, execution, and scenario expansion |
+| **Vector Memory** | Supabase-backed vector storage for AI memory chunks (module, workflow, selector, field context) |
 
-### 📋 Forms & Validation
-- **🎣 React Hook Form** - Performant forms with easy validation
-- **✅ Zod** - TypeScript-first schema validation
+---
 
-### 🔄 State Management & Data Fetching
-- **🐻 Zustand** - Simple, scalable state management
-- **🔄 TanStack Query** - Powerful data synchronization for React
-- **🌐 Axios** - Promise-based HTTP client
+## 🏗️ Tech Stack
 
-### 🗄️ Database & Backend
-- **🗄️ Prisma** - Next-generation Node.js and TypeScript ORM
-- **🔐 NextAuth.js** - Complete open-source authentication solution
+| Layer | Technology |
+| --- | --- |
+| **Framework** | [Next.js 15](https://nextjs.org/) (App Router, React 19) |
+| **Language** | TypeScript |
+| **Styling** | Tailwind CSS 4, shadcn/ui (Radix primitives) |
+| **Database** | PostgreSQL (Neon / local Docker) |
+| **ORM** | Prisma 5 |
+| **Authentication** | NextAuth.js (credentials provider) |
+| **AI / LLM** | Azure OpenAI / OpenAI (GPT-5-mini), LangChain |
+| **Test Execution** | Playwright |
+| **Job Queue** | BullMQ + Redis (Upstash / local Docker) |
+| **Vector Store** | Supabase (replaces ChromaDB) |
+| **Real-time** | Socket.IO |
+| **PDF Generation** | jsPDF + jspdf-autotable |
+| **State Management** | Zustand, TanStack React Query |
+| **Charts** | Recharts |
+| **Animations** | Framer Motion |
 
-### 🎨 Advanced UI Features
-- **📊 TanStack Table** - Headless UI for building tables and datagrids
-- **🖱️ DND Kit** - Modern drag and drop toolkit for React
-- **📊 Recharts** - Redefined chart library built with React and D3
-- **🖼️ Sharp** - High performance image processing
-
-### 🌍 Internationalization & Utilities
-- **🌍 Next Intl** - Internationalization library for Next.js
-- **📅 Date-fns** - Modern JavaScript date utility library
-- **🪝 ReactUse** - Collection of essential React hooks for modern development
-
-## 🎯 Why This Scaffold?
-
-- **🏎️ Fast Development** - Pre-configured tooling and best practices
-- **🎨 Beautiful UI** - Complete shadcn/ui component library with advanced interactions
-- **🔒 Type Safety** - Full TypeScript configuration with Zod validation
-- **📱 Responsive** - Mobile-first design principles with smooth animations
-- **🗄️ Database Ready** - Prisma ORM configured for rapid backend development
-- **🔐 Auth Included** - NextAuth.js for secure authentication flows
-- **📊 Data Visualization** - Charts, tables, and drag-and-drop functionality
-- **🌍 i18n Ready** - Multi-language support with Next Intl
-- **🚀 Production Ready** - Optimized build and deployment settings
-- **🤖 AI-Friendly** - Structured codebase perfect for AI assistance
-
-## 🚀 Quick Start
-
-```bash
-# Install dependencies
-npm install
-
-# Start development server
-npm run dev
-
-# Build for production
-npm run build
-
-# Start production server
-npm start
-```
-
-Open [http://localhost:3000](http://localhost:3000) to see your application running.
-
-## 🤖 Powered by Z.ai
-
-This scaffold is optimized for use with [Z.ai](https://chat.z.ai) - your AI assistant for:
-
-- **💻 Code Generation** - Generate components, pages, and features instantly
-- **🎨 UI Development** - Create beautiful interfaces with AI assistance  
-- **🔧 Bug Fixing** - Identify and resolve issues with intelligent suggestions
-- **📝 Documentation** - Auto-generate comprehensive documentation
-- **🚀 Optimization** - Performance improvements and best practices
-
-Ready to build something amazing? Start chatting with Z.ai at [chat.z.ai](https://chat.z.ai) and experience the future of AI-powered development!
+---
 
 ## 📁 Project Structure
 
 ```
-src/
-├── app/                 # Next.js App Router pages
-├── components/          # Reusable React components
-│   └── ui/             # shadcn/ui components
-├── hooks/              # Custom React hooks
-└── lib/                # Utility functions and configurations
+QAptain/
+├── prisma/
+│   └── schema.prisma          # Database schema (workspace-centric model)
+├── scripts/
+│   └── download-chromium.mjs  # Chromium binary downloader for Playwright
+├── src/
+│   ├── app/                   # Next.js App Router pages
+│   │   ├── (platform)/        # Authenticated pages (dashboard, workspaces, settings)
+│   │   ├── api/               # API routes (19 endpoint groups)
+│   │   ├── login/             # Login page
+│   │   ├── signup/            # Signup page
+│   │   ├── scenarios/         # Scenario management
+│   │   ├── test-execution/    # Test execution UI
+│   │   ├── results/           # Test results viewer
+│   │   ├── history/           # Execution history
+│   │   └── url-input/         # URL input for discovery
+│   ├── components/            # React components
+│   │   ├── ui/                # shadcn/ui primitives
+│   │   └── platform/          # Platform-specific components
+│   ├── hooks/                 # Custom React hooks
+│   ├── lib/                   # Shared utilities & services
+│   │   ├── auth.ts            # NextAuth configuration
+│   │   ├── openai.ts          # LLM client setup
+│   │   ├── prompts.ts         # AI prompt templates
+│   │   ├── test-executor.ts   # Core Playwright execution engine
+│   │   ├── prisma.ts          # Prisma client singleton
+│   │   ├── socket.ts          # Socket.IO event handlers
+│   │   ├── supabase.ts        # Supabase client
+│   │   └── pdf-generator.ts   # Report PDF generation
+│   └── server/                # Server-side modules
+│       ├── data/              # Data access layer
+│       ├── events/            # Socket.IO event bridge
+│       ├── execution/         # Test run execution engine
+│       ├── intelligence/      # App intelligence (field classification, graph building, workflow inference)
+│       ├── jobs/              # Background job processors (discovery, scenario expansion)
+│       ├── memory/            # Vector memory (Supabase)
+│       ├── orchestration/     # Execution orchestration
+│       └── queues/            # BullMQ queue definitions
+├── docker-compose.yml         # Local PostgreSQL + Redis
+├── server.ts                  # Custom Next.js + Socket.IO server
+├── worker.ts                  # BullMQ worker process
+├── schema.sql                 # Legacy SQL schema (reference)
+├── supabase-setup.sql         # Supabase vector store setup
+└── package.json
 ```
-
-## 🎨 Available Features & Components
-
-This scaffold includes a comprehensive set of modern web development tools:
-
-### 🧩 UI Components (shadcn/ui)
-- **Layout**: Card, Separator, Aspect Ratio, Resizable Panels
-- **Forms**: Input, Textarea, Select, Checkbox, Radio Group, Switch
-- **Feedback**: Alert, Toast (Sonner), Progress, Skeleton
-- **Navigation**: Breadcrumb, Menubar, Navigation Menu, Pagination
-- **Overlay**: Dialog, Sheet, Popover, Tooltip, Hover Card
-- **Data Display**: Badge, Avatar, Calendar
-
-### 📊 Advanced Data Features
-- **Tables**: Powerful data tables with sorting, filtering, pagination (TanStack Table)
-- **Charts**: Beautiful visualizations with Recharts
-- **Forms**: Type-safe forms with React Hook Form + Zod validation
-
-### 🎨 Interactive Features
-- **Animations**: Smooth micro-interactions with Framer Motion
-- **Drag & Drop**: Modern drag-and-drop functionality with DND Kit
-- **Theme Switching**: Built-in dark/light mode support
-
-### 🔐 Backend Integration
-- **Authentication**: Ready-to-use auth flows with NextAuth.js
-- **Database**: Type-safe database operations with Prisma
-- **API Client**: HTTP requests with Axios + TanStack Query
-- **State Management**: Simple and scalable with Zustand
-
-### 🌍 Production Features
-- **Internationalization**: Multi-language support with Next Intl
-- **Image Optimization**: Automatic image processing with Sharp
-- **Type Safety**: End-to-end TypeScript with Zod validation
-- **Essential Hooks**: 100+ useful React hooks with ReactUse for common patterns
-
-## 🤝 Get Started with Z.ai
-
-1. **Clone this scaffold** to jumpstart your project
-2. **Visit [chat.z.ai](https://chat.z.ai)** to access your AI coding assistant
-3. **Start building** with intelligent code generation and assistance
-4. **Deploy with confidence** using the production-ready setup
 
 ---
 
-Built with ❤️ for the developer community. Supercharged by [Z.ai](https://chat.z.ai) 🚀
+## 🚀 Getting Started
+
+### Prerequisites
+
+- **Node.js** ≥ 18
+- **npm** (comes with Node.js)
+- **Docker & Docker Compose** (for local PostgreSQL + Redis)
+- **Git**
+
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/your-org/QAptain.git
+cd QAptain
+```
+
+### 2. Install Dependencies
+
+```bash
+npm install
+```
+
+> This automatically downloads a Chromium binary for Playwright and generates the Prisma client (`postinstall` hook).
+
+### 3. Configure Environment Variables
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and fill in the required values:
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `DATABASE_URL` | ✅ | PostgreSQL connection string |
+| `NEXTAUTH_SECRET` | ✅ | Random secret for session encryption |
+| `NEXTAUTH_URL` | ✅ | App URL (default: `http://localhost:3000`) |
+| `REDIS_URL` | Recommended | Redis connection string (BullMQ workers) |
+| `NEXT_PUBLIC_SUPABASE_URL` | Optional | Supabase project URL (vector memory) |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Optional | Supabase anon/public key |
+| `LLM_PROVIDER` | ✅ | `azure` or `openai` |
+| `AZURE_OPENAI_API_KEY` | If Azure | Azure OpenAI API key |
+| `AZURE_OPENAI_ENDPOINT` | If Azure | Azure OpenAI endpoint URL |
+| `AZURE_OPENAI_DEPLOYMENT` | If Azure | Deployment/model name |
+
+### 4. Start Local Infrastructure (PostgreSQL + Redis)
+
+```bash
+docker compose up -d
+```
+
+This starts:
+- **PostgreSQL 16** on port `5432` (user: `qaptain`, password: `qaptain`, db: `qaptain`)
+- **Redis 7** on port `6379`
+
+### 5. Push Database Schema
+
+```bash
+npx prisma db push
+```
+
+### 6. Generate Prisma Client (if not already done)
+
+```bash
+npx prisma generate
+```
+
+---
+
+## 🖥️ Running the Application
+
+### Development Server (Web App)
+
+```bash
+npm run dev
+```
+
+This starts the custom server (Next.js + Socket.IO) at **http://localhost:3000**.
+
+### Background Worker (Job Queue)
+
+Open a **second terminal** and run:
+
+```bash
+npm run worker
+```
+
+This starts BullMQ workers that process:
+- **Discovery jobs** — crawl and map your application
+- **Execution jobs** — run Playwright test scenarios
+- **Scenario expansion jobs** — AI-powered scenario generation
+
+### Production Build
+
+```bash
+npm run build
+npm start
+```
+
+---
+
+## 📋 All Available Commands
+
+| Command | Description |
+| --- | --- |
+| `npm run dev` | Start the development server (Next.js + Socket.IO on port 3000) |
+| `npm run build` | Generate Prisma client and build the Next.js production bundle |
+| `npm start` | Start the production server |
+| `npm run worker` | Start BullMQ background workers (discovery, execution, scenario-expand) |
+| `npm run lint` | Run ESLint |
+| `npm run db:push` | Push Prisma schema changes to the database |
+| `npm run db:generate` | Regenerate the Prisma client |
+| `docker compose up -d` | Start local PostgreSQL + Redis containers |
+| `docker compose down` | Stop local infrastructure containers |
+| `docker compose down -v` | Stop containers and remove volumes (⚠️ deletes data) |
+
+---
+
+## 🔌 API Endpoints
+
+The application exposes the following API route groups under `/api/`:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `/api/auth` | NextAuth.js authentication |
+| `/api/analyze-url` | URL analysis and page inspection |
+| `/api/generate-scenarios` | AI-powered scenario generation |
+| `/api/interpret-scenario` | Natural-language scenario interpretation |
+| `/api/translate-scenarios` | Scenario format translation |
+| `/api/ai-generate-steps` | AI step generation for scenarios |
+| `/api/ai-fill-form` | AI-powered form data generation |
+| `/api/ai-test-form-validations` | Form validation test generation |
+| `/api/execute-workflow` | Workflow execution trigger |
+| `/api/run-test` | Test execution trigger |
+| `/api/results` | Test results retrieval |
+| `/api/history` | Execution history |
+| `/api/saved-scenarios` | Saved scenario CRUD |
+| `/api/import-excel` | Excel scenario import |
+| `/api/generate-pdf` | PDF report generation |
+| `/api/videos` | Test execution video recordings |
+| `/api/health` | Health check |
+| `/api/v1/` | Versioned API namespace |
+
+---
+
+## 🗄️ Database
+
+QAPtain uses a **workspace-centric data model** with PostgreSQL. Key entities include:
+
+- **Users & Workspaces** — Multi-tenant isolation with role-based access (Owner, Admin, Member)
+- **Environments** — Multiple target URLs per workspace (staging, production, etc.)
+- **Auth Profiles** — Encrypted credential storage for authenticated testing
+- **Discovery Runs** — Application crawl sessions that map modules and routes
+- **Application Modules & Routes** — Discovered application structure
+- **Scenarios & Execution Plans** — Test scenarios with versioned execution plans
+- **Execution Runs, Steps & Logs** — Full test execution history with step-level detail
+- **Field Definitions & Validation Rules** — Inferred form field metadata
+- **Selector Memory** — Self-healing selector strategies with confidence scoring
+- **AI Memory Chunks** — Vector-stored context for intelligent test generation
+- **Application Intel Graphs** — Navigation and workflow intelligence
+
+---
+
+## 🧪 Execution Modes
+
+| Mode | Description |
+| --- | --- |
+| `smoke` | Quick surface-level checks |
+| `functional` | Standard CRUD workflow validation (default) |
+| `validation_heavy` | Focused on form validation and edge cases |
+| `regression` | Full regression across known scenarios |
+| `deep_validation` | Exhaustive field-level validation with boundary testing |
+
+---
+
+## 🛡️ Environment Notes
+
+- **Local development**: Use `docker compose up -d` for PostgreSQL + Redis
+- **Hosted databases**: Neon (Postgres) + Upstash (Redis) are supported out of the box
+- **Vector memory**: Supabase replaces the legacy ChromaDB integration
+- **AI provider**: Configure either Azure OpenAI or OpenAI via the `LLM_PROVIDER` env var
+
+---
+
+## 📄 License
+
+Private — All rights reserved.
+]]>

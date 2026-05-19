@@ -42,18 +42,24 @@ export async function POST(req: Request) {
     if (!name || !baseUrl) {
       return NextResponse.json({ error: 'name and baseUrl are required' }, { status: 400 });
     }
-    const ws = await prisma.$transaction(async (tx) => {
-      const w = await tx.workspace.create({
-        data: { ownerId: userId, name, description },
-      });
-      await tx.workspaceMember.create({
-        data: { workspaceId: w.id, userId, role: 'OWNER' },
-      });
-      await tx.environment.create({
-        data: { workspaceId: w.id, name: 'Default', baseUrl },
-      });
-      return w;
-    });
+    const ws = await prisma.$transaction(
+      async (tx) => {
+        const w = await tx.workspace.create({
+          data: { ownerId: userId, name, description },
+        });
+        await tx.workspaceMember.create({
+          data: { workspaceId: w.id, userId, role: 'OWNER' },
+        });
+        await tx.environment.create({
+          data: { workspaceId: w.id, name: 'Default', baseUrl },
+        });
+        return w;
+      },
+      {
+        maxWait: 15000, // 15s wait for Neon cold start
+        timeout: 30000, // 30s timeout for transaction
+      }
+    );
     const full = await prisma.workspace.findUnique({
       where: { id: ws.id },
       include: { environments: true, authProfiles: true },

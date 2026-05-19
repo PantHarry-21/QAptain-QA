@@ -1,0 +1,50 @@
+# Page snapshot
+
+```yaml
+- generic [active] [ref=e1]:
+  - generic [ref=e2]:
+    - complementary [ref=e3]:
+      - generic [ref=e4]:
+        - img [ref=e6]
+        - generic [ref=e8]:
+          - generic [ref=e9]: QAPtain
+          - generic [ref=e10]: AI-native automation
+      - navigation [ref=e14]:
+        - link "Dashboard" [ref=e15] [cursor=pointer]:
+          - /url: /dashboard
+          - img [ref=e16]
+          - text: Dashboard
+        - link "Workspaces" [ref=e21] [cursor=pointer]:
+          - /url: /workspaces
+          - img [ref=e22]
+          - text: Workspaces
+        - link "Settings" [ref=e26] [cursor=pointer]:
+          - /url: /settings
+          - img [ref=e27]
+          - text: Settings
+      - button "Sign out" [ref=e31] [cursor=pointer]:
+        - img
+        - text: Sign out
+    - main [ref=e33]:
+      - generic [ref=e34]:
+        - generic [ref=e35]:
+          - heading "New workspace" [level=1] [ref=e36]
+          - paragraph [ref=e37]: "Three steps: application URL, authentication, discovery."
+        - generic [ref=e38]:
+          - generic [ref=e39]:
+            - heading "1 · Application" [level=3] [ref=e40]
+            - paragraph [ref=e41]: Base URL used for Playwright navigation and discovery.
+          - generic [ref=e42]:
+            - generic [ref=e43]:
+              - generic [ref=e44]: Name
+              - textbox "e.g. Acme ERP" [ref=e45]
+            - generic [ref=e46]:
+              - generic [ref=e47]: Description
+              - textbox [ref=e48]
+            - generic [ref=e49]:
+              - generic [ref=e50]: Base URL
+              - textbox "https://app.example.com" [ref=e51]
+            - button "Continue" [disabled]
+  - region "Notifications (F8)":
+    - list
+```

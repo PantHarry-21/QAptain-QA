@@ -43,15 +43,18 @@ async function isLocationPickerVisible(page: Page): Promise<boolean> {
       return true;
     }
   }
-  // Location as combobox on same login route after first submit
+  // Location as combobox on same login route after first submit or on the same form
   const onLogin = isLoginUrl(page.url());
   if (onLogin) {
     const combo = page.getByRole('combobox').first();
-    if ((await combo.count().catch(() => 0)) > 0 && (await combo.isVisible().catch(() => false))) {
-      const userVisible = page.locator('[name="username"]').first();
-      const stillHasUser =
-        (await userVisible.count().catch(() => 0)) > 0 && (await userVisible.isVisible().catch(() => false));
-      if (!stillHasUser) return true;
+    const comboVisible = (await combo.count().catch(() => 0)) > 0 && (await combo.isVisible().catch(() => false));
+    if (comboVisible) {
+      return true; // Return true if combobox is visible on login page, regardless of username field presence
+    }
+    
+    const select = page.locator('.ant-select-selection-search-input, [class*="select"]').first();
+    if ((await select.count().catch(() => 0)) > 0 && (await select.isVisible().catch(() => false))) {
+       return true;
     }
   }
   return false;
@@ -78,10 +81,23 @@ async function selectAdminLocation(page: Page, labName: string): Promise<void> {
     return;
   }
 
-  const combo = page.getByRole('combobox').first();
+  const combo = page.locator('.ant-select-selection-search-input, [role="combobox"]').first();
   if ((await combo.count().catch(() => 0)) > 0 && (await combo.isVisible().catch(() => false))) {
     await combo.click({ timeout: 5000 }).catch(() => {});
-    await page.getByRole('option', { name: new RegExp(lab.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') }).first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1000);
+    
+    // Try exact or regex match in standard or ant design options
+    const optionSelectors = [
+      page.getByRole('option', { name: new RegExp(lab.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') }).first(),
+      page.locator('.ant-select-item-option-content').getByText(new RegExp(lab.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')).first()
+    ];
+    
+    for (const opt of optionSelectors) {
+      if ((await opt.count().catch(() => 0)) > 0 && (await opt.isVisible().catch(() => false))) {
+        await opt.click({ timeout: 8000 }).catch(() => {});
+        return;
+      }
+    }
     return;
   }
 

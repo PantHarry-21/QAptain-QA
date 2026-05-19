@@ -21,22 +21,10 @@ export type RawDomField = {
 
 export async function extractRawFieldsFromPage(page: Page, maxFields = 120): Promise<RawDomField[]> {
   return page.evaluate((limit) => {
-    const out: RawDomField[] = [];
+    // Define dummy __name to catch any stray SWC injections safely
+    const __name = (target: any, value: any) => target;
+    const out: any[] = [];
     const seen = new Set<string>();
-
-    function labelFor(el: Element): string {
-      const id = (el as HTMLInputElement).id;
-      if (id) {
-        const lab = document.querySelector(`label[for="${CSS.escape(id)}"]`);
-        if (lab?.textContent) return lab.textContent.trim().replace(/\s+/g, ' ');
-      }
-      let p: Element | null = el.parentElement;
-      for (let d = 0; d < 4 && p; d++, p = p.parentElement) {
-        const l = p.querySelector?.(':scope > label');
-        if (l?.textContent) return l.textContent.trim().replace(/\s+/g, ' ');
-      }
-      return '';
-    }
 
     const els = Array.from(document.querySelectorAll('input, textarea, select'));
     for (const el of els) {
@@ -62,6 +50,26 @@ export async function extractRawFieldsFromPage(page: Page, maxFields = 120): Pro
           .slice(0, 40);
       }
 
+      let labelText = '';
+      try {
+        if (id) {
+          const lab = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+          if (lab?.textContent) labelText = lab.textContent.trim().replace(/\s+/g, ' ');
+        }
+        if (!labelText) {
+          let p: Element | null = el.parentElement;
+          for (let d = 0; d < 4 && p; d++, p = p.parentElement) {
+            const l = p.querySelector?.(':scope > label');
+            if (l?.textContent) {
+              labelText = l.textContent.trim().replace(/\s+/g, ' ');
+              break;
+            }
+          }
+        }
+      } catch (e) {
+        // ignore selector errors
+      }
+
       out.push({
         fieldKey: key.slice(0, 200),
         tag,
@@ -75,7 +83,7 @@ export async function extractRawFieldsFromPage(page: Page, maxFields = 120): Pro
         maxLength: inp.maxLength > 0 ? inp.maxLength : null,
         pattern: (inp.pattern || '').slice(0, 500),
         inputMode: (inp.getAttribute('inputmode') || '').slice(0, 50),
-        labelText: labelFor(el).slice(0, 300),
+        labelText: labelText.slice(0, 300),
         options,
         multiple,
       });
