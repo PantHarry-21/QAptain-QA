@@ -1,10 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.db.session import get_db
 from app.db.models import User, Application, Environment, Credential, ApplicationModule
 from app.core.dependencies import get_current_user
+from app.core.security import encrypt_credential
 from app.schemas.workspace import ApplicationResponse, EnvironmentResponse
 
 router = APIRouter()
@@ -59,3 +62,47 @@ async def list_modules(
         }
         for m in modules
     ]
+
+
+class ApplicationSettingsUpdate(BaseModel):
+    description: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+
+
+@router.patch("/{application_id}/settings")
+async def update_application_settings(
+    application_id: str,
+    payload: ApplicationSettingsUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Application).where(Application.id == application_id))
+    app = result.scalar_one_or_none()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    if payload.description is not None:
+        app.description = payload.description
+
+    if payload.username or payload.password:
+        cred_result = await db.execute(
+            select(Credential).where(Credential.application_id == application_id).limit(1)
+        )
+        cred = cred_result.scalar_one_or_none()
+        if cred:
+            if payload.username:
+                cred.username = payload.username
+            if payload.password:
+                cred.password_encrypted = encrypt_credential(payload.password)
+        else:
+            if payload.username and payload.password:
+                cred = Credential(
+                    application_id=application_id,
+                    username=payload.username,
+                    password_encrypted=encrypt_credential(payload.password),
+                )
+                db.add(cred)
+
+    await db.commit()
+    return {"status": "ok"}

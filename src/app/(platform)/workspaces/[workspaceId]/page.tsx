@@ -16,7 +16,7 @@ import {
 } from '@/lib/api';
 import { getSocket } from '@/lib/websocket';
 
-type ActiveTab = 'overview' | 'explore' | 'scenarios' | 'reports';
+type ActiveTab = 'overview' | 'explore' | 'scenarios' | 'reports' | 'settings';
 
 export default function WorkspacePage() {
   const params = useParams();
@@ -44,6 +44,13 @@ export default function WorkspacePage() {
   const [startingExplore, setStartingExplore] = useState(false);
   const [exploreMode, setExploreMode] = useState<'FULL' | 'SMART' | 'SKIP'>('SMART');
 
+  // Settings
+  const [settingsDesc, setSettingsDesc] = useState('');
+  const [settingsUsername, setSettingsUsername] = useState('');
+  const [settingsPassword, setSettingsPassword] = useState('');
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [settingsSaved, setSettingsSaved] = useState(false);
+
   const socket = getSocket();
 
   useEffect(() => {
@@ -58,6 +65,15 @@ export default function WorkspacePage() {
     });
     return () => off();
   }, [selectedApp]);
+
+  useEffect(() => {
+    if (selectedApp) {
+      setSettingsDesc(selectedApp.description || '');
+      setSettingsUsername('');
+      setSettingsPassword('');
+      setSettingsSaved(false);
+    }
+  }, [selectedApp?.id]);
 
   const loadData = async (preferredAppId?: string | null) => {
     setLoading(true);
@@ -167,6 +183,34 @@ export default function WorkspacePage() {
     }
   };
 
+  const handleSaveSettings = async () => {
+    if (!selectedApp) return;
+    setSavingSettings(true);
+    setSettingsSaved(false);
+    try {
+      await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1'}/applications/${selectedApp.id}/settings`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(localStorage.getItem('qaptain_token') ? { Authorization: `Bearer ${localStorage.getItem('qaptain_token')}` } : {}),
+        },
+        body: JSON.stringify({
+          description: settingsDesc || undefined,
+          username: settingsUsername || undefined,
+          password: settingsPassword || undefined,
+        }),
+      });
+      setSettingsSaved(true);
+      setSettingsPassword('');
+      setTimeout(() => setSettingsSaved(false), 3000);
+    } catch (e) {
+      console.error('Failed to save settings', e);
+      alert('Failed to save settings');
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-screen bg-zinc-950 text-zinc-500">
@@ -233,6 +277,7 @@ export default function WorkspacePage() {
                 { id: 'explore', label: 'Explore', icon: '🔍' },
                 { id: 'scenarios', label: 'Scenarios', icon: '📋' },
                 { id: 'reports', label: 'Reports', icon: '📈' },
+                { id: 'settings', label: 'Settings', icon: '⚙️' },
               ] as const
             ).map((item) => (
               <button
@@ -309,6 +354,74 @@ export default function WorkspacePage() {
                   reports={reports}
                   workspaceId={workspaceId}
                 />
+              )}
+              {tab === 'settings' && selectedApp && (
+                <div className="max-w-2xl space-y-6">
+                  <div>
+                    <h2 className="text-xl font-semibold text-white mb-1">Application Settings</h2>
+                    <p className="text-sm text-zinc-500">Update description and credentials for {selectedApp.name}</p>
+                  </div>
+
+                  <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-4">
+                    <h3 className="text-sm font-medium text-zinc-300">General</h3>
+                    <div>
+                      <label className="block text-xs text-zinc-500 mb-1">Description</label>
+                      <textarea
+                        value={settingsDesc}
+                        onChange={(e) => setSettingsDesc(e.target.value)}
+                        rows={3}
+                        className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-blue-500"
+                        placeholder="What does this application do?"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs text-zinc-500 mb-1">Base URL</label>
+                      <input
+                        value={selectedApp.base_url}
+                        disabled
+                        className="w-full bg-zinc-800/50 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-400 cursor-not-allowed"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-4">
+                    <h3 className="text-sm font-medium text-zinc-300">Credentials</h3>
+                    <p className="text-xs text-zinc-500">Leave password blank to keep the existing one.</p>
+                    <div>
+                      <label className="block text-xs text-zinc-500 mb-1">Username / Email</label>
+                      <input
+                        type="text"
+                        value={settingsUsername}
+                        onChange={(e) => setSettingsUsername(e.target.value)}
+                        className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-blue-500"
+                        placeholder="username or email"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs text-zinc-500 mb-1">New Password</label>
+                      <input
+                        type="password"
+                        value={settingsPassword}
+                        onChange={(e) => setSettingsPassword(e.target.value)}
+                        className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-blue-500"
+                        placeholder="leave blank to keep existing"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={handleSaveSettings}
+                      disabled={savingSettings}
+                      className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50"
+                    >
+                      {savingSettings ? 'Saving...' : 'Save Changes'}
+                    </button>
+                    {settingsSaved && (
+                      <span className="text-sm text-green-400">✓ Saved successfully</span>
+                    )}
+                  </div>
+                </div>
               )}
             </>
           )}

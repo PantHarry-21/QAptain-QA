@@ -288,37 +288,60 @@ class ExploreEngine:
 
     async def _handle_login_context_selection(self, state: dict):
         """
-        Dynamically detect and handle any post-login context selection step.
-        Inspects the live DOM to determine the selector type, extracts available
-        options when possible, and interacts appropriately for each UI pattern.
+        Loop-based handler for multi-step post-login context selection.
+        Keeps inspecting and interacting until no more selectors are found
+        or a human decision is awaited and resolved.
         """
-        # Fresh DOM inspection — do not rely on pre-processed state
-        selector_info = await asyncio.to_thread(self._inspect_dom_for_selectors)
+        max_steps = 5
+        prev_type = None
+        prev_label = None
 
-        sel_type = selector_info.get("type", "unknown")
-        label = selector_info.get("label", "Selection required")
-        options = selector_info.get("options", [])
+        for step in range(max_steps):
+            # Retry inspection a few times — overlays load asynchronously
+            selector_info: dict = {"type": "unknown"}
+            for _ in range(4):
+                selector_info = await asyncio.to_thread(self._inspect_dom_for_selectors)
+                if selector_info.get("type") != "unknown":
+                    break
+                await asyncio.sleep(1.5)
 
-        await self._log("INFO", "login",
-            f"Post-login step detected — {label!r} ({sel_type}, {len(options)} option(s) found)")
-
-        # Trigger button: auto-click to reveal the actual selector, then re-inspect
-        if sel_type == "trigger_button":
-            await self._log("INFO", "login", f"Clicking '{label}' to open selector")
-            await asyncio.to_thread(self._click_trigger_button, label)
-            await asyncio.sleep(1.5)
-            selector_info = await asyncio.to_thread(self._inspect_dom_for_selectors)
             sel_type = selector_info.get("type", "unknown")
-            label = selector_info.get("label", label)
+            label = selector_info.get("label", "Selection required")
             options = selector_info.get("options", [])
-            await self._log("INFO", "login",
-                f"After trigger click — {label!r} ({sel_type}, {len(options)} option(s) found)")
 
-        if options and len(options) <= 20:
-            await self._handle_choice_decision(label, options, sel_type, selector_info)
-        else:
-            # Too many options or structure not parseable — ask user to type
-            await self._handle_text_input_decision(label, selector_info)
+            await self._log("INFO", "login",
+                f"Step {step+1}: detected {sel_type!r} — {label!r} ({len(options)} options)")
+
+            if sel_type == "unknown":
+                # Nothing more to handle — done
+                break
+
+            # Avoid infinite loops on same step
+            if sel_type == prev_type and label == prev_label:
+                await self._log("WARNING", "login",
+                    "Selector unchanged after interaction — falling back to text input")
+                await self._handle_text_input_decision(label, selector_info)
+                return
+
+            prev_type = sel_type
+            prev_label = label
+
+            if sel_type == "trigger_button":
+                await self._log("INFO", "login", f"Auto-clicking trigger: {label!r}")
+                await asyncio.to_thread(self._click_trigger_button, label)
+                await asyncio.sleep(2.5)
+                # Continue loop — re-inspect for the revealed selector
+                continue
+
+            # Real selector found — ask user
+            if options and len(options) <= 20:
+                await self._handle_choice_decision(label, options, sel_type, selector_info)
+            else:
+                await self._handle_text_input_decision(label, selector_info)
+
+            # After user decision, wait and check for another step
+            await asyncio.sleep(2.5)
+            # Continue loop to check if another selector appeared
 
     def _inspect_dom_for_selectors(self) -> dict:
         """
@@ -430,24 +453,47 @@ class ExploreEngine:
                 };
             }
 
-            // 4. Visible button group / list of clickable items
-            const candidates = Array.from(document.querySelectorAll(
-                'ul, ol, [role="group"], table tbody'
-            )).filter(isVisible);
-            for (const c of candidates) {
-                const items = Array.from(c.querySelectorAll('li, tr, button, [role="button"]'))
-                    .filter(isVisible)
-                    .filter(el => {
+            // 4. Visible button group / list of clickable items (broad detection)
+            const listSelectors = [
+                'ul', 'ol', '[role="group"]', 'table tbody',
+                '[class*="list"]', '[class*="grid"]', '[class*="options"]',
+                '[class*="modal"] ul', '[class*="modal"] ol',
+                '[class*="dialog"] ul', '[class*="dropdown"] ul',
+                '[class*="popup"] ul', '[class*="panel"] ul',
+            ];
+            for (const sel of listSelectors) {
+                const containers = Array.from(document.querySelectorAll(sel)).filter(isVisible);
+                for (const c of containers) {
+                    const items = Array.from(c.querySelectorAll(
+                        'li, tr, button, [role="button"], [role="option"], [role="menuitem"], a, .item, .option'
+                    )).filter(isVisible).filter(el => {
                         const t = getText(el);
-                        return t.length > 0 && t.length < 100;
+                        return t.length > 0 && t.length < 150;
                     });
-                if (items.length >= 2 && items.length <= 30) {
-                    return {
-                        type: 'button_group',
-                        label: c.getAttribute('aria-label') || getLabel(c) || 'Select',
-                        options: items.map(el => ({label: getText(el), value: getText(el)})),
-                    };
+                    if (items.length >= 2 && items.length <= 50) {
+                        return {
+                            type: 'button_group',
+                            label: c.getAttribute('aria-label') || getLabel(c) || 'Select',
+                            options: items.map(el => ({label: getText(el), value: getText(el)})).slice(0, 20),
+                        };
+                    }
                 }
+            }
+
+            // 4b. Any group of similarly-styled clickable elements (custom components)
+            const allClickable = Array.from(document.querySelectorAll(
+                'button:not([disabled]), [role="button"], [onclick], [tabindex="0"]'
+            )).filter(isVisible).filter(el => {
+                const t = getText(el);
+                return t.length > 0 && t.length < 100;
+            });
+            // If there are 2-20 visible clickable elements and no nav, treat as a choice group
+            if (allClickable.length >= 2 && allClickable.length <= 20 && !hasMainNav) {
+                return {
+                    type: 'button_group',
+                    label: 'Select option',
+                    options: allClickable.map(el => ({label: getText(el), value: getText(el)})),
+                };
             }
 
             // 5. Visible text input (type-to-filter / search)
