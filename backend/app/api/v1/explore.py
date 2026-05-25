@@ -123,17 +123,24 @@ async def resolve_decision(
     decision.is_saved_as_preference = payload.save_as_preference
 
     if payload.save_as_preference:
-        from app.db.models import WorkspacePreference
-        pref = WorkspacePreference(
-            application_id=(await db.execute(
+        try:
+            from app.db.models import WorkspacePreference
+            app_id_result = await db.execute(
                 select(ExploreSession.application_id).where(ExploreSession.id == session_id)
-            )).scalar(),
-            preference_key=f"decision.{payload.decision_id[:8]}",
-            preference_value=payload.selected_option,
-        )
-        db.add(pref)
+            )
+            app_id = app_id_result.scalar()
+            if app_id:
+                pref = WorkspacePreference(
+                    application_id=app_id,
+                    preference_key=f"decision.{str(payload.decision_id)[:8]}",
+                    preference_value=payload.selected_option,
+                )
+                db.add(pref)
+        except Exception:
+            pass  # preference save is non-critical
 
     await db.commit()
+    await db.refresh(decision)
     return HumanDecisionResponse.model_validate(decision)
 
 

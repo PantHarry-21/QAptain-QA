@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import { explore as exploreApi, ApiError, type ExploreSession, type ExploreLog, type HumanDecision } from '@/lib/api';
 import { getSocket } from '@/lib/websocket';
+import { useAppToast } from '@/components/ui/app-notifications';
 
 interface ExploreSessionViewerProps {
   sessionId: string;
@@ -31,6 +32,7 @@ const CATEGORY_ICONS: Record<string, string> = {
 export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessionViewerProps) {
   const router = useRouter();
   const pathname = usePathname();
+  const toast = useAppToast();
   const [session, setSession] = useState<ExploreSession | null>(null);
   const [logs, setLogs] = useState<ExploreLog[]>([]);
   const [pendingDecision, setPendingDecision] = useState<HumanDecision | null>(null);
@@ -62,10 +64,13 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
 
     const offLog = socket.on('explore_log', (data) => {
       if (data.session_id !== sessionId) return;
+      // Use server-provided UTC timestamp if available, otherwise fall back to client time.
+      // Server sends ISO 8601 with explicit Z suffix so JS parses it as UTC correctly.
+      const ts = data.timestamp ? String(data.timestamp) : new Date().toISOString();
       const log: ExploreLog = {
         id: String(data.id || Date.now()),
-        timestamp: new Date().toISOString(),
-        level: String(data.level || 'INFO'),
+        timestamp: ts,
+        level: (data.level || 'INFO') as ExploreLog['level'],
         category: String(data.category || ''),
         message: String(data.message || ''),
         metadata: {},
@@ -87,6 +92,7 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
         options: Array.isArray(data.options) ? data.options as HumanDecision['options'] : [],
         is_saved_as_preference: true,
       });
+      setDecisionScreenshot(data.screenshot_url ? String(data.screenshot_url) : null);
       setSession((s) => s ? { ...s, status: 'WAITING_HUMAN' } : s);
     });
 
@@ -104,6 +110,7 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
 
   const [decidingOption, setDecidingOption] = useState<string | null>(null);
   const [decisionError, setDecisionError] = useState<string | null>(null);
+  const [decisionScreenshot, setDecisionScreenshot] = useState<string | null>(null);
   const [textInputValue, setTextInputValue] = useState('');
   const [stopping, setStopping] = useState(false);
   const [restarting, setRestarting] = useState(false);
@@ -115,11 +122,11 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
       await exploreApi.cancelSession(session.id);
       setSession((s) => s ? { ...s, status: 'CANCELLED' as ExploreSession['status'] } : s);
     } catch (e) {
-      alert(e instanceof ApiError ? e.detail : 'Failed to stop session');
+      toast.error(e instanceof ApiError ? e.detail : 'Failed to stop session');
     } finally {
       setStopping(false);
     }
-  }, [session, stopping]);
+  }, [session, stopping, toast]);
 
   const handleRestart = useCallback(async () => {
     if (!session || restarting) return;
@@ -130,10 +137,10 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
       const newPath = pathname.replace(/\/explore\/[^/]+$/, `/explore/${newSession.id}`);
       router.push(newPath);
     } catch (e) {
-      alert(e instanceof ApiError ? e.detail : 'Failed to restart exploration');
+      toast.error(e instanceof ApiError ? e.detail : 'Failed to restart exploration');
       setRestarting(false);
     }
-  }, [session, restarting, applicationId, pathname, router]);
+  }, [session, restarting, applicationId, pathname, router, toast]);
 
   const handleDecision = useCallback(async (option: { label: string; value: string }) => {
     if (!pendingDecision || decidingOption) return;
@@ -147,6 +154,7 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
       });
       setPendingDecision(null);
       setTextInputValue('');
+      setDecisionScreenshot(null);
       setSession((s) => s ? { ...s, status: 'RUNNING' } : s);
     } catch (e) {
       setDecisionError(e instanceof Error ? e.message : 'Failed to submit decision');
@@ -222,6 +230,16 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
               <p className="text-sm text-zinc-300 mb-1">{pendingDecision.question}</p>
               {pendingDecision.context && (
                 <p className="text-xs text-zinc-500 mb-3">{pendingDecision.context}</p>
+              )}
+              {decisionScreenshot && (
+                <div className="mb-3 rounded-lg overflow-hidden border border-amber-500/20">
+                  <p className="text-xs text-zinc-500 px-2 py-1 bg-zinc-800/60">Current browser state:</p>
+                  <img
+                    src={`http://localhost:8000${decisionScreenshot}`}
+                    alt="Browser screenshot"
+                    className="w-full max-h-64 object-contain object-top bg-zinc-900"
+                  />
+                </div>
               )}
               {(pendingDecision.options[0] as { type?: string } | undefined)?.type === 'text_input' ? (
                 <div className="flex gap-2 mt-3">
@@ -300,7 +318,11 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
           {logs.map((log) => {
             const style = LEVEL_STYLES[log.level] || LEVEL_STYLES.INFO;
             const icon = CATEGORY_ICONS[log.category || ''] || '•';
-            const time = new Date(log.timestamp).toLocaleTimeString();
+            // DB timestamps have no timezone suffix — treat them as UTC by appending Z.
+            // WebSocket timestamps already include Z from the server.
+            const rawTs = log.timestamp || '';
+            const ts = rawTs && !rawTs.endsWith('Z') && !rawTs.includes('+') ? rawTs + 'Z' : rawTs;
+            const time = ts ? new Date(ts).toLocaleTimeString() : '—';
 
             return (
               <div key={log.id} className="flex items-start gap-3 group">

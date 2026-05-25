@@ -1,66 +1,73 @@
+'use client';
+
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
-import { getServerSession } from 'next-auth/next';
-import { getAuthOptions } from '@/lib/auth';
-import { prisma } from '@/lib/prisma';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { ArrowRight, PlayCircle, Radar } from 'lucide-react';
+import { ArrowRight, PlayCircle, Radar, Brain } from 'lucide-react';
 
-export default async function DashboardPage() {
-  const session = await getServerSession(getAuthOptions());
-  const userId = session?.user && 'id' in session.user ? (session.user as { id: string }).id : null;
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
 
-  let workspaceCount = 0;
-  let runCount = 0;
-  if (userId) {
-    workspaceCount = await prisma.workspace.count({
-      where: { OR: [{ ownerId: userId }, { members: { some: { userId } } }] },
-    });
-    runCount = await prisma.executionRun.count({
-      where: {
-        workspace: { OR: [{ ownerId: userId }, { members: { some: { userId } } }] },
-      },
-    });
-  }
+export default function DashboardPage() {
+  const [stats, setStats] = useState({ workspaces: 0, runs: 0, userName: '' });
+
+  useEffect(() => {
+    const token = localStorage.getItem('qaptain_token');
+    if (!token) return;
+
+    Promise.all([
+      fetch(`${API_URL}/auth/me`, { headers: { Authorization: `Bearer ${token}` } }).then((r) => r.json()),
+      fetch(`${API_URL}/workspaces`, { headers: { Authorization: `Bearer ${token}` } }).then((r) => r.json()),
+    ]).then(([user, workspaceData]) => {
+      setStats({
+        workspaces: workspaceData?.total ?? 0,
+        runs: 0,
+        userName: user?.full_name ?? user?.email ?? '',
+      });
+    }).catch(() => {});
+  }, []);
+
+  const firstName = stats.userName.split(' ')[0];
 
   return (
     <div className="mx-auto max-w-6xl space-y-8 p-6 lg:p-10">
       <div className="space-y-2">
-        <h1 className="text-3xl font-semibold tracking-tight text-slate-900 dark:text-slate-50">
-          Welcome back{session?.user?.name ? `, ${session.user.name.split(' ')[0]}` : ''}
+        <h1 className="text-3xl font-semibold tracking-tight text-white">
+          Welcome back{firstName ? `, ${firstName}` : ''}
         </h1>
-        <p className="max-w-2xl text-muted-foreground">
-          QAPtain maps your applications, expands scenarios with AI, and executes structured Playwright plans with
-          self-healing selectors — all scoped per workspace.
+        <p className="max-w-2xl text-slate-400">
+          QAptain explores your applications, builds a semantic knowledge graph, and executes intelligent test scenarios via Selenium with self-healing selectors.
         </p>
       </div>
 
       <div className="grid gap-4 md:grid-cols-3">
-        <Card className="border-slate-200/80 shadow-sm dark:border-slate-800">
+        <Card className="border-slate-800 bg-slate-900/60 backdrop-blur-xl shadow-sm">
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Workspaces</CardTitle>
-            <Radar className="h-4 w-4 text-violet-600" />
+            <CardTitle className="text-sm font-medium text-slate-300">Workspaces</CardTitle>
+            <Radar className="h-4 w-4 text-violet-400" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{workspaceCount}</div>
-            <p className="text-xs text-muted-foreground">Applications under test</p>
+            <div className="text-2xl font-bold text-white">{stats.workspaces}</div>
+            <p className="text-xs text-slate-400">Applications under test</p>
           </CardContent>
         </Card>
-        <Card className="border-slate-200/80 shadow-sm dark:border-slate-800">
+        <Card className="border-slate-800 bg-slate-900/60 backdrop-blur-xl shadow-sm">
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Execution runs</CardTitle>
-            <PlayCircle className="h-4 w-4 text-emerald-600" />
+            <CardTitle className="text-sm font-medium text-slate-300">Execution Runs</CardTitle>
+            <PlayCircle className="h-4 w-4 text-emerald-400" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{runCount}</div>
-            <p className="text-xs text-muted-foreground">Recorded in PostgreSQL</p>
+            <div className="text-2xl font-bold text-white">{stats.runs}</div>
+            <p className="text-xs text-slate-400">Selenium runs recorded</p>
           </CardContent>
         </Card>
-        <Card className="border-slate-200/80 bg-gradient-to-br from-violet-600 to-indigo-700 text-white shadow-md dark:from-violet-700 dark:to-indigo-900">
+        <Card className="border-slate-800 bg-gradient-to-br from-violet-600 to-indigo-700 text-white shadow-md">
           <CardHeader>
-            <CardTitle className="text-lg">Start here</CardTitle>
+            <CardTitle className="text-lg flex items-center gap-2">
+              <Brain className="h-5 w-5" /> Start here
+            </CardTitle>
             <CardDescription className="text-violet-100">
-              Create a workspace, attach credentials, run lightweight discovery, then execute scenarios.
+              Create a workspace, configure credentials, run explore, then execute scenarios.
             </CardDescription>
           </CardHeader>
           <CardContent>

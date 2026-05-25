@@ -1,6 +1,6 @@
 ﻿from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete as sql_delete
 from slugify import slugify
 import uuid
 
@@ -65,6 +65,33 @@ async def get_workspace(
 
 
 # â”€â”€â”€ Applications within a Workspace â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@router.delete("/{workspace_id}", status_code=204)
+async def delete_workspace(
+    workspace_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Permanently delete a workspace and all its data (owner only)."""
+    member_result = await db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace_id,
+            WorkspaceMember.user_id == current_user.id,
+            WorkspaceMember.role == WorkspaceRole.OWNER,
+        )
+    )
+    if not member_result.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Only workspace owners can delete a workspace")
+
+    ws_result = await db.execute(select(Workspace).where(Workspace.id == workspace_id))
+    if not ws_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    # Use a raw DELETE so PostgreSQL's ondelete=CASCADE constraints cascade
+    # through workspace_members, applications, and all child tables automatically.
+    await db.execute(sql_delete(Workspace).where(Workspace.id == workspace_id))
+    await db.commit()
+
 
 @router.get("/{workspace_id}/applications", response_model=list[ApplicationResponse])
 async def list_applications(

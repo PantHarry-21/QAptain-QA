@@ -27,10 +27,13 @@ async function request<T>(
     url += `?${qs}`;
   }
 
+  // Never set Content-Type for FormData — the browser must set it with the multipart boundary
+  const isFormData = options.body instanceof FormData;
+
   const res = await fetch(url, {
     ...options,
     headers: {
-      'Content-Type': 'application/json',
+      ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...options.headers,
     },
@@ -38,7 +41,14 @@ async function request<T>(
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new ApiError(res.status, err.detail || 'Request failed');
+    // FastAPI validation errors return detail as an array of {loc, msg, type} objects
+    const raw = err.detail;
+    const detail =
+      typeof raw === 'string' ? raw
+      : Array.isArray(raw) ? raw.map((e: Record<string, unknown>) => String(e.msg ?? JSON.stringify(e))).join('; ')
+      : raw != null ? JSON.stringify(raw)
+      : 'Request failed';
+    throw new ApiError(res.status, detail);
   }
 
   if (res.status === 204) return undefined as T;
@@ -66,12 +76,15 @@ export const auth = {
 // ─── Workspaces ───────────────────────────────────────────────────────────────
 
 export const workspaces = {
-  list: () => request<{ workspaces: Workspace[]; total: number }>('/workspaces'),
+  list: () => request<Workspace[]>('/workspaces'),
 
   create: (data: { name: string }) =>
     request<Workspace>('/workspaces', { method: 'POST', body: JSON.stringify(data) }),
 
   get: (workspaceId: string) => request<Workspace>(`/workspaces/${workspaceId}`),
+
+  delete: (workspaceId: string) =>
+    request<void>(`/workspaces/${workspaceId}`, { method: 'DELETE' }),
 
   listApplications: (workspaceId: string) =>
     request<Application[]>(`/workspaces/${workspaceId}/applications`),
@@ -158,6 +171,34 @@ export const scenarios = {
       { method: 'POST', body: form, headers: {} },
     );
   },
+
+  importDocument: (data: {
+    application_id: string;
+    module_name: string;
+    module_url: string;
+    file: File;
+  }) => {
+    const form = new FormData();
+    form.append('file', data.file);
+    const qs = new URLSearchParams({
+      application_id: data.application_id,
+      module_name: data.module_name,
+      module_url: data.module_url,
+    }).toString();
+    return request<{ imported: number; module: string; module_url: string; module_id: string; titles: string[] }>(
+      `/scenarios/import/document?${qs}`,
+      { method: 'POST', body: form, headers: {} },
+    );
+  },
+
+  runBatch: (data: { scenario_ids: string[]; execution_mode: string; environment_id: string }) =>
+    request<{ runs: BatchRun[]; total: number }>('/scenarios/run-batch', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  delete: (scenarioId: string) =>
+    request<void>(`/scenarios/${scenarioId}`, { method: 'DELETE' }),
 };
 
 // ─── Executions ───────────────────────────────────────────────────────────────
@@ -324,9 +365,18 @@ export interface Scenario {
   priority: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
   tags: string[];
   module_id?: string;
+  module_name?: string;
+  module_url?: string;
   source: string;
   is_active: boolean;
   created_at: string;
+}
+
+export interface BatchRun {
+  scenario_id: string;
+  run_id?: string;
+  title: string;
+  error?: string;
 }
 
 export interface ExecutionPlan {

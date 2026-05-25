@@ -48,3 +48,21 @@ dev.log
 test
 prompt
 server.log
+
+# Python backend
+backend/.env
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.pyc
+backend/.venv/
+backend/venv/
+backend/artifacts/
+
+# Artifacts
+artifacts/
+screenshots/
+videos/
+
+# Test outputs
+test-results/
+*.log

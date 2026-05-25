@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -33,6 +34,10 @@ async def lifespan(app: FastAPI):
     import os
     os.makedirs(settings.SCREENSHOTS_DIR, exist_ok=True)
     os.makedirs(settings.VIDEOS_DIR, exist_ok=True)
+    # Give execution worker threads a reference to the main event loop
+    # so they can post WebSocket broadcasts back to it.
+    from app.jobs.execution_job import set_main_loop
+    set_main_loop(asyncio.get_running_loop())
     log.info("QAptain ready")
     yield
     log.info("QAptain shutting down")

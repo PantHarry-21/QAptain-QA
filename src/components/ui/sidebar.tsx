@@ -1,10 +1,10 @@
-'use client';
+﻿'use client';
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
 import { Home, FileText, History, BarChart3, Bot, Settings } from "lucide-react";
-import { cn } from "@/lib/utils.client";
+import { cn } from "@/lib/utils";
 
 const navItems = [
   { href: "/", icon: Home, label: "Dashboard" },

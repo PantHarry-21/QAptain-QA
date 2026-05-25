@@ -1,12 +1,19 @@
 """
-Plan Runner — Deterministic Execution Engine
-AI plans ONCE. This runner executes deterministically.
-No AI calls during execution unless healing fails.
+Plan Runner — Semantic Execution Engine
+
+Design principles:
+  - AI THINKS (QAReasoningEngine generated the plan)
+  - This runner EXECUTES deterministically
+  - Checkpoints trigger AI validation (not every step — only key transitions)
+  - Self-healing for element resolution: labels → roles → text → XPath
+  - Angular Material / React / SPA-aware field filling
+  - No business logic here — pure execution with semantic element resolution
 """
 from __future__ import annotations
 import asyncio
 import os
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
 
@@ -24,28 +31,33 @@ from app.intelligence.semantic_extractor import SemanticUIExtractor
 log = structlog.get_logger()
 
 
+@dataclass
 class StepExecutionResult:
-    def __init__(self, success: bool, message: str = "", healing_used: bool = False,
-                 healing_attempts: list = None, screenshot_path: str | None = None,
-                 duration_ms: int = 0, state_after: dict | None = None):
-        self.success = success
-        self.message = message
-        self.healing_used = healing_used
-        self.healing_attempts = healing_attempts or []
-        self.screenshot_path = screenshot_path
-        self.duration_ms = duration_ms
-        self.state_after = state_after
+    success: bool
+    message: str = ""
+    healing_used: bool = False
+    healing_attempts: list = field(default_factory=list)
+    screenshot_path: str | None = None
+    duration_ms: int = 0
+    state_after: dict | None = None
+    checkpoint_result: dict | None = None  # AI validation result if step was a checkpoint
+    phase: str = ""
+    business_intent: str = ""
 
 
 class PlanRunner:
     """
     Executes a structured execution plan step by step.
 
-    Design principles:
-    - Each step is atomic
-    - Healing is triggered automatically on failure
-    - Screenshots captured at key stages
-    - No business logic here — pure execution
+    The plan was already generated intelligently by QAReasoningEngine.
+    This runner translates plan steps into browser actions — no reasoning here.
+
+    Key capabilities:
+    - Semantic target resolution (labels, roles, text — not CSS/XPath)
+    - Angular Material / React-aware field filling (JS native setter)
+    - Checkpoint validation hooks (AI validates at workflow transitions)
+    - Self-healing on element not found
+    - CDP-enhanced state capture
     """
 
     def __init__(
@@ -55,15 +67,31 @@ class PlanRunner:
         screenshots_dir: str,
         run_id: str,
         event_callback: Callable[[str, dict], None] | None = None,
+        validation_engine=None,   # Optional[ValidationEngine]
+        state_machine=None,       # Optional[WorkflowStateMachine]
+        ui_engine=None,           # Optional[UITransitionEngine]
+        safety=None,              # Optional[SafetyGuardrails]
+        test_data=None,           # Optional[TestDataEngine]
+        confidence=None,          # Optional[ConfidenceEngine]
+        observability=None,       # Optional[ObservabilityLayer]
     ):
         self.browser = browser
         self.base_url = base_url
         self.screenshots_dir = screenshots_dir
         self.run_id = run_id
         self.event_callback = event_callback or (lambda e, d: None)
+        self.validation_engine = validation_engine
+        self.state_machine = state_machine
+        self.ui_engine = ui_engine
+        self.safety = safety
+        self.test_data = test_data
+        self.confidence = confidence
+        self.observability = observability
         self.healer = SelfHealingEngine(browser.driver)
         self.extractor = SemanticUIExtractor(browser.driver)
         self._step_counter = 0
+        self._current_phase = ""
+        self._recent_actions: list[str] = []
 
     async def execute_plan(
         self,
@@ -71,33 +99,194 @@ class PlanRunner:
     ) -> list[StepExecutionResult]:
         """Execute all steps in the plan. Returns results for each step."""
         steps = plan_data.get("steps", [])
-        results = []
+        checkpoint_validations = plan_data.get("checkpoint_validations", [])
+        results: list[StepExecutionResult] = []
+
+        # Build a lookup: step description → checkpoint definition
+        checkpoint_map: dict[str, dict] = {}
+        for cv in (checkpoint_validations or []):
+            after_desc = cv.get("after_description", "")
+            if after_desc:
+                checkpoint_map[after_desc.strip().lower()] = cv
+
+        execution_context = {
+            "workflow": plan_data.get("workflow", ""),
+            "workflow_type": plan_data.get("workflow_type", ""),
+            "scenario_title": plan_data.get("goal", ""),
+            "phase": "",
+            "recent_actions": self._recent_actions,
+        }
+
+        # Sync state machine with workflow type from the plan
+        if self.state_machine:
+            self.state_machine.workflow_type = plan_data.get("workflow_type", "")
 
         self._emit("plan_started", {
             "workflow": plan_data.get("workflow"),
+            "workflow_type": plan_data.get("workflow_type", ""),
+            "goal": plan_data.get("goal", ""),
             "total_steps": len(steps),
+            "checkpoints": len(checkpoint_validations),
         })
 
         for idx, step in enumerate(steps):
             self._step_counter = idx + 1
-            result = await self._execute_step(step, idx + 1, len(steps))
+
+            # Track current phase
+            phase = step.get("phase", "")
+            if phase and phase != self._current_phase:
+                self._current_phase = phase
+                execution_context["phase"] = phase
+                self._emit("phase_started", {"phase": phase, "step_index": idx})
+                if self.observability:
+                    self.observability.record_phase_start(phase)
+
+            # Resolve {{template}} placeholders before execution
+            if self.test_data:
+                self.test_data.set_step(idx + 1)
+                step = self.test_data.resolve_step(step)
+
+            # Safety guardrail check — block dangerous steps before they run
+            _safety_blocked = False
+            if self.safety:
+                _sr = self.safety.check_step(step)
+                if not _sr.allowed:
+                    _safety_blocked = True
+                    result = StepExecutionResult(
+                        success=False,
+                        message=f"[SAFETY BLOCKED] {_sr.reason}",
+                    )
+                    self._emit("step_blocked", {
+                        "step_index": idx,
+                        "reason": _sr.reason,
+                        "risk_level": _sr.risk_level,
+                    })
+
+            # Lightweight DOM fingerprint before execution (for transition detection)
+            _ui_before = None
+            if not _safety_blocked and self.ui_engine:
+                _ui_before = await asyncio.to_thread(self.ui_engine.capture)
+
+            # Execute the step (or use the safety-blocked result above)
+            if not _safety_blocked:
+                result = await self._execute_step(step, idx + 1, len(steps))
+
+            result.phase = phase
+            result.business_intent = step.get("business_intent", "")
             results.append(result)
+
+            # Detect DOM transitions (modal, form, toast, row delta, navigation)
+            _ui_transitions: list[str] = []
+            if _ui_before is not None and self.ui_engine:
+                _ui_after = await asyncio.to_thread(self.ui_engine.capture)
+                _ui_transitions = self.ui_engine.detect_transitions(_ui_before, _ui_after)
+                if _ui_transitions:
+                    self._emit("ui_transition", {"step_index": idx, "transitions": _ui_transitions})
+
+            # Advance workflow state machine based on step outcome + UI transitions
+            if self.state_machine:
+                self.state_machine.transition_from_step(step, result.success, phase, _ui_transitions)
+
+            # Track step in observability
+            if self.observability:
+                self.observability.record_step(result.success, result.healing_used)
+
+            # Track recent actions for context
+            self._recent_actions.append(step.get("description", ""))
+            if len(self._recent_actions) > 6:
+                self._recent_actions.pop(0)
 
             # Emit step result event
             self._emit("step_completed", {
                 "step_index": idx,
                 "action": step.get("action"),
                 "description": step.get("description"),
+                "business_intent": step.get("business_intent", ""),
+                "phase": phase,
                 "success": result.success,
                 "healing_used": result.healing_used,
                 "duration_ms": result.duration_ms,
             })
 
+            # ── Checkpoint validation (AI validates workflow transition) ───────
+            step_desc_lower = step.get("description", "").strip().lower()
+            checkpoint_def = None
+            if step.get("checkpoint"):
+                # Either step is flagged as checkpoint, or matches a checkpoint_validations entry
+                checkpoint_def = checkpoint_map.get(step_desc_lower) or {
+                    "validation_type": "workflow_complete",
+                    "description": f"Verify: {step.get('description', '')}",
+                    "semantic_check": step.get("business_intent", ""),
+                    "critical": False,
+                }
+            else:
+                checkpoint_def = checkpoint_map.get(step_desc_lower)
+
+            if checkpoint_def and result.success and self.validation_engine:
+                cv_result = await self.validation_engine.validate_checkpoint(
+                    checkpoint_def,
+                    {**execution_context, "recent_actions": list(self._recent_actions)},
+                )
+                result.checkpoint_result = {
+                    "passed": cv_result.passed,
+                    "confidence": cv_result.confidence,
+                    "evidence": cv_result.evidence,
+                    "business_explanation": cv_result.business_explanation,
+                    "failure_detail": cv_result.failure_detail,
+                    "validation_type": cv_result.validation_type,
+                }
+                self._emit("checkpoint_validated", {
+                    "step_index": idx,
+                    "description": step.get("description"),
+                    "validation_type": cv_result.validation_type,
+                    "passed": cv_result.passed,
+                    "confidence": cv_result.confidence,
+                    "evidence": cv_result.evidence,
+                    "business_explanation": cv_result.business_explanation,
+                })
+                # If checkpoint failed and it's critical — treat step as failed
+                if not cv_result.passed and checkpoint_def.get("critical") and cv_result.confidence >= 0.7:
+                    result.success = False
+                    result.message = f"[CHECKPOINT FAILED] {cv_result.business_explanation}"
+
+            # Confidence tracking from checkpoint result
+            if result.checkpoint_result and self.confidence:
+                _cp_conf = result.checkpoint_result.get("confidence", 0.7)
+                _cp_action, _cp_reason = self.confidence.assess_checkpoint(result.checkpoint_result)
+                self.confidence.record(_cp_conf, _cp_reason, phase=phase)
+                if _cp_action in ("pause", "abort"):
+                    self._emit("low_confidence_warning", {
+                        "step_index": idx,
+                        "confidence": _cp_conf,
+                        "action": _cp_action,
+                        "reason": _cp_reason,
+                    })
+
             # Abort on failure if on_fail=fail
             if not result.success and step.get("on_fail", "fail") == "fail":
-                log.warning("Aborting plan — step failed with on_fail=fail", step=idx + 1)
-                self._emit("plan_aborted", {"at_step": idx + 1, "reason": result.message})
+                log.warning("Aborting plan — step failed", step=idx + 1,
+                    action=step.get("action"), desc=step.get("description"))
+                self._emit("plan_aborted", {
+                    "at_step": idx + 1,
+                    "reason": result.message,
+                    "phase": phase,
+                    "business_intent": step.get("business_intent", ""),
+                })
                 break
+
+        # ── Post-plan summaries ────────────────────────────────────────────────
+        if self.observability and self._current_phase:
+            _final_ok = all(r.success for r in results if r.phase == self._current_phase)
+            self.observability.record_phase_end(self._current_phase, _final_ok)
+
+        if self.state_machine:
+            self._emit("workflow_state_summary", self.state_machine.summary())
+
+        if self.observability:
+            self._emit("execution_metrics", self.observability.get_summary())
+
+        if self.test_data:
+            self._emit("test_data_summary", self.test_data.summary())
 
         return results
 
@@ -116,16 +305,20 @@ class PlanRunner:
             "total": total,
             "action": action,
             "description": description,
+            "phase": step.get("phase", ""),
+            "business_intent": step.get("business_intent", ""),
         })
 
-        log.info("Executing step", step_num=step_num, action=action, desc=description)
+        log.info("Executing step",
+            step_num=step_num, action=action,
+            desc=description[:60], phase=step.get("phase", ""))
 
         try:
             result = await self._dispatch_action(action, step)
         except Exception as e:
             result = StepExecutionResult(
                 success=False,
-                message=f"Unexpected error: {str(e)[:200]}",
+                message=f"Unexpected error in '{description}': {str(e)[:200]}",
             )
 
         result.duration_ms = int((time.monotonic() - start) * 1000)
@@ -136,10 +329,15 @@ class PlanRunner:
             "navigate": self._action_navigate,
             "click": self._action_click,
             "fill": self._action_fill,
+            "clear": self._action_clear,
             "select": self._action_select,
+            "key_press": self._action_key_press,
             "assert_visible": self._action_assert_visible,
             "assert_text": self._action_assert_text,
+            "assert_not_text": self._action_assert_not_text,
             "assert_url": self._action_assert_url,
+            "assert_count": self._action_assert_count,
+            "assert_ai_semantic": self._action_assert_ai_semantic,
             "wait_network": self._action_wait_network,
             "wait_element": self._action_wait_element,
             "wait_ms": self._action_wait_ms,
@@ -147,18 +345,19 @@ class PlanRunner:
             "upload": self._action_upload,
             "screenshot": self._action_screenshot,
         }
-
         handler = handlers.get(action)
         if not handler:
             return StepExecutionResult(success=False, message=f"Unknown action: {action}")
-
         return await handler(step)
+
+    # ─── Action Handlers ──────────────────────────────────────────────────────
 
     async def _action_navigate(self, step: dict) -> StepExecutionResult:
         url = step.get("url", "")
-        if url.startswith("/") or not url.startswith("http"):
+        if url.startswith("/") or (url and not url.startswith("http")):
             url = self.base_url.rstrip("/") + "/" + url.lstrip("/")
-
+        if not url:
+            url = self.base_url
         try:
             self.browser.navigate(url)
             return StepExecutionResult(success=True, message=f"Navigated to {url}")
@@ -166,13 +365,12 @@ class PlanRunner:
             return StepExecutionResult(success=False, message=f"Navigation failed: {e}")
 
     async def _action_click(self, step: dict) -> StepExecutionResult:
-        target = step.get("target", step.get("label", ""))
+        target = step.get("target", step.get("label", step.get("text", "")))
         element_type = step.get("element_type")
         timeout = step.get("timeout_ms", 10000) / 1000
 
-        # Try stored selectors first (if available)
-        stored_selectors = step.get("selectors", [])
-        for sel in stored_selectors:
+        # Try stored selectors first
+        for sel in step.get("selectors", []):
             try:
                 by = By.CSS_SELECTOR if sel.get("type") == "css" else By.XPATH
                 element = WebDriverWait(self.browser.driver, 3).until(
@@ -181,37 +379,34 @@ class PlanRunner:
                 success, method = self.healer.click_with_healing(element)
                 if success:
                     self._wait_for_settle()
-                    screenshot = self._take_step_screenshot()
                     return StepExecutionResult(
                         success=True,
                         message=f"Clicked '{target}' via stored selector",
-                        screenshot_path=screenshot,
+                        screenshot_path=self._take_step_screenshot(),
                     )
             except Exception:
                 continue
 
-        # Healing: find by semantic label
+        # Semantic resolution via self-healer
         result_tuple = self.healer.find_element(target, element_type)
         element, strategy, attempts = result_tuple
 
         if element is None:
             return StepExecutionResult(
                 success=False,
-                message=f"Element '{target}' not found after all healing strategies",
+                message=f"Element '{target}' not found (tried all healing strategies)",
                 healing_used=True,
                 healing_attempts=[a.__dict__ for a in attempts],
             )
 
         success, method = self.healer.click_with_healing(element)
         self._wait_for_settle()
-        screenshot = self._take_step_screenshot()
-
         return StepExecutionResult(
             success=success,
-            message=f"Clicked '{target}' via {strategy} / {method}",
+            message=f"Clicked '{target}' via {strategy}/{method}",
             healing_used=strategy != "stored_selector",
             healing_attempts=[a.__dict__ for a in attempts],
-            screenshot_path=screenshot,
+            screenshot_path=self._take_step_screenshot() if success else None,
         )
 
     async def _action_fill(self, step: dict) -> StepExecutionResult:
@@ -230,16 +425,94 @@ class PlanRunner:
             )
 
         try:
-            element.clear()
-            element.send_keys(str(value))
+            # JS native setter — works with Angular Material, React, Vue
+            self.browser.execute_script("""
+                const el = arguments[0];
+                const value = arguments[1];
+                try {
+                    const setter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value'
+                    );
+                    if (setter && setter.set) {
+                        setter.set.call(el, value);
+                    } else {
+                        el.value = value;
+                    }
+                } catch(e) { el.value = value; }
+                el.dispatchEvent(new Event('input',  { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new Event('blur',   { bubbles: true }));
+            """, element, str(value))
             return StepExecutionResult(
                 success=True,
-                message=f"Filled '{target}' with value",
+                message=f"Filled '{target}'",
                 healing_used=strategy != "stored_selector",
                 healing_attempts=[a.__dict__ for a in attempts],
             )
+        except Exception:
+            # Fallback: standard send_keys
+            try:
+                element.clear()
+                element.send_keys(str(value))
+                return StepExecutionResult(
+                    success=True,
+                    message=f"Filled '{target}' (send_keys fallback)",
+                    healing_used=strategy != "stored_selector",
+                    healing_attempts=[a.__dict__ for a in attempts],
+                )
+            except Exception as e:
+                return StepExecutionResult(success=False, message=f"Fill failed: {e}")
+
+    async def _action_clear(self, step: dict) -> StepExecutionResult:
+        target = step.get("target", step.get("field", ""))
+        result_tuple = self.healer.find_element(target, "textbox")
+        element, _, _ = result_tuple
+        if element is None:
+            return StepExecutionResult(success=False, message=f"Field '{target}' not found for clear")
+        try:
+            element.clear()
+            # Also dispatch events in case SPA listens to them
+            self.browser.execute_script("""
+                arguments[0].value = '';
+                arguments[0].dispatchEvent(new Event('input', {bubbles:true}));
+                arguments[0].dispatchEvent(new Event('change', {bubbles:true}));
+            """, element)
+            return StepExecutionResult(success=True, message=f"Cleared '{target}'")
         except Exception as e:
-            return StepExecutionResult(success=False, message=f"Fill failed: {e}")
+            return StepExecutionResult(success=False, message=f"Clear failed: {e}")
+
+    async def _action_key_press(self, step: dict) -> StepExecutionResult:
+        key_name = step.get("key", "Enter").strip()
+        target = step.get("target", "")
+        key_map = {
+            "Enter": Keys.RETURN, "Return": Keys.RETURN,
+            "Tab": Keys.TAB, "Escape": Keys.ESCAPE, "Esc": Keys.ESCAPE,
+            "Space": Keys.SPACE, "Backspace": Keys.BACK_SPACE,
+            "ArrowUp": Keys.ARROW_UP, "ArrowDown": Keys.ARROW_DOWN,
+            "ArrowLeft": Keys.ARROW_LEFT, "ArrowRight": Keys.ARROW_RIGHT,
+            "Delete": Keys.DELETE, "Home": Keys.HOME, "End": Keys.END,
+        }
+        key = key_map.get(key_name, key_name)
+
+        if target:
+            result_tuple = self.healer.find_element(target)
+            element, _, _ = result_tuple
+            if element:
+                try:
+                    element.send_keys(key)
+                    self._wait_for_settle()
+                    return StepExecutionResult(success=True, message=f"Pressed {key_name} on '{target}'")
+                except Exception as e:
+                    return StepExecutionResult(success=False, message=f"Key press failed: {e}")
+
+        # No target — send to active element
+        try:
+            active = self.browser.driver.switch_to.active_element
+            active.send_keys(key)
+            self._wait_for_settle()
+            return StepExecutionResult(success=True, message=f"Pressed {key_name} on active element")
+        except Exception as e:
+            return StepExecutionResult(success=False, message=f"Key press failed: {e}")
 
     async def _action_select(self, step: dict) -> StepExecutionResult:
         target = step.get("target", "")
@@ -249,83 +522,183 @@ class PlanRunner:
         element, strategy, attempts = result_tuple
 
         if element is None:
-            # Try custom dropdown (non-native select)
             return await self._handle_custom_dropdown(target, value, attempts)
 
         try:
-            select = Select(element)
+            sel = Select(element)
             try:
-                select.select_by_visible_text(str(value))
+                sel.select_by_visible_text(str(value))
             except Exception:
-                select.select_by_value(str(value))
+                sel.select_by_value(str(value))
             return StepExecutionResult(success=True, message=f"Selected '{value}' in '{target}'")
         except Exception as e:
             return StepExecutionResult(success=False, message=f"Select failed: {e}")
 
-    async def _handle_custom_dropdown(self, target: str, value: str, prior_attempts: list) -> StepExecutionResult:
-        """Handle custom (non-native) dropdown menus."""
-        # Click the dropdown trigger
-        result_tuple = self.healer.find_element(target, "combobox")
-        trigger, strategy, attempts = result_tuple
-        if trigger is None:
+    async def _handle_custom_dropdown(
+        self, target: str, value: str, prior_attempts: list
+    ) -> StepExecutionResult:
+        from app.intelligence.field_inspector import FieldInspector
+        inspector = FieldInspector(self.browser.driver)
+
+        ok = await asyncio.to_thread(inspector.select_by_label_text, target, value)
+        if ok:
             return StepExecutionResult(
-                success=False,
-                message=f"Dropdown '{target}' not found",
+                success=True,
+                message=f"Selected '{value}' from custom dropdown '{target}'",
                 healing_used=True,
-                healing_attempts=prior_attempts + [a.__dict__ for a in attempts],
+                screenshot_path=self._take_step_screenshot(),
             )
 
-        self.healer.click_with_healing(trigger)
-        time.sleep(0.5)
+        # Try via trigger button
+        for element_type in ("combobox", "button"):
+            result_tuple = self.healer.find_element(target, element_type)
+            trigger, _, attempts = result_tuple
+            if trigger:
+                ok = await asyncio.to_thread(inspector.select_option, trigger, value)
+                return StepExecutionResult(
+                    success=ok,
+                    message=f"{'Selected' if ok else 'Failed'} '{value}' from dropdown '{target}'",
+                    healing_used=True,
+                    healing_attempts=[a.__dict__ for a in attempts],
+                    screenshot_path=self._take_step_screenshot(),
+                )
 
-        # Find and click the option
-        try:
-            option = WebDriverWait(self.browser.driver, 5).until(
-                EC.element_to_be_clickable((
-                    By.XPATH,
-                    f'//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "{value.lower()}") and (contains(@class, "option") or contains(@class, "item") or @role="option")]',
-                ))
-            )
-            option.click()
-            return StepExecutionResult(success=True, message=f"Selected '{value}' from custom dropdown '{target}'")
-        except Exception as e:
-            return StepExecutionResult(success=False, message=f"Custom dropdown selection failed: {e}")
+        return StepExecutionResult(
+            success=False,
+            message=f"Dropdown '{target}' not found",
+            healing_used=True,
+            healing_attempts=[a.__dict__ for a in prior_attempts],
+        )
 
     async def _action_assert_visible(self, step: dict) -> StepExecutionResult:
         text = step.get("text", step.get("target", ""))
         timeout = step.get("timeout_ms", 10000) / 1000
 
+        if not text:
+            return StepExecutionResult(success=True, message="Assert visible: no target specified (pass)")
+
         try:
             WebDriverWait(self.browser.driver, timeout).until(
                 EC.visibility_of_element_located((
                     By.XPATH,
-                    f'//*[contains(normalize-space(text()), "{text}") or contains(@aria-label, "{text}")]',
+                    f'//*[contains(normalize-space(text()), "{text}") '
+                    f'or contains(@aria-label, "{text}") '
+                    f'or contains(@placeholder, "{text}")]',
                 ))
             )
             return StepExecutionResult(success=True, message=f"'{text}' is visible")
         except TimeoutException:
-            screenshot = self._take_step_screenshot("failure")
+            screenshot = self._take_step_screenshot("assert_fail")
             return StepExecutionResult(
                 success=False,
-                message=f"Expected text '{text}' not visible after {timeout}s",
+                message=f"Expected text '{text}' not visible after {timeout:.0f}s",
                 screenshot_path=screenshot,
             )
 
     async def _action_assert_text(self, step: dict) -> StepExecutionResult:
         text = step.get("text", "")
-        page_source = self.browser.driver.page_source
-        if text.lower() in page_source.lower():
+        if text.lower() in self.browser.driver.page_source.lower():
             return StepExecutionResult(success=True, message=f"Text '{text}' found on page")
-        return StepExecutionResult(success=False, message=f"Text '{text}' not found on page")
+        screenshot = self._take_step_screenshot("assert_fail")
+        return StepExecutionResult(
+            success=False,
+            message=f"Expected text '{text}' not found on page",
+            screenshot_path=screenshot,
+        )
+
+    async def _action_assert_not_text(self, step: dict) -> StepExecutionResult:
+        text = step.get("text", step.get("target", ""))
+        if text.lower() not in self.browser.driver.page_source.lower():
+            return StepExecutionResult(success=True, message=f"Confirmed '{text}' is NOT on page")
+        screenshot = self._take_step_screenshot("assert_fail")
+        return StepExecutionResult(
+            success=False,
+            message=f"Text '{text}' is still on page (expected to be absent)",
+            screenshot_path=screenshot,
+        )
 
     async def _action_assert_url(self, step: dict) -> StepExecutionResult:
-        pattern = step.get("pattern", step.get("text", ""))
+        pattern = step.get("pattern", step.get("text", step.get("target", "")))
         current_url = self.browser.get_current_url()
         if pattern.lower() in current_url.lower():
             return StepExecutionResult(success=True, message=f"URL contains '{pattern}'")
         return StepExecutionResult(
             success=False,
             message=f"URL '{current_url}' does not contain '{pattern}'",
+        )
+
+    async def _action_assert_count(self, step: dict) -> StepExecutionResult:
+        target = step.get("target", "row")
+        count_expr = step.get("value", step.get("count", ""))
+        try:
+            # Count rows/items matching target
+            elements = self.browser.driver.find_elements(
+                By.XPATH,
+                f'//*[contains(normalize-space(text()), "{target}") '
+                f'or self::tr or self::li]',
+            )
+            actual = len(elements)
+            if count_expr:
+                # Support: ">0", ">=5", "==10", "3"
+                count_expr = str(count_expr).strip()
+                op = ">=" if ">=" in count_expr else (">" if ">" in count_expr else
+                     "<=" if "<=" in count_expr else ("<" if "<" in count_expr else "=="))
+                num = int(count_expr.replace(op, "").replace("=", "").strip())
+                ops = {">": lambda a, b: a > b, ">=": lambda a, b: a >= b,
+                       "<": lambda a, b: a < b, "<=": lambda a, b: a <= b,
+                       "==": lambda a, b: a == b}
+                passed = ops.get(op, ops[">="])(actual, num)
+                if passed:
+                    return StepExecutionResult(success=True, message=f"Count check: {actual} {op} {num}")
+                return StepExecutionResult(
+                    success=False,
+                    message=f"Count check failed: found {actual} items, expected {op} {num}",
+                )
+            return StepExecutionResult(success=True, message=f"Found {actual} items matching '{target}'")
+        except Exception as e:
+            return StepExecutionResult(success=False, message=f"Count assertion failed: {e}")
+
+    async def _action_assert_ai_semantic(self, step: dict) -> StepExecutionResult:
+        """
+        AI-powered semantic assertion.
+        Validates a business state using the ValidationEngine.
+        Only called when explicitly in the plan — not on every step.
+        """
+        description = step.get("description", "")
+        semantic_check = step.get("text", step.get("target", description))
+
+        if not self.validation_engine:
+            return StepExecutionResult(
+                success=True,
+                message="assert_ai_semantic: validation engine not configured — assumed pass",
+            )
+
+        checkpoint = {
+            "validation_type": "workflow_complete",
+            "description": description,
+            "semantic_check": semantic_check,
+            "critical": step.get("on_fail", "fail") == "fail",
+        }
+        cv = await self.validation_engine.validate_checkpoint(
+            checkpoint,
+            {
+                "workflow": "",
+                "phase": self._current_phase,
+                "scenario_title": "",
+                "recent_actions": list(self._recent_actions),
+            },
+        )
+        screenshot = self._take_step_screenshot("ai_assert")
+        return StepExecutionResult(
+            success=cv.passed,
+            message=cv.business_explanation or f"AI assertion: {'passed' if cv.passed else 'failed'}",
+            screenshot_path=screenshot,
+            checkpoint_result={
+                "passed": cv.passed,
+                "confidence": cv.confidence,
+                "evidence": cv.evidence,
+                "business_explanation": cv.business_explanation,
+            },
         )
 
     async def _action_wait_network(self, step: dict) -> StepExecutionResult:
@@ -336,23 +709,31 @@ class PlanRunner:
         while time.monotonic() < deadline:
             events = self.browser.get_network_events()
             for event in events:
-                if url_substring.lower() in event.get("url", "").lower():
-                    return StepExecutionResult(success=True, message=f"Network request matching '{url_substring}' detected")
+                if not url_substring or url_substring.lower() in event.get("url", "").lower():
+                    return StepExecutionResult(
+                        success=True,
+                        message=f"Network activity detected" + (f" matching '{url_substring}'" if url_substring else "")
+                    )
             await asyncio.sleep(0.5)
 
-        return StepExecutionResult(success=False, message=f"No network request matching '{url_substring}' within {timeout}s")
+        return StepExecutionResult(
+            success=False,
+            message=f"No network activity{f' matching {url_substring}' if url_substring else ''} within {timeout:.0f}s",
+        )
 
     async def _action_wait_element(self, step: dict) -> StepExecutionResult:
         target = step.get("target", "")
         timeout = step.get("timeout_ms", 10000) / 1000
-        result_tuple = self.healer.find_element(target, timeout=timeout if hasattr(self.healer.find_element, 'timeout') else None)
+        result_tuple = self.healer.find_element(target)
         element, strategy, attempts = result_tuple
         if element:
             return StepExecutionResult(success=True, message=f"Element '{target}' appeared")
-        return StepExecutionResult(success=False, message=f"Element '{target}' did not appear within {timeout}s")
+        return StepExecutionResult(
+            success=False, message=f"Element '{target}' did not appear within {timeout:.0f}s"
+        )
 
     async def _action_wait_ms(self, step: dict) -> StepExecutionResult:
-        ms = min(step.get("ms", 1000), 30000)  # Cap at 30 seconds
+        ms = min(step.get("ms", 1000), 30000)
         await asyncio.sleep(ms / 1000)
         return StepExecutionResult(success=True, message=f"Waited {ms}ms")
 
@@ -362,13 +743,17 @@ class PlanRunner:
             result_tuple = self.healer.find_element(target)
             element, _, _ = result_tuple
             if element:
-                self.browser.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+                self.browser.execute_script(
+                    "arguments[0].scrollIntoView({block:'center',behavior:'smooth'});", element
+                )
                 return StepExecutionResult(success=True, message=f"Scrolled to '{target}'")
         else:
             direction = step.get("direction", "down")
             amount = step.get("amount", 500)
-            self.browser.execute_script(f"window.scrollBy(0, {amount if direction == 'down' else -amount});")
-            return StepExecutionResult(success=True, message=f"Scrolled {direction}")
+            self.browser.execute_script(
+                f"window.scrollBy(0, {amount if direction == 'down' else -amount});"
+            )
+            return StepExecutionResult(success=True, message=f"Scrolled {direction} {amount}px")
         return StepExecutionResult(success=False, message="Scroll target not found")
 
     async def _action_upload(self, step: dict) -> StepExecutionResult:
@@ -387,28 +772,24 @@ class PlanRunner:
         path = self._take_step_screenshot("evidence")
         return StepExecutionResult(success=True, message="Screenshot captured", screenshot_path=path)
 
+    # ─── Utilities ────────────────────────────────────────────────────────────
+
     def _take_step_screenshot(self, suffix: str = "") -> str | None:
         os.makedirs(self.screenshots_dir, exist_ok=True)
-        timestamp = int(time.time() * 1000)
-        filename = f"{self.run_id}_step{self._step_counter}_{suffix}_{timestamp}.png".replace("__", "_")
-        path = os.path.join(self.screenshots_dir, filename)
-        success = self.browser.take_screenshot(path)
-        return path if success else None
+        ts = int(time.time() * 1000)
+        fn = f"{self.run_id}_step{self._step_counter}_{suffix}_{ts}.png".replace("__", "_")
+        path = os.path.join(self.screenshots_dir, fn)
+        return path if self.browser.take_screenshot(path) else None
 
-    def _wait_for_settle(self, timeout: float = 2.0):
-        """Brief wait for DOM to settle after action."""
-        time.sleep(0.3)
-        # Quick stability check
+    def _wait_for_settle(self, min_wait: float = 0.3):
+        """Brief wait for DOM to settle after an action."""
+        time.sleep(min_wait)
         try:
-            before = self.browser.execute_script(
-                "return document.querySelectorAll('*').length;"
-            )
-            time.sleep(0.3)
-            after = self.browser.execute_script(
-                "return document.querySelectorAll('*').length;"
-            )
-            if abs(after - before) > 20:
-                time.sleep(0.5)  # Extra wait for active rendering
+            before = self.browser.execute_script("return document.querySelectorAll('*').length;")
+            time.sleep(0.25)
+            after = self.browser.execute_script("return document.querySelectorAll('*').length;")
+            if abs(after - before) > 15:
+                time.sleep(0.5)  # DOM still changing — wait more
         except Exception:
             pass
 

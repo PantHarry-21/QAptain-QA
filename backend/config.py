@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     CHROMA_COLLECTION_PREFIX: str = "qaptain"
 
     # AI Providers
-    AI_PROVIDER: Literal["anthropic", "openai", "azure_openai"] = "anthropic"
+    AI_PROVIDER: Literal["anthropic", "openai", "azure_openai", "gemini"] = "anthropic"
     ANTHROPIC_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
     AZURE_OPENAI_API_KEY: str = ""
@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     PRIMARY_MODEL: str = "claude-opus-4-7"
     FAST_MODEL: str = "claude-haiku-4-5-20251001"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
+
+    # Gemini
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-2.0-flash"
+    GEMINI_FAST_MODEL: str = "gemini-2.0-flash"
 
     # Security
     SECRET_KEY: str = "change-this-in-production-minimum-32-chars"
@@ -75,6 +80,7 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
         case_sensitive = True
+        extra = "ignore"  # .env is shared with the frontend — ignore unknown fields
 
 
 @lru_cache()

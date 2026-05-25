@@ -52,13 +52,25 @@ class BrowserManager:
         opts.add_argument("--disable-gpu")
         opts.add_argument("--disable-software-rasterizer")
         opts.add_argument("--disable-setuid-sandbox")
+        # UAT environments often use self-signed or corporate CA certs
+        opts.add_argument("--ignore-certificate-errors")
+        opts.add_argument("--allow-insecure-localhost")
+        # Realistic user-agent prevents bot-detection blocks in headless mode
+        opts.add_argument(
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
         opts.add_experimental_option("excludeSwitches", ["enable-automation"])
         opts.add_experimental_option("useAutomationExtension", False)
         # Enable performance logging for CDP
         opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
-        # eager: wait for DOMContentLoaded only, not full resource load (images/fonts/analytics)
-        opts.page_load_strategy = "eager"
+        # none: driver.get() returns immediately after Chrome starts navigation.
+        # This prevents blocking for 60s on heavy SPAs (YLIMS, Angular). Callers are
+        # responsible for waiting (explore uses _wait_for_any_input, executor uses
+        # implicit waits via _wait_for_stability + explicit element waits).
+        opts.page_load_strategy = "none"
 
         # Selenium Manager (built into Selenium 4.6+) auto-downloads the matching ChromeDriver
         driver = webdriver.Chrome(options=opts)
@@ -89,7 +101,12 @@ class BrowserManager:
             log.warning("CDP setup failed — running without CDP intelligence", error=str(e))
 
     def navigate(self, url: str):
-        """Navigate with stability wait. Tolerates slow-resource timeouts and renderer hangs."""
+        """
+        Navigate and wait for DOM stability.
+        Uses page_load_strategy='none' so driver.get() returns immediately.
+        _wait_for_stability() then polls until DOM mutations settle (≤5s), which
+        is sufficient for fast pages. For slow SPAs, the caller waits explicitly.
+        """
         from selenium.common.exceptions import TimeoutException, WebDriverException
         try:
             self.driver.get(url)
@@ -97,13 +114,16 @@ class BrowserManager:
             log.warning("Page load timed out — continuing with partial load", url=url)
         except WebDriverException as e:
             msg = str(e).lower()
-            # "timed out receiving message from renderer" — Chrome renderer hung on slow
-            # resources after DOMContentLoaded. Page is usually interactive; continue.
             if "timeout" in msg or "renderer" in msg:
                 log.warning("Renderer timeout — continuing with partial load", url=url)
             else:
                 raise
-        self._wait_for_stability()
+        try:
+            self._wait_for_stability()
+        except Exception:
+            # Stability check can fail mid-navigation (execute_script on an unloaded
+            # frame). Safe to ignore — caller has its own explicit waits.
+            pass
 
     def get_dom_snapshot(self) -> dict[str, Any]:
         """Get lightweight DOM snapshot via CDP."""

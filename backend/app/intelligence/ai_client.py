@@ -4,10 +4,13 @@ Supports: Anthropic Claude, OpenAI, Azure OpenAI
 All intelligence passes through this single interface.
 """
 from __future__ import annotations
+import asyncio
 import json
 from typing import Any
 
 import anthropic
+from google import genai as google_genai
+from google.genai import types as google_types
 import openai
 import structlog
 
@@ -44,8 +47,14 @@ class AIClient:
 
     def __init__(self):
         self._provider = settings.AI_PROVIDER
-        self._primary_model = settings.PRIMARY_MODEL
-        self._fast_model = settings.FAST_MODEL
+
+        # Use provider-specific model names so Gemini never receives Anthropic model IDs
+        if self._provider == "gemini":
+            self._primary_model = settings.GEMINI_MODEL
+            self._fast_model = settings.GEMINI_FAST_MODEL
+        else:
+            self._primary_model = settings.PRIMARY_MODEL
+            self._fast_model = settings.FAST_MODEL
 
         if self._provider == "anthropic":
             self._anthropic = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
@@ -55,6 +64,8 @@ class AIClient:
                 azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
                 api_version=settings.AZURE_OPENAI_API_VERSION,
             )
+        elif self._provider == "gemini":
+            self._gemini = google_genai.Client(api_key=settings.GEMINI_API_KEY)
         else:
             self._openai = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
@@ -69,13 +80,22 @@ class AIClient:
         max_tokens: int = 4096,
         temperature: float = 0.1,
     ) -> AIMessage:
-        selected_model = model or (self._fast_model if fast else self._primary_model)
+        # Azure OpenAI uses deployment names, not model names — always use the configured deployment
+        if self._provider == "azure_openai":
+            selected_model = settings.AZURE_OPENAI_DEPLOYMENT
+        else:
+            selected_model = model or (self._fast_model if fast else self._primary_model)
 
         try:
             if self._provider == "anthropic":
                 return await self._call_anthropic(
                     system=system, user=user, model=selected_model,
                     max_tokens=max_tokens, temperature=temperature,
+                )
+            elif self._provider == "gemini":
+                return await self._call_gemini(
+                    system=system, user=user, model=selected_model,
+                    max_tokens=max_tokens, json_mode=json_mode,
                 )
             else:
                 return await self._call_openai(
@@ -104,23 +124,57 @@ class AIClient:
             output_tokens=response.usage.output_tokens,
         )
 
+    async def _call_gemini(
+        self, system: str, user: str, model: str,
+        max_tokens: int, json_mode: bool,
+    ) -> AIMessage:
+        config = google_types.GenerateContentConfig(
+            system_instruction=system,
+            max_output_tokens=max_tokens,
+            response_mime_type="application/json" if json_mode else "text/plain",
+        )
+        resp = await self._gemini.aio.models.generate_content(
+            model=model,
+            contents=user,
+            config=config,
+        )
+        text = resp.text or ""
+        usage = resp.usage_metadata
+        return AIMessage(
+            content=text,
+            model=model,
+            input_tokens=usage.prompt_token_count if usage else 0,
+            output_tokens=usage.candidates_token_count if usage else 0,
+        )
+
     async def _call_openai(
         self, system: str, user: str, model: str,
         max_tokens: int, temperature: float, json_mode: bool,
     ) -> AIMessage:
         kwargs: dict[str, Any] = {
             "model": model,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
+            "max_completion_tokens": max_tokens,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
         }
-        if json_mode:
+        # Azure deployments (e.g. gpt-5-mini) only support the default temperature (1)
+        # and reject any other value — omit the parameter entirely for Azure.
+        if self._provider != "azure_openai":
+            kwargs["temperature"] = temperature
+        # response_format=json_object is not supported by all Azure deployments.
+        # The system prompt already instructs the model to return only JSON,
+        # and AIMessage.json() strips markdown fences — so this is safe to skip.
+        if json_mode and self._provider != "azure_openai":
             kwargs["response_format"] = {"type": "json_object"}
 
-        response = await self._openai.chat.completions.create(**kwargs)
+        try:
+            response = await self._openai.chat.completions.create(**kwargs)
+        except Exception as exc:
+            log.error("OpenAI API call failed", provider=self._provider, model=model,
+                      error=str(exc), kwargs_keys=list(kwargs.keys()))
+            raise
         msg = response.choices[0].message.content or ""
         return AIMessage(
             content=msg,

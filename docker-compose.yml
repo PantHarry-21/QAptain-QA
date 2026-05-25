@@ -1,4 +1,8 @@
-# QAPtain local stack — PostgreSQL, Redis (Supabase replaces ChromaDB)
+# QAptain v2 local stack
+# Services: PostgreSQL, Redis, ChromaDB
+# Backend: FastAPI (Python) on port 8000
+# Frontend: Next.js on port 3000
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -11,6 +15,11 @@ services:
       - "5432:5432"
     volumes:
       - qaptain_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qaptain"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis:
     image: redis:7-alpine
@@ -19,8 +28,25 @@ services:
       - "6379:6379"
     volumes:
       - qaptain_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  chromadb:
+    image: chromadb/chroma:latest
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    volumes:
+      - qaptain_chroma:/chroma/chroma
+    environment:
+      ANONYMIZED_TELEMETRY: "false"
+      IS_PERSISTENT: "TRUE"
 
 volumes:
   qaptain_pg:
   qaptain_redis:
+  qaptain_chroma:
 

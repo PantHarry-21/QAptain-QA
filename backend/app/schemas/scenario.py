@@ -27,6 +27,8 @@ class ScenarioResponse(BaseModel):
     priority: str
     tags: list[str]
     module_id: str | None
+    module_name: str | None = None
+    module_url: str | None = None
     source: str
     is_active: bool
     created_at: datetime

@@ -1,11 +1,11 @@
-'use client';
+﻿'use client';
 
 import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Bot, X, Sparkles, Send } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { cn } from "@/lib/utils.client";
+import { cn } from "@/lib/utils";
 
 export function AssistantPanel() {
   const [isOpen, setIsOpen] = useState(true);
