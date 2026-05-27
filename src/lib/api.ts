@@ -197,8 +197,20 @@ export const scenarios = {
       body: JSON.stringify(data),
     }),
 
+  update: (scenarioId: string, data: { title?: string; description?: string; priority?: string; tags?: string[] }) =>
+    request<Scenario>(`/scenarios/${scenarioId}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+
   delete: (scenarioId: string) =>
     request<void>(`/scenarios/${scenarioId}`, { method: 'DELETE' }),
+
+  deleteByModule: (applicationId: string, moduleId: string | null) =>
+    request<{ deleted: number }>(
+      `/scenarios/bulk/by-module?application_id=${applicationId}${moduleId && moduleId !== '__none__' ? `&module_id=${moduleId}` : ''}`,
+      { method: 'DELETE' },
+    ),
 };
 
 // ─── Executions ───────────────────────────────────────────────────────────────
@@ -218,6 +230,16 @@ export const executions = {
 
   cancel: (runId: string) =>
     request<{ status: string }>(`/executions/${runId}/cancel`, { method: 'POST' }),
+
+  batchHistory: (applicationId: string, limit = 30) =>
+    request<BatchHistory[]>(`/executions/batch-history`, {
+      params: { application_id: applicationId, limit: String(limit) },
+    }),
+
+  getBatch: (batchId: string) =>
+    request<{ batch_id: string; runs: Array<{ run_id: string; title: string }> }>(
+      `/executions/batch/${batchId}`,
+    ),
 };
 
 // ─── Reports ──────────────────────────────────────────────────────────────────
@@ -449,9 +471,44 @@ export interface ReportSummary {
   scenario_id: string;
   risk_level?: string;
   quality_score?: number;
-  summary: Record<string, unknown>;
+  summary: {
+    total?: number;
+    passed?: number;
+    failed?: number;
+    healed?: number;
+    pass_rate?: number;
+    workflow?: string;
+    workflow_type?: string;
+    duration_seconds?: number;
+    phases_completed?: string[];
+    phases_failed?: string[];
+    checkpoints_total?: number;
+    checkpoints_passed?: number;
+    [key: string]: unknown;
+  };
   created_at: string;
   run_status?: string;
+}
+
+export interface BatchHistoryRun {
+  run_id: string;
+  title: string;
+  status: string;
+  passed_steps: number;
+  failed_steps: number;
+  total_steps: number;
+  completed_at?: string;
+}
+
+export interface BatchHistory {
+  batch_id: string;
+  started_at: string;
+  environment_id: string;
+  total: number;
+  passed: number;
+  failed: number;
+  running: number;
+  runs: BatchHistoryRun[];
 }
 
 export interface CreateApplicationPayload {

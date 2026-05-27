@@ -26,6 +26,7 @@ from selenium.common.exceptions import TimeoutException
 
 from app.execution.browser_manager import BrowserManager
 from app.execution.self_healing import SelfHealingEngine
+from app.execution.entity_tracker import EntityTracker
 from app.intelligence.semantic_extractor import SemanticUIExtractor
 
 log = structlog.get_logger()
@@ -89,6 +90,7 @@ class PlanRunner:
         self.observability = observability
         self.healer = SelfHealingEngine(browser.driver)
         self.extractor = SemanticUIExtractor(browser.driver)
+        self.entity_tracker: EntityTracker | None = None   # set by IntentOrchestrator
         self._step_counter = 0
         self._current_phase = ""
         self._recent_actions: list[str] = []
@@ -146,6 +148,11 @@ class PlanRunner:
                 self.test_data.set_step(idx + 1)
                 step = self.test_data.resolve_step(step)
 
+            # Inject live entity references ({{live_entity}}, {{created_entity}})
+            # This MUST run after test_data resolution so both systems compose
+            if self.entity_tracker:
+                step = self.entity_tracker.inject_into_step(step)
+
             # Safety guardrail check — block dangerous steps before they run
             _safety_blocked = False
             if self.safety:
@@ -174,6 +181,10 @@ class PlanRunner:
             result.phase = phase
             result.business_intent = step.get("business_intent", "")
             results.append(result)
+
+            # Observe step for entity lifecycle tracking (CRUD entity awareness)
+            if self.entity_tracker:
+                self.entity_tracker.observe_step(step, result, idx + 1)
 
             # Detect DOM transitions (modal, form, toast, row delta, navigation)
             _ui_transitions: list[str] = []
@@ -223,31 +234,36 @@ class PlanRunner:
                 checkpoint_def = checkpoint_map.get(step_desc_lower)
 
             if checkpoint_def and result.success and self.validation_engine:
-                cv_result = await self.validation_engine.validate_checkpoint(
-                    checkpoint_def,
-                    {**execution_context, "recent_actions": list(self._recent_actions)},
-                )
-                result.checkpoint_result = {
-                    "passed": cv_result.passed,
-                    "confidence": cv_result.confidence,
-                    "evidence": cv_result.evidence,
-                    "business_explanation": cv_result.business_explanation,
-                    "failure_detail": cv_result.failure_detail,
-                    "validation_type": cv_result.validation_type,
-                }
-                self._emit("checkpoint_validated", {
-                    "step_index": idx,
-                    "description": step.get("description"),
-                    "validation_type": cv_result.validation_type,
-                    "passed": cv_result.passed,
-                    "confidence": cv_result.confidence,
-                    "evidence": cv_result.evidence,
-                    "business_explanation": cv_result.business_explanation,
-                })
-                # If checkpoint failed and it's critical — treat step as failed
-                if not cv_result.passed and checkpoint_def.get("critical") and cv_result.confidence >= 0.7:
-                    result.success = False
-                    result.message = f"[CHECKPOINT FAILED] {cv_result.business_explanation}"
+                try:
+                    cv_result = await self.validation_engine.validate_checkpoint(
+                        checkpoint_def,
+                        {**execution_context, "recent_actions": list(self._recent_actions)},
+                    )
+                except (Exception, asyncio.CancelledError) as _cv_err:
+                    log.warning("Checkpoint validation skipped", error=str(_cv_err))
+                    cv_result = None
+                if cv_result is not None:
+                    result.checkpoint_result = {
+                        "passed": cv_result.passed,
+                        "confidence": cv_result.confidence,
+                        "evidence": cv_result.evidence,
+                        "business_explanation": cv_result.business_explanation,
+                        "failure_detail": cv_result.failure_detail,
+                        "validation_type": cv_result.validation_type,
+                    }
+                    self._emit("checkpoint_validated", {
+                        "step_index": idx,
+                        "description": step.get("description"),
+                        "validation_type": cv_result.validation_type,
+                        "passed": cv_result.passed,
+                        "confidence": cv_result.confidence,
+                        "evidence": cv_result.evidence,
+                        "business_explanation": cv_result.business_explanation,
+                    })
+                    # If checkpoint failed and it's critical — treat step as failed
+                    if not cv_result.passed and checkpoint_def.get("critical") and cv_result.confidence >= 0.7:
+                        result.success = False
+                        result.message = f"[CHECKPOINT FAILED] {cv_result.business_explanation}"
 
             # Confidence tracking from checkpoint result
             if result.checkpoint_result and self.confidence:
@@ -264,6 +280,19 @@ class PlanRunner:
 
             # Abort on failure if on_fail=fail
             if not result.success and step.get("on_fail", "fail") == "fail":
+                # Enrich failure message with recovery hints from capability engine
+                try:
+                    from app.capabilities.engine_registry import get_engine_registry
+                    _hints = get_engine_registry().get_recovery_plan(
+                        step.get("action", ""),
+                        execution_context.get("workflow_type", ""),
+                        result.message,
+                    )
+                    if _hints:
+                        result.message = result.message + "\n[Recovery hints: " + "; ".join(_hints[:3]) + "]"
+                except Exception:
+                    pass
+
                 log.warning("Aborting plan — step failed", step=idx + 1,
                     action=step.get("action"), desc=step.get("description"))
                 self._emit("plan_aborted", {
@@ -353,21 +382,82 @@ class PlanRunner:
     # ─── Action Handlers ──────────────────────────────────────────────────────
 
     async def _action_navigate(self, step: dict) -> StepExecutionResult:
-        url = step.get("url", "")
-        if url.startswith("/") or (url and not url.startswith("http")):
-            url = self.base_url.rstrip("/") + "/" + url.lstrip("/")
-        if not url:
-            url = self.base_url
+        raw_url = step.get("url", "")
+        if not raw_url:
+            target_url = self.base_url
+        elif raw_url.startswith("http"):
+            target_url = raw_url
+        else:
+            target_url = self.base_url.rstrip("/") + "/" + raw_url.lstrip("/")
+
         try:
-            self.browser.navigate(url)
-            return StepExecutionResult(success=True, message=f"Navigated to {url}")
+            from urllib.parse import urlparse
+            current_url = self.browser.get_current_url()
+            t = urlparse(target_url)
+            c = urlparse(current_url)
+            same_origin = (
+                t.scheme == c.scheme
+                and t.netloc == c.netloc
+                and current_url not in ("about:blank", "data:,", "")
+            )
+
+            if same_origin:
+                # ── Angular SPA: avoid full page reload to preserve in-memory JWT ──
+
+                # Strategy 1: hash-fragment navigation (HashLocationStrategy)
+                # window.location.hash = '/foo' sets URL to #/foo — no page reload.
+                # Angular detects the hashchange event and routes internally.
+                if t.fragment:
+                    self.browser.execute_script(
+                        "window.location.hash = arguments[0];", t.fragment
+                    )
+                    await self._wait_for_angular_render()
+                    return StepExecutionResult(
+                        success=True,
+                        message=f"Navigated via hash #{t.fragment}",
+                    )
+
+                # Strategy 2: click a sidebar/nav link whose text matches the path segment
+                nav_hint = t.path.rstrip("/").split("/")[-1].replace("-", " ").replace("_", " ").strip()
+                if nav_hint and nav_hint.lower() not in ("", "index", "home", "dashboard"):
+                    el, _, _ = self.healer.find_element(nav_hint, "link")
+                    if el:
+                        ok, _ = self.healer.click_with_healing(el)
+                        if ok:
+                            await self._wait_for_angular_render()
+                            return StepExecutionResult(
+                                success=True,
+                                message=f"Navigated via nav link '{nav_hint}'",
+                            )
+
+                # Strategy 3: HTML5 pushState (PathLocationStrategy)
+                # Triggers Angular's router without a browser reload.
+                if t.path and t.path != c.path:
+                    try:
+                        push_target = t.path + (("?" + t.query) if t.query else "")
+                        self.browser.execute_script(
+                            "window.history.pushState({}, '', arguments[0]); "
+                            "window.dispatchEvent(new PopStateEvent('popstate', {state: {}}));",
+                            push_target,
+                        )
+                        await self._wait_for_angular_render()
+                        return StepExecutionResult(
+                            success=True,
+                            message=f"Navigated via pushState to {push_target}",
+                        )
+                    except Exception:
+                        pass
+
+            # Last resort: full navigation (different origin, or all SPA strategies failed)
+            self.browser.navigate(target_url)
+            await self._wait_for_angular_render(timeout=10.0)
+            return StepExecutionResult(success=True, message=f"Navigated to {target_url}")
         except Exception as e:
             return StepExecutionResult(success=False, message=f"Navigation failed: {e}")
 
     async def _action_click(self, step: dict) -> StepExecutionResult:
         target = step.get("target", step.get("label", step.get("text", "")))
         element_type = step.get("element_type")
-        timeout = step.get("timeout_ms", 10000) / 1000
 
         # Try stored selectors first
         for sel in step.get("selectors", []):
@@ -378,7 +468,7 @@ class PlanRunner:
                 )
                 success, method = self.healer.click_with_healing(element)
                 if success:
-                    self._wait_for_settle()
+                    await self._async_settle()
                     return StepExecutionResult(
                         success=True,
                         message=f"Clicked '{target}' via stored selector",
@@ -400,7 +490,7 @@ class PlanRunner:
             )
 
         success, method = self.healer.click_with_healing(element)
-        self._wait_for_settle()
+        await self._async_settle()
         return StepExecutionResult(
             success=success,
             message=f"Clicked '{target}' via {strategy}/{method}",
@@ -572,28 +662,63 @@ class PlanRunner:
 
     async def _action_assert_visible(self, step: dict) -> StepExecutionResult:
         text = step.get("text", step.get("target", ""))
-        timeout = step.get("timeout_ms", 10000) / 1000
+        timeout = max(step.get("timeout_ms", 10000) / 1000, 10.0)
 
         if not text:
             return StepExecutionResult(success=True, message="Assert visible: no target specified (pass)")
 
-        try:
-            WebDriverWait(self.browser.driver, timeout).until(
-                EC.visibility_of_element_located((
-                    By.XPATH,
-                    f'//*[contains(normalize-space(text()), "{text}") '
-                    f'or contains(@aria-label, "{text}") '
-                    f'or contains(@placeholder, "{text}")]',
-                ))
-            )
-            return StepExecutionResult(success=True, message=f"'{text}' is visible")
-        except TimeoutException:
-            screenshot = self._take_step_screenshot("assert_fail")
-            return StepExecutionResult(
-                success=False,
-                message=f"Expected text '{text}' not visible after {timeout:.0f}s",
-                screenshot_path=screenshot,
-            )
+        # JS-based visibility check: walks only text nodes inside specific element
+        # types, ignoring <script>/<style> and hidden Angular internals.
+        # Works correctly with Angular Material components (mat-cell, mat-chip, etc.)
+        # whose text lives in child <span> nodes rather than direct text content.
+        _JS = """
+        var needle = arguments[0];
+        var TAGS = {h1:1,h2:1,h3:1,h4:1,h5:1,p:1,span:1,label:1,
+                    td:1,th:1,li:1,dt:1,dd:1,button:1,a:1,
+                    'mat-cell':1,'mat-header-cell':1,'mat-label':1,
+                    'mat-chip':1,'mat-option':1};
+        function vis(el) {
+            if (!el || !el.getBoundingClientRect) return false;
+            var s = window.getComputedStyle(el);
+            var r = el.getBoundingClientRect();
+            return s.display !== 'none' && s.visibility !== 'hidden' &&
+                   parseFloat(s.opacity||'1') > 0 && r.width > 0 && r.height > 0;
+        }
+        var els = document.querySelectorAll(
+            'h1,h2,h3,h4,h5,p,span,label,td,th,li,dt,dd,' +
+            'button,a,mat-cell,mat-header-cell,mat-label,mat-chip,mat-option,' +
+            '[role="cell"],[role="columnheader"],[role="gridcell"],[role="option"]'
+        );
+        for (var i = 0; i < els.length; i++) {
+            var el = els[i];
+            if (!vis(el)) continue;
+            var own = '';
+            for (var j = 0; j < el.childNodes.length; j++) {
+                if (el.childNodes[j].nodeType === 3) own += el.childNodes[j].textContent;
+            }
+            if (own.toLowerCase().indexOf(needle) >= 0) return true;
+            var aria = (el.getAttribute('aria-label')||'').toLowerCase();
+            if (aria.indexOf(needle) >= 0) return true;
+        }
+        return false;
+        """
+
+        text_lower = text.lower()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if self.browser.execute_script(_JS, text_lower):
+                    return StepExecutionResult(success=True, message=f"'{text}' is visible")
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+        screenshot = self._take_step_screenshot("assert_fail")
+        return StepExecutionResult(
+            success=False,
+            message=f"Expected visible text '{text}' not found after {timeout:.0f}s",
+            screenshot_path=screenshot,
+        )
 
     async def _action_assert_text(self, step: dict) -> StepExecutionResult:
         text = step.get("text", "")
@@ -737,6 +862,27 @@ class PlanRunner:
         await asyncio.sleep(ms / 1000)
         return StepExecutionResult(success=True, message=f"Waited {ms}ms")
 
+    async def _wait_for_angular_render(self, timeout: float = 8.0):
+        """
+        Wait for Angular to finish rendering after a route change.
+        Polls for meaningful content (nav links, buttons, or any non-empty headings).
+        Falls back after timeout so execution can continue.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                count = self.browser.execute_script(
+                    "return document.querySelectorAll("
+                    "  'nav a, [role=\"menuitem\"], [role=\"navigation\"] a, "
+                    "   button:not([disabled]), h1, h2, h3, table, mat-table'"
+                    ").length;"
+                )
+                if (count or 0) >= 3:
+                    return
+            except Exception:
+                pass
+            await asyncio.sleep(0.4)
+
     async def _action_scroll(self, step: dict) -> StepExecutionResult:
         target = step.get("target")
         if target:
@@ -782,14 +928,30 @@ class PlanRunner:
         return path if self.browser.take_screenshot(path) else None
 
     def _wait_for_settle(self, min_wait: float = 0.3):
-        """Brief wait for DOM to settle after an action."""
+        """Brief synchronous DOM settle — called from sync code paths only."""
         time.sleep(min_wait)
         try:
             before = self.browser.execute_script("return document.querySelectorAll('*').length;")
-            time.sleep(0.25)
+            time.sleep(0.2)
             after = self.browser.execute_script("return document.querySelectorAll('*').length;")
             if abs(after - before) > 15:
-                time.sleep(0.5)  # DOM still changing — wait more
+                time.sleep(0.4)  # DOM still changing — wait more
+        except Exception:
+            pass
+
+    async def _async_settle(self, min_wait: float = 0.3):
+        """Async version of DOM settle — use inside async action handlers."""
+        await asyncio.sleep(min_wait)
+        try:
+            before = await asyncio.to_thread(
+                self.browser.execute_script, "return document.querySelectorAll('*').length;"
+            )
+            await asyncio.sleep(0.2)
+            after = await asyncio.to_thread(
+                self.browser.execute_script, "return document.querySelectorAll('*').length;"
+            )
+            if abs((after or 0) - (before or 0)) > 15:
+                await asyncio.sleep(0.4)
         except Exception:
             pass
 

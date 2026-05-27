@@ -45,7 +45,7 @@ class SelfHealingEngine:
     """
 
     MAX_ATTEMPTS_PER_STRATEGY = 3
-    STRATEGY_TIMEOUT = 5.0
+    STRATEGY_TIMEOUT = 3.0   # reduced from 5s — 8 strategies × 3s = 24s max per lookup
 
     def __init__(self, driver):
         self.driver = driver
@@ -63,21 +63,57 @@ class SelfHealingEngine:
         strategies = self._build_strategies(semantic_label, element_type)
         attempts = []
 
+        # Fast-path: try all strategies with 0 wait first (DOM snapshot check).
+        # If the element is already rendered we find it instantly instead of
+        # burning STRATEGY_TIMEOUT per strategy just to confirm it exists.
+        for strategy_name, by, value in strategies:
+            try:
+                elements = self.driver.find_elements(by, value)
+                for el in elements:
+                    try:
+                        if el.is_displayed() or el.is_enabled():
+                            attempts.append(HealingAttempt(
+                                strategy=f"{strategy_name}_fast",
+                                selector_type=by,
+                                selector_value=value,
+                                success=True,
+                                reason="Instant DOM hit",
+                                duration_ms=0,
+                            ))
+                            log.debug("Element found (fast path)", strategy=strategy_name, label=semantic_label)
+                            return el, strategy_name, attempts
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
         for strategy_name, by, value in strategies:
             start = time.monotonic()
             try:
                 element = WebDriverWait(self.driver, self.STRATEGY_TIMEOUT).until(
                     EC.presence_of_element_located((by, value))
                 )
-                # Verify it's visible and interactable
-                if element.is_displayed():
+                # Accept if visible OR if enabled (Angular Material hides actual inputs
+                # behind mat-form-field while keeping them interactable via JS).
+                visible = False
+                try:
+                    visible = element.is_displayed()
+                except Exception:
+                    pass
+                enabled = False
+                try:
+                    enabled = element.is_enabled()
+                except Exception:
+                    pass
+
+                if visible or enabled:
                     duration = int((time.monotonic() - start) * 1000)
                     attempts.append(HealingAttempt(
                         strategy=strategy_name,
                         selector_type=by,
                         selector_value=value,
                         success=True,
-                        reason="Located and visible",
+                        reason="Located and interactable",
                         duration_ms=duration,
                     ))
                     log.debug("Element found", strategy=strategy_name, label=semantic_label)

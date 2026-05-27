@@ -10,11 +10,13 @@ import {
   scenarios as scenariosApi,
   explore as exploreApi,
   reports as reportsApi,
+  executions as executionsApi,
   type Application,
   type Scenario,
   type ExploreSession,
   type ReportSummary,
   type BatchRun,
+  type BatchHistory,
 } from '@/lib/api';
 import { getSocket } from '@/lib/websocket';
 
@@ -43,6 +45,8 @@ export default function WorkspacePage() {
 
   // Batch run
   const [runningModuleId, setRunningModuleId] = useState<string | null>(null);
+  // Pre-loaded environment — avoids an extra API call on every "Run All" click
+  const [cachedEnv, setCachedEnv] = useState<{ id: string } | null>(null);
 
   // Document upload modal
   const [docUploadOpen, setDocUploadOpen] = useState(false);
@@ -54,7 +58,7 @@ export default function WorkspacePage() {
 
   // Explore
   const [startingExplore, setStartingExplore] = useState(false);
-  const [exploreMode, setExploreMode] = useState<'FULL' | 'SMART' | 'SKIP'>('SMART');
+  const [exploreMode, setExploreMode] = useState<'SMART' | 'SKIP'>('SMART');
 
   // Settings
   const [settingsDesc, setSettingsDesc] = useState('');
@@ -102,6 +106,7 @@ export default function WorkspacePage() {
       setSettingsUsername('');
       setSettingsPassword('');
       setSettingsSaved(false);
+      loadEnv(selectedApp.id);
     }
   }, [selectedApp?.id]);
 
@@ -117,13 +122,25 @@ export default function WorkspacePage() {
 
       if (target) {
         setSelectedApp(target);
-        await Promise.all([loadScenarios(target.id), loadReports(target.id)]);
+        await Promise.all([
+          loadScenarios(target.id),
+          loadReports(target.id),
+          loadEnv(target.id),
+        ]);
       }
     } catch (e) {
       console.error('Failed to load workspace data', e);
     } finally {
       setLoading(false);
     }
+  };
+
+  const loadEnv = async (appId: string) => {
+    try {
+      const envs = await appApi.listEnvironments(appId);
+      const env = envs.find((e) => e.is_default) || envs[0];
+      setCachedEnv(env ? { id: env.id } : null);
+    } catch { setCachedEnv(null); }
   };
 
   const loadScenarios = async (appId: string) => {
@@ -185,23 +202,52 @@ export default function WorkspacePage() {
   const handleRunModule = async (scenarioIds: string[], moduleKey: string) => {
     if (!selectedApp || scenarioIds.length === 0) return;
     setRunningModuleId(moduleKey);
-    try {
-      const envs = await appApi.listEnvironments(selectedApp.id);
-      const env = envs.find((e) => e.is_default) || envs[0];
-      if (!env) throw new Error('No environment configured');
 
+    // Use pre-loaded env — avoids a blocking API call on every Run All click
+    let envId = cachedEnv?.id;
+    if (!envId) {
+      try {
+        const envs = await appApi.listEnvironments(selectedApp.id);
+        const env = envs.find((e) => e.is_default) || envs[0];
+        if (!env) { toast.error('No environment configured'); setRunningModuleId(null); return; }
+        envId = env.id;
+        setCachedEnv({ id: env.id });
+      } catch (e) {
+        toast.error('Could not load environment');
+        setRunningModuleId(null);
+        return;
+      }
+    }
+
+    try {
       const result = await scenariosApi.runBatch({
         scenario_ids: scenarioIds,
         execution_mode: executionMode,
-        environment_id: env.id,
+        environment_id: envId,
       });
 
-      const firstRun = result.runs.find((r: { run_id?: string }) => r.run_id);
-      if (firstRun?.run_id) {
-        router.push(`/workspaces/${workspaceId}/executions/${firstRun.run_id}`);
-      } else {
+      const validRuns = result.runs.filter((r: { run_id?: string }) => r.run_id);
+      if (validRuns.length === 0) {
         const firstError = result.runs.find((r: { error?: string }) => r.error);
         toast.error(`All runs failed: ${firstError?.error || 'Unknown error'}`);
+        return;
+      }
+
+      // Navigate immediately — execution already started in the background
+      if (validRuns.length === 1) {
+        router.push(`/workspaces/${workspaceId}/executions/${validRuns[0].run_id}`);
+      } else {
+        const batchId = (result as { batch_id?: string }).batch_id;
+        if (batchId) {
+          router.push(`/workspaces/${workspaceId}/executions/batch?batch_id=${batchId}`);
+        } else {
+          // Fallback: encode data directly (small batches only)
+          const batchData = (validRuns as Array<{ run_id: string; title: string }>).map((r) => ({
+            run_id: r.run_id,
+            title: r.title,
+          }));
+          router.push(`/workspaces/${workspaceId}/executions/batch?data=${encodeURIComponent(JSON.stringify(batchData))}`);
+        }
       }
     } catch (e) {
       console.error('Failed to run module', e);
@@ -217,6 +263,29 @@ export default function WorkspacePage() {
       setScenarios((s) => s.filter((sc) => sc.id !== id));
     } catch (e) {
       console.error('Failed to delete scenario', e);
+    }
+  };
+
+  const handleUpdateScenario = async (id: string, data: { title?: string; description?: string; priority?: string; tags?: string[] }) => {
+    try {
+      const updated = await scenariosApi.update(id, data);
+      setScenarios((s) => s.map((sc) => sc.id === id ? { ...sc, ...updated } : sc));
+    } catch (e) {
+      console.error('Failed to update scenario', e);
+    }
+  };
+
+  const handleDeleteModule = async (moduleId: string | null) => {
+    if (!selectedApp) return;
+    try {
+      await scenariosApi.deleteByModule(selectedApp.id, moduleId);
+      if (moduleId && moduleId !== '__none__') {
+        setScenarios((s) => s.filter((sc) => sc.module_id !== moduleId));
+      } else {
+        setScenarios((s) => s.filter((sc) => sc.module_id != null));
+      }
+    } catch (e) {
+      console.error('Failed to delete module scenarios', e);
     }
   };
 
@@ -460,6 +529,8 @@ export default function WorkspacePage() {
                     onRunScenario={handleGenerateAndRun}
                     onRunModule={handleRunModule}
                     onDeleteScenario={handleDeleteScenario}
+                    onUpdateScenario={handleUpdateScenario}
+                    onDeleteModule={handleDeleteModule}
                     onOpenDocUpload={() => { setDocUploadResult(null); setDocUploadOpen(true); }}
                     creating={creatingScenario}
                     runningId={generatingPlan ? selectedScenarioId : null}
@@ -479,34 +550,82 @@ export default function WorkspacePage() {
                         </div>
 
                         <div className="p-6 space-y-4">
-                          <div>
-                            <label className="block text-xs font-medium text-zinc-400 mb-1.5">
-                              Module Name <span className="text-red-400">*</span>
-                            </label>
-                            <input
-                              type="text"
-                              value={docModuleName}
-                              onChange={(e) => setDocModuleName(e.target.value)}
-                              placeholder="e.g. Samples & Receipts"
-                              className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                            />
-                          </div>
+                          {(() => {
+                            const existingModules = [
+                              ...new Map(
+                                scenarios
+                                  .filter((s) => s.module_name)
+                                  .map((s) => [s.module_name, s.module_url ?? ''])
+                              ).entries(),
+                            ].map(([name, url]) => ({ name: name!, url }));
+                            return (
+                              <>
+                                <div>
+                                  <label className="block text-xs font-medium text-zinc-400 mb-1.5">
+                                    Module Name <span className="text-red-400">*</span>
+                                  </label>
+                                  {existingModules.length > 0 ? (
+                                    <>
+                                      <select
+                                        value={existingModules.some((m) => m.name === docModuleName) ? docModuleName : '__new__'}
+                                        onChange={(e) => {
+                                          if (e.target.value === '__new__') {
+                                            setDocModuleName('');
+                                            setDocModuleUrl('');
+                                          } else {
+                                            const found = existingModules.find((m) => m.name === e.target.value);
+                                            if (found) {
+                                              setDocModuleName(found.name);
+                                              setDocModuleUrl(found.url);
+                                            }
+                                          }
+                                        }}
+                                        className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500 mb-2"
+                                      >
+                                        <option value="__new__">— New module —</option>
+                                        {existingModules.map((m) => (
+                                          <option key={m.name} value={m.name}>{m.name}</option>
+                                        ))}
+                                      </select>
+                                      {(!existingModules.some((m) => m.name === docModuleName) || docModuleName === '') && (
+                                        <input
+                                          type="text"
+                                          value={docModuleName}
+                                          onChange={(e) => setDocModuleName(e.target.value)}
+                                          placeholder="Enter new module name…"
+                                          className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                        />
+                                      )}
+                                    </>
+                                  ) : (
+                                    <input
+                                      type="text"
+                                      value={docModuleName}
+                                      onChange={(e) => setDocModuleName(e.target.value)}
+                                      placeholder="e.g. Samples & Receipts"
+                                      className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    />
+                                  )}
+                                </div>
 
-                          <div>
-                            <label className="block text-xs font-medium text-zinc-400 mb-1.5">
-                              Module URL <span className="text-red-400">*</span>
-                            </label>
-                            <input
-                              type="text"
-                              value={docModuleUrl}
-                              onChange={(e) => setDocModuleUrl(e.target.value)}
-                              placeholder="e.g. http://ylims.app/#/samples"
-                              className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                            />
-                            <p className="text-xs text-zinc-600 mt-1">
-                              After login, the executor will navigate here before running each scenario.
-                            </p>
-                          </div>
+                                <div>
+                                  <label className="block text-xs font-medium text-zinc-400 mb-1.5">
+                                    Module URL <span className="text-red-400">*</span>
+                                  </label>
+                                  <input
+                                    type="text"
+                                    value={docModuleUrl}
+                                    onChange={(e) => setDocModuleUrl(e.target.value)}
+                                    placeholder="e.g. http://ylims.app/#/samples"
+                                    className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                  />
+                                  <p className="text-xs text-zinc-600 mt-1">
+                                    After login, the executor will navigate here before running each scenario.
+                                  </p>
+                                </div>
+                              </>
+                            );
+                          })()}
 
                           <div>
                             <label className="block text-xs font-medium text-zinc-400 mb-1.5">
@@ -567,8 +686,8 @@ export default function WorkspacePage() {
                   )}
                 </>
               )}
-              {tab === 'reports' && (
-                <ReportsTab reports={reports} workspaceId={workspaceId} />
+              {tab === 'reports' && selectedApp && (
+                <ReportsTab reports={reports} workspaceId={workspaceId} appId={selectedApp.id} />
               )}
               {tab === 'settings' && (
                 <SettingsTab
@@ -696,14 +815,13 @@ function OverviewTab({ app, scenarios, reports, onRunScenario, onExploreClick, o
 
 function ExploreTab({ app, exploreMode, setExploreMode, onStart, loading }: {
   app: Application;
-  exploreMode: 'FULL' | 'SMART' | 'SKIP';
-  setExploreMode: (m: 'FULL' | 'SMART' | 'SKIP') => void;
+  exploreMode: 'SMART' | 'SKIP';
+  setExploreMode: (m: 'SMART' | 'SKIP') => void;
   onStart: () => void;
   loading: boolean;
 }) {
   const modes = [
-    { id: 'FULL' as const, icon: '🔍', title: 'Full Explore', desc: 'Complete application mapping — all modules, pages, forms, workflows', time: '15–45 min' },
-    { id: 'SMART' as const, icon: '⚡', title: 'Smart Explore', desc: 'Major modules and workflows only — faster but comprehensive', time: '5–15 min' },
+    { id: 'SMART' as const, icon: '🔍', title: 'Smart Explore', desc: 'Complete application mapping — clicks every module, sub-module, and link. Builds full knowledge graph including forms, workflows, and test scenarios.', time: '15–45 min' },
     { id: 'SKIP' as const, icon: '🎯', title: 'Skip Explore', desc: 'Semantic runtime reasoning — no pre-exploration needed', time: 'Instant' },
   ];
 
@@ -752,10 +870,157 @@ function ExploreTab({ app, exploreMode, setExploreMode, onStart, loading }: {
 
 // ─── Scenarios Tab ────────────────────────────────────────────────────────────
 
+function ScenarioViewModal({ scenario, onClose, onEdit }: { scenario: Scenario; onClose: () => void; onEdit: () => void }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm" onClick={onClose}>
+      <div className="bg-zinc-900 border border-zinc-700 rounded-2xl w-full max-w-2xl max-h-[85vh] flex flex-col shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-start justify-between px-6 py-4 border-b border-zinc-800">
+          <div className="flex-1 min-w-0 pr-4">
+            <div className="flex items-center gap-2 flex-wrap mb-1">
+              <PriorityBadge priority={scenario.priority} />
+              <SourceBadge source={scenario.source} />
+              {scenario.module_name && (
+                <span className="text-xs bg-zinc-700/60 text-zinc-400 px-2 py-0.5 rounded-full">{scenario.module_name}</span>
+              )}
+            </div>
+            <h2 className="text-lg font-semibold text-white leading-snug">{scenario.title}</h2>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button onClick={onEdit} className="flex items-center gap-1.5 text-xs px-3 py-1.5 bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-600/30 rounded-lg transition-colors">
+              ✏️ Edit
+            </button>
+            <button onClick={onClose} className="text-zinc-500 hover:text-white transition-colors text-xl leading-none px-1">✕</button>
+          </div>
+        </div>
+        <div className="overflow-y-auto flex-1 px-6 py-5 space-y-5">
+          {scenario.description ? (
+            <div>
+              <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wide mb-2">Description / Steps</h3>
+              <div className="text-sm text-zinc-300 whitespace-pre-wrap bg-zinc-800/50 rounded-xl p-4 border border-zinc-700/50 leading-relaxed">
+                {scenario.description}
+              </div>
+            </div>
+          ) : (
+            <p className="text-sm text-zinc-600 italic">No description provided.</p>
+          )}
+          {scenario.tags && scenario.tags.length > 0 && (
+            <div>
+              <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wide mb-2">Tags</h3>
+              <div className="flex flex-wrap gap-1.5">
+                {scenario.tags.map((tag) => (
+                  <span key={tag} className="text-xs bg-zinc-700/60 text-zinc-400 px-2 py-0.5 rounded-full">{tag}</span>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="text-xs text-zinc-600">
+            Created {scenario.created_at ? new Date(scenario.created_at).toLocaleString() : '—'}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ScenarioEditModal({ scenario, onClose, onSave }: {
+  scenario: Scenario;
+  onClose: () => void;
+  onSave: (id: string, data: { title: string; description: string; priority: string; tags: string[] }) => Promise<void>;
+}) {
+  const [title, setTitle] = useState(scenario.title);
+  const [description, setDescription] = useState(scenario.description || '');
+  const [priority, setPriority] = useState<string>(scenario.priority);
+  const [tagsInput, setTagsInput] = useState((scenario.tags || []).join(', '));
+  const [saving, setSaving] = useState(false);
+
+  const handleSave = async () => {
+    if (!title.trim()) return;
+    setSaving(true);
+    try {
+      await onSave(scenario.id, {
+        title: title.trim(),
+        description: description.trim(),
+        priority,
+        tags: tagsInput.split(',').map((t) => t.trim()).filter(Boolean),
+      });
+      onClose();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm" onClick={onClose}>
+      <div className="bg-zinc-900 border border-zinc-700 rounded-2xl w-full max-w-2xl max-h-[90vh] flex flex-col shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-800">
+          <h2 className="text-base font-semibold text-white">Edit Scenario</h2>
+          <button onClick={onClose} className="text-zinc-500 hover:text-white transition-colors text-xl leading-none px-1">✕</button>
+        </div>
+        <div className="overflow-y-auto flex-1 px-6 py-5 space-y-4">
+          <div>
+            <label className="text-xs font-medium text-zinc-400 uppercase tracking-wide block mb-1.5">Title</label>
+            <input
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+          <div>
+            <label className="text-xs font-medium text-zinc-400 uppercase tracking-wide block mb-1.5">Description / Steps</label>
+            <textarea
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              rows={10}
+              className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y font-mono leading-relaxed"
+              placeholder="Describe the test steps and expected outcome…"
+            />
+          </div>
+          <div className="flex gap-4">
+            <div className="flex-1">
+              <label className="text-xs font-medium text-zinc-400 uppercase tracking-wide block mb-1.5">Priority</label>
+              <select
+                value={priority}
+                onChange={(e) => setPriority(e.target.value)}
+                className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2.5 text-zinc-300 text-sm focus:outline-none"
+              >
+                <option value="CRITICAL">Critical</option>
+                <option value="HIGH">High</option>
+                <option value="MEDIUM">Medium</option>
+                <option value="LOW">Low</option>
+              </select>
+            </div>
+            <div className="flex-1">
+              <label className="text-xs font-medium text-zinc-400 uppercase tracking-wide block mb-1.5">Tags (comma-separated)</label>
+              <input
+                value={tagsInput}
+                onChange={(e) => setTagsInput(e.target.value)}
+                className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                placeholder="smoke, regression, critical-path"
+              />
+            </div>
+          </div>
+        </div>
+        <div className="flex justify-end gap-3 px-6 py-4 border-t border-zinc-800">
+          <button onClick={onClose} className="px-4 py-2 text-sm text-zinc-400 hover:text-white transition-colors">Cancel</button>
+          <button
+            onClick={handleSave}
+            disabled={saving || !title.trim()}
+            className="px-5 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg transition-colors disabled:opacity-50 flex items-center gap-2"
+          >
+            {saving && <div className="animate-spin w-3.5 h-3.5 border border-white border-t-transparent rounded-full" />}
+            {saving ? 'Saving…' : 'Save Changes'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ScenariosTab({
   app, scenarios, newTitle, setNewTitle, priority, setPriority,
   executionMode, setExecutionMode, onCreateScenario, onRunScenario,
-  onRunModule, onDeleteScenario, onOpenDocUpload, creating, runningId, runningModuleId,
+  onRunModule, onDeleteScenario, onUpdateScenario, onDeleteModule, onOpenDocUpload,
+  creating, runningId, runningModuleId,
 }: {
   app: Application;
   scenarios: Scenario[];
@@ -769,14 +1034,18 @@ function ScenariosTab({
   onRunScenario: (id: string) => void;
   onRunModule: (ids: string[], moduleKey: string) => void;
   onDeleteScenario: (id: string) => void;
+  onUpdateScenario: (id: string, data: { title?: string; description?: string; priority?: string; tags?: string[] }) => Promise<void>;
+  onDeleteModule: (moduleId: string | null) => Promise<void>;
   onOpenDocUpload: () => void;
   creating: boolean;
   runningId: string | null;
   runningModuleId: string | null;
 }) {
   const [search, setSearch] = useState('');
+  const [viewScenario, setViewScenario] = useState<Scenario | null>(null);
+  const [editScenario, setEditScenario] = useState<Scenario | null>(null);
+  const [deletingModuleId, setDeletingModuleId] = useState<string | null>(null);
 
-  // Group scenarios by module_name (null = ungrouped)
   const filtered = search.trim()
     ? scenarios.filter((s) =>
         s.title.toLowerCase().includes(search.toLowerCase()) ||
@@ -799,8 +1068,39 @@ function ScenariosTab({
     moduleMap.get(key)!.items.push(s);
   }
 
+  const handleDeleteModule = async (moduleId: string | null) => {
+    const key = moduleId || '__none__';
+    if (!window.confirm(`Delete all ${moduleMap.get(key)?.items.length ?? 0} scenarios in this group?`)) return;
+    setDeletingModuleId(key);
+    try {
+      await onDeleteModule(moduleId);
+    } finally {
+      setDeletingModuleId(null);
+    }
+  };
+
   return (
     <div>
+      {/* View modal */}
+      {viewScenario && !editScenario && (
+        <ScenarioViewModal
+          scenario={viewScenario}
+          onClose={() => setViewScenario(null)}
+          onEdit={() => { setEditScenario(viewScenario); setViewScenario(null); }}
+        />
+      )}
+      {/* Edit modal */}
+      {editScenario && (
+        <ScenarioEditModal
+          scenario={editScenario}
+          onClose={() => setEditScenario(null)}
+          onSave={async (id, data) => {
+            await onUpdateScenario(id, data);
+            setEditScenario(null);
+          }}
+        />
+      )}
+
       {/* Header */}
       <div className="flex items-center justify-between mb-6">
         <div>
@@ -935,16 +1235,29 @@ function ScenariosTab({
                     </>
                   )}
                 </div>
-                <button
-                  onClick={() => onRunModule(group.items.map((s) => s.id), group.moduleId || '__ungrouped__')}
-                  disabled={!!runningModuleId}
-                  className="flex items-center gap-1.5 text-xs px-3 py-1.5 bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-600/30 rounded-lg transition-colors disabled:opacity-50 shrink-0 ml-4"
-                >
-                  {runningModuleId === (group.moduleId || '__ungrouped__') ? (
-                    <div className="animate-spin w-3 h-3 border border-blue-300 border-t-transparent rounded-full" />
-                  ) : '▶'}
-                  {runningModuleId === (group.moduleId || '__ungrouped__') ? ' Starting…' : ' Run All'}
-                </button>
+                <div className="flex items-center gap-2 shrink-0 ml-4">
+                  <button
+                    onClick={() => onRunModule(group.items.map((s) => s.id), group.moduleId || '__ungrouped__')}
+                    disabled={!!runningModuleId}
+                    className="flex items-center gap-1.5 text-xs px-3 py-1.5 bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-600/30 rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    {runningModuleId === (group.moduleId || '__ungrouped__') ? (
+                      <div className="animate-spin w-3 h-3 border border-blue-300 border-t-transparent rounded-full" />
+                    ) : '▶'}
+                    {runningModuleId === (group.moduleId || '__ungrouped__') ? ' Starting…' : ' Run All'}
+                  </button>
+                  <button
+                    onClick={() => handleDeleteModule(group.moduleId)}
+                    disabled={deletingModuleId === (group.moduleId || '__none__')}
+                    className="flex items-center gap-1.5 text-xs px-3 py-1.5 bg-red-600/10 hover:bg-red-600/20 text-red-400 border border-red-600/20 rounded-lg transition-colors disabled:opacity-50"
+                    title="Delete all scenarios in this group"
+                  >
+                    {deletingModuleId === (group.moduleId || '__none__') ? (
+                      <div className="animate-spin w-3 h-3 border border-red-400 border-t-transparent rounded-full" />
+                    ) : '🗑'}
+                    Delete All
+                  </button>
+                </div>
               </div>
 
               {/* Scenario rows */}
@@ -961,6 +1274,22 @@ function ScenariosTab({
                       )}
                     </div>
                     <PriorityBadge priority={s.priority} />
+                    {/* View */}
+                    <button
+                      onClick={() => setViewScenario(s)}
+                      className="text-zinc-600 hover:text-blue-400 transition-colors opacity-0 group-hover:opacity-100 text-sm px-1 shrink-0"
+                      title="View full scenario"
+                    >
+                      👁
+                    </button>
+                    {/* Edit */}
+                    <button
+                      onClick={() => setEditScenario(s)}
+                      className="text-zinc-600 hover:text-yellow-400 transition-colors opacity-0 group-hover:opacity-100 text-sm px-1 shrink-0"
+                      title="Edit scenario"
+                    >
+                      ✏️
+                    </button>
                     <button
                       onClick={() => onRunScenario(s.id)}
                       disabled={runningId === s.id}
@@ -971,6 +1300,7 @@ function ScenariosTab({
                       )}
                       {runningId === s.id ? 'Planning…' : 'Run'}
                     </button>
+                    {/* Delete */}
                     <button
                       onClick={() => onDeleteScenario(s.id)}
                       className="text-zinc-600 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100 text-sm px-1 shrink-0"
@@ -991,40 +1321,256 @@ function ScenariosTab({
 
 // ─── Reports Tab ──────────────────────────────────────────────────────────────
 
-function ReportsTab({ reports, workspaceId }: { reports: ReportSummary[]; workspaceId: string }) {
+function ReportsTab({
+  reports,
+  workspaceId,
+  appId,
+}: {
+  reports: ReportSummary[];
+  workspaceId: string;
+  appId: string;
+}) {
+  const router = useRouter();
+  const [view, setView] = useState<'reports' | 'history'>('reports');
+  const [history, setHistory] = useState<BatchHistory[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [expandedBatch, setExpandedBatch] = useState<string | null>(null);
+
+  const loadHistory = async () => {
+    setHistoryLoading(true);
+    try {
+      const data = await executionsApi.batchHistory(appId, 30);
+      setHistory(data);
+    } catch { setHistory([]); }
+    finally { setHistoryLoading(false); }
+  };
+
+  useEffect(() => {
+    if (view === 'history') loadHistory();
+  }, [view]);
+
+  const openBatchDetail = (batch: BatchHistory) => {
+    router.push(
+      `/workspaces/${workspaceId}/executions/batch?batch_id=${batch.batch_id}`
+    );
+  };
+
+  const passRate = (b: BatchHistory) =>
+    b.total > 0 ? Math.round((b.passed / b.total) * 100) : 0;
+
   return (
     <div>
-      <h1 className="text-2xl font-bold text-white mb-6">Execution Reports</h1>
-      {reports.length === 0 ? (
-        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-10 text-center text-zinc-500">
-          No reports yet. Run some scenarios to see AI-native reports here.
+      {/* Header + toggle */}
+      <div className="flex items-center justify-between mb-6">
+        <h1 className="text-2xl font-bold text-white">Execution Reports</h1>
+        <div className="flex bg-zinc-800 rounded-lg p-1 gap-1">
+          <button
+            onClick={() => setView('reports')}
+            className={`px-4 py-1.5 text-sm rounded-md transition-colors font-medium ${
+              view === 'reports' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            AI Reports
+          </button>
+          <button
+            onClick={() => setView('history')}
+            className={`px-4 py-1.5 text-sm rounded-md transition-colors font-medium ${
+              view === 'history' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            Run History
+          </button>
         </div>
-      ) : (
-        <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
-          <div className="divide-y divide-zinc-800">
-            {reports.map((r) => (
-              <Link
-                key={r.id}
-                href={`/workspaces/${workspaceId}/executions/${r.run_id}`}
-                className="flex items-center gap-4 px-5 py-4 hover:bg-zinc-800/50 transition-colors"
-              >
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm text-zinc-300 truncate">{r.scenario_title}</div>
-                  <div className="text-xs text-zinc-600">{new Date(r.created_at).toLocaleString()}</div>
-                </div>
-                <span className={`text-xs px-2 py-0.5 rounded-full ${
-                  r.risk_level === 'LOW' ? 'bg-green-500/20 text-green-400' :
-                  r.risk_level === 'MEDIUM' ? 'bg-amber-500/20 text-amber-400' :
-                  'bg-red-500/20 text-red-400'
-                }`}>
-                  {r.risk_level}
-                </span>
-                <span className="text-sm font-medium text-white">{r.quality_score?.toFixed(0) || '-'}</span>
-                <span className="text-xs text-zinc-600">/ 100</span>
-              </Link>
-            ))}
+      </div>
+
+      {/* ── AI Reports view ───────────────────────────────────────── */}
+      {view === 'reports' && (
+        reports.length === 0 ? (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-10 text-center text-zinc-500">
+            No reports yet. Run some scenarios to see AI-native reports here.
           </div>
-        </div>
+        ) : (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
+            <div className="divide-y divide-zinc-800">
+              {reports.map((r) => {
+                const s = r.summary;
+                const passRate = s.pass_rate ?? (s.total ? Math.round(((s.passed ?? 0) / s.total) * 100) : null);
+                const checkpointInfo = s.checkpoints_total
+                  ? `${s.checkpoints_passed ?? 0}/${s.checkpoints_total} checkpoints`
+                  : null;
+                return (
+                  <Link
+                    key={r.id}
+                    href={`/workspaces/${workspaceId}/executions/${r.run_id}`}
+                    className="flex items-start gap-4 px-5 py-4 hover:bg-zinc-800/50 transition-colors"
+                  >
+                    {/* Status dot */}
+                    <div className={`w-2 h-2 rounded-full mt-1.5 shrink-0 ${
+                      r.run_status === 'COMPLETED' ? 'bg-green-500' :
+                      r.run_status === 'FAILED' ? 'bg-red-500' : 'bg-zinc-500'
+                    }`} />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium text-zinc-300 truncate">{r.scenario_title}</div>
+                      <div className="flex items-center gap-3 mt-1 flex-wrap">
+                        <span className="text-xs text-zinc-600">
+                          {new Date(r.created_at).toLocaleString(undefined, {
+                            month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+                          })}
+                        </span>
+                        {s.workflow_type && (
+                          <span className="text-xs text-zinc-600 bg-zinc-800 px-1.5 py-0.5 rounded">{s.workflow_type}</span>
+                        )}
+                        {s.total != null && (
+                          <span className="text-xs text-zinc-500">{s.passed}/{s.total} steps</span>
+                        )}
+                        {checkpointInfo && (
+                          <span className="text-xs text-zinc-500">{checkpointInfo}</span>
+                        )}
+                        {(s.phases_failed?.length ?? 0) > 0 && (
+                          <span className="text-xs text-red-400/70">{s.phases_failed!.join(', ')} failed</span>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3 shrink-0">
+                      {passRate !== null && (
+                        <div className="text-right">
+                          <div className={`text-sm font-bold tabular-nums ${
+                            passRate === 100 ? 'text-green-400' : passRate >= 50 ? 'text-amber-400' : 'text-red-400'
+                          }`}>{passRate}%</div>
+                          <div className="text-xs text-zinc-600">pass rate</div>
+                        </div>
+                      )}
+                      <div className="text-right">
+                        <div className="text-sm font-bold text-white tabular-nums">{r.quality_score?.toFixed(0) ?? '–'}</div>
+                        <div className="text-xs text-zinc-600">/ 100</div>
+                      </div>
+                      <span className={`text-xs px-2 py-0.5 rounded-full ${
+                        r.risk_level === 'LOW' ? 'bg-green-500/20 text-green-400' :
+                        r.risk_level === 'MEDIUM' ? 'bg-amber-500/20 text-amber-400' :
+                        'bg-red-500/20 text-red-400'
+                      }`}>
+                        {r.risk_level ?? 'LOW'}
+                      </span>
+                    </div>
+                  </Link>
+                );
+              })}
+            </div>
+          </div>
+        )
+      )}
+
+      {/* ── Run History view ──────────────────────────────────────── */}
+      {view === 'history' && (
+        historyLoading ? (
+          <div className="flex items-center justify-center py-20">
+            <div className="w-6 h-6 border-2 border-blue-500/40 border-t-blue-500 rounded-full animate-spin" />
+          </div>
+        ) : history.length === 0 ? (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-10 text-center text-zinc-500">
+            No batch execution history yet. Click "Run All" on a module to start.
+          </div>
+        ) : (
+          <div className="flex flex-col gap-3">
+            {history.map((batch) => {
+              const rate = passRate(batch);
+              const isExpanded = expandedBatch === batch.batch_id;
+              const isRunning = batch.running > 0;
+              return (
+                <div
+                  key={batch.batch_id}
+                  className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden"
+                >
+                  {/* Batch summary row */}
+                  <div className="flex items-center gap-4 px-5 py-4">
+                    <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                      isRunning ? 'bg-blue-500 animate-pulse' :
+                      batch.failed === 0 ? 'bg-green-500' :
+                      batch.passed === 0 ? 'bg-red-500' : 'bg-amber-500'
+                    }`} />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium text-zinc-200">
+                        {new Date(batch.started_at).toLocaleString(undefined, {
+                          month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+                        })}
+                      </div>
+                      <div className="text-xs text-zinc-500 mt-0.5">
+                        {batch.total} scenarios · {batch.passed} passed · {batch.failed} failed
+                        {isRunning ? ` · ${batch.running} running` : ''}
+                      </div>
+                    </div>
+
+                    {/* Pass rate bar */}
+                    <div className="hidden sm:flex items-center gap-2 w-32">
+                      <div className="flex-1 h-1.5 bg-zinc-800 rounded-full overflow-hidden flex">
+                        <div className="bg-green-500 h-full" style={{ width: `${rate}%` }} />
+                        <div className="bg-red-500 h-full" style={{ width: `${batch.total > 0 ? (batch.failed / batch.total) * 100 : 0}%` }} />
+                      </div>
+                      <span className={`text-xs font-medium tabular-nums w-8 text-right ${
+                        rate === 100 ? 'text-green-400' : rate >= 50 ? 'text-amber-400' : 'text-red-400'
+                      }`}>{rate}%</span>
+                    </div>
+
+                    {/* Actions */}
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        onClick={() => setExpandedBatch(isExpanded ? null : batch.batch_id)}
+                        className="text-xs text-zinc-400 hover:text-zinc-200 transition-colors px-2 py-1 rounded hover:bg-zinc-800"
+                      >
+                        {isExpanded ? 'Hide' : 'Details'}
+                      </button>
+                      <button
+                        onClick={() => openBatchDetail(batch)}
+                        className="text-xs bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded-lg transition-colors font-medium"
+                      >
+                        View Full Report
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Expanded scenario list */}
+                  {isExpanded && (
+                    <div className="border-t border-zinc-800 divide-y divide-zinc-800/60">
+                      {batch.runs.map((run) => {
+                        const stepRate = run.total_steps > 0
+                          ? Math.round((run.passed_steps / run.total_steps) * 100)
+                          : null;
+                        return (
+                          <div
+                            key={run.run_id}
+                            className="flex items-center gap-3 px-6 py-3 hover:bg-zinc-800/30 transition-colors cursor-pointer"
+                            onClick={() => router.push(`/workspaces/${workspaceId}/executions/${run.run_id}`)}
+                          >
+                            <div className={`w-2 h-2 rounded-full shrink-0 ${
+                              run.status === 'COMPLETED' ? 'bg-green-500' :
+                              run.status === 'FAILED' ? 'bg-red-500' :
+                              run.status === 'RUNNING' ? 'bg-blue-500 animate-pulse' :
+                              'bg-zinc-600'
+                            }`} />
+                            <span className="flex-1 text-xs text-zinc-300 truncate">{run.title || 'Untitled scenario'}</span>
+                            {stepRate !== null && (
+                              <span className={`text-xs tabular-nums ${
+                                stepRate === 100 ? 'text-green-400' : stepRate >= 50 ? 'text-amber-400' : 'text-red-400'
+                              }`}>{stepRate}%</span>
+                            )}
+                            <span className={`text-xs px-2 py-0.5 rounded-full ${
+                              run.status === 'COMPLETED' ? 'bg-green-500/15 text-green-400' :
+                              run.status === 'FAILED' ? 'bg-red-500/15 text-red-400' :
+                              run.status === 'RUNNING' ? 'bg-blue-500/15 text-blue-300' :
+                              'bg-zinc-800 text-zinc-500'
+                            }`}>
+                              {run.status === 'COMPLETED' ? 'Passed' : run.status === 'FAILED' ? 'Failed' : run.status}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )
       )}
     </div>
   );

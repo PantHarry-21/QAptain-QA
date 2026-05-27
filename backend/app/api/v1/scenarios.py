@@ -22,6 +22,9 @@ from app.schemas.scenario import (
 )
 from app.intelligence.scenario_planner import ScenarioPlanner
 from app.intelligence.ai_client import get_ai_client
+from app.intelligence.exploratory_engine import ExploratoryTestEngine
+from app.intelligence.business_rule_engine import BusinessRuleEngine
+from app.intelligence.smart_scenario_generator import SmartScenarioGenerator
 from app.jobs.execution_job import enqueue_execution, enqueue_batch_execution
 
 router = APIRouter()
@@ -248,6 +251,68 @@ async def create_scenario(
     return ScenarioResponse.model_validate(scenario)
 
 
+# ─── Update ───────────────────────────────────────────────────────────────────
+
+class ScenarioUpdate(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    priority: str | None = None
+    tags: list[str] | None = None
+
+# ─── Bulk delete by module (must be before /{scenario_id} to avoid route shadowing) ─
+
+@router.delete("/bulk/by-module", status_code=200)
+async def delete_scenarios_by_module(
+    application_id: str,
+    module_id: str | None = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Soft-delete all scenarios for a module (or all unassigned if module_id=none)."""
+    query = select(Scenario).where(
+        Scenario.application_id == application_id,
+        Scenario.is_active == True,
+    )
+    if module_id and module_id != "__none__":
+        query = query.where(Scenario.module_id == module_id)
+    else:
+        query = query.where(Scenario.module_id == None)  # noqa: E711
+
+    result = await db.execute(query)
+    scenarios = result.scalars().all()
+    for s in scenarios:
+        s.is_active = False
+    await db.commit()
+    return {"deleted": len(scenarios)}
+
+
+# ─── Update ───────────────────────────────────────────────────────────────────
+
+@router.put("/{scenario_id}")
+async def update_scenario(
+    scenario_id: str,
+    payload: ScenarioUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Scenario).where(Scenario.id == scenario_id))
+    scenario = result.scalar_one_or_none()
+    if not scenario:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    if payload.title is not None:
+        scenario.title = payload.title[:512]
+    if payload.description is not None:
+        scenario.description = payload.description
+    if payload.priority is not None:
+        scenario.priority = _parse_priority(payload.priority)
+    if payload.tags is not None:
+        scenario.tags = payload.tags
+    await db.commit()
+    await db.refresh(scenario)
+    modules_by_id = await _load_modules_by_id(db, [scenario])
+    return _enrich_scenario(scenario, modules_by_id)
+
+
 # ─── Delete (soft) ────────────────────────────────────────────────────────────
 
 @router.delete("/{scenario_id}", status_code=204)
@@ -274,30 +339,29 @@ async def import_from_excel(
     db: AsyncSession = Depends(get_db),
 ):
     content = await file.read()
-    wb = openpyxl.load_workbook(io.BytesIO(content))
-    ws = wb.active
-    headers = [str(c.value).strip().lower() if c.value else "" for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    test_cases = _extract_excel_test_cases(content)
+    if not test_cases:
+        raise HTTPException(status_code=422, detail="No test cases found. Check that your file has Title/Description columns.")
 
-    created = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        row_data = dict(zip(headers, row))
-        title = row_data.get("title") or row_data.get("scenario") or row_data.get("test case")
+    created_titles: list[str] = []
+    for tc in test_cases:
+        title = tc.get("title", "").strip()
         if not title:
             continue
         scenario = Scenario(
             application_id=application_id,
-            title=str(title).strip(),
-            description=str(row_data.get("description", "") or ""),
-            priority=_parse_priority(row_data.get("priority")),
-            tags=[t.strip() for t in str(row_data.get("tags", "")).split(",") if t.strip()],
+            title=title[:512],
+            description=tc.get("description", ""),
+            priority=_parse_priority(tc.get("priority", "MEDIUM")),
+            tags=[t.strip() for t in str(tc.get("tags", "")).split(",") if t.strip()],
             source="excel",
             created_by=current_user.id,
         )
         db.add(scenario)
-        created.append(str(title).strip())
+        created_titles.append(title)
 
     await db.commit()
-    return {"imported": len(created), "titles": created[:10]}
+    return {"imported": len(created_titles), "titles": created_titles[:20]}
 
 
 # ─── Import: CSV ──────────────────────────────────────────────────────────────
@@ -446,44 +510,66 @@ async def run_batch(
 ):
     """
     Execute multiple scenarios with a single browser session (BeforeAll pattern).
-    One login, N scenarios executed sequentially — avoids N redundant logins.
+    Optimized: bulk-fetches all scenarios, builds all plans in one DB commit,
+    then enqueues execution — returns run IDs in ~100ms regardless of batch size.
     """
-    if not payload.scenario_ids:
-        raise HTTPException(status_code=400, detail="No scenario IDs provided")
-
+    import uuid as _uuid
     import traceback as _tb
     import structlog as _sl
     _log = _sl.get_logger()
 
+    if not payload.scenario_ids:
+        raise HTTPException(status_code=400, detail="No scenario IDs provided")
+
+    cap = 50
+    requested_ids = list(dict.fromkeys(payload.scenario_ids[:cap]))  # dedup, preserve order
+
+    # ── 1. Bulk-fetch all scenarios in ONE query ──────────────────────────────
+    result = await db.execute(
+        select(Scenario).where(Scenario.id.in_(requested_ids))
+    )
+    scenario_lookup: dict[str, Scenario] = {s.id: s for s in result.scalars().all()}
+
+    errors: list[dict] = [
+        {"scenario_id": sid, "error": "Scenario not found"}
+        for sid in requested_ids if sid not in scenario_lookup
+    ]
+
+    # ── 2. Build ALL plan objects (no AI, no commit) in a single pass ─────────
     planner = ScenarioPlanner(db)
-    plans: list = []
-    scenario_map: dict[str, str] = {}  # plan_id → scenario title (for response)
-    errors: list[dict] = []
-
-    cap = 50  # max scenarios per batch
-    for sid in payload.scenario_ids[:cap]:
-        result = await db.execute(select(Scenario).where(Scenario.id == sid))
-        scenario = result.scalar_one_or_none()
-        if not scenario:
-            errors.append({"scenario_id": sid, "error": "Scenario not found"})
+    plan_entries: list[tuple] = []  # (plan_obj, scenario_title)
+    for sid in requested_ids:
+        if sid not in scenario_lookup:
             continue
-        try:
-            plan = await planner.generate_fallback_plan(scenario, payload.execution_mode)
-            plans.append(plan)
-            scenario_map[plan.id] = scenario.title
-            _log.info("Plan created", scenario_id=sid, plan_id=plan.id)
-        except Exception as plan_err:
-            err_detail = f"Plan creation failed: {plan_err}\n{_tb.format_exc()[-300:]}"
-            _log.error("Plan creation error", scenario_id=sid, error=err_detail)
-            try:
-                await db.rollback()
-            except Exception:
-                pass
-            errors.append({"scenario_id": sid, "error": err_detail, "title": scenario.title})
+        scenario = scenario_lookup[sid]
+        plan_data = planner._fallback_plan(scenario)
+        from app.db.models import ExecutionPlan
+        from config import settings as _cfg
+        plan = ExecutionPlan(
+            scenario_id=scenario.id,
+            execution_mode=payload.execution_mode,
+            plan_data=plan_data,
+            ai_reasoning="Fallback — AI reasoning deferred to execution time",
+            semantic_intent={},
+            workflow_stages=[],
+            risk_score=5,
+            estimated_duration_seconds=len(plan_data.get("steps", [])) * 5,
+            created_by_model="fallback",
+        )
+        db.add(plan)
+        plan_entries.append((plan, scenario.title))
 
-    if not plans:
-        return {"runs": errors, "total": len(errors), "batch_mode": True}
+    if not plan_entries:
+        return {"runs": errors, "total": 0, "batch_mode": True}
 
+    # ── 3. ONE commit for all plans ───────────────────────────────────────────
+    await db.commit()
+
+    plans = [p for p, _ in plan_entries]
+    plan_title_map: dict[str, str] = {p.id: title for p, title in plan_entries}
+
+    # ── 4. Enqueue batch — creates runs + submits thread job ──────────────────
+    batch_id = str(_uuid.uuid4())
     try:
         runs = await enqueue_batch_execution(
             db=db,
@@ -491,21 +577,22 @@ async def run_batch(
             environment_id=payload.environment_id,
             credential_id=None,
             triggered_by=current_user.id,
+            batch_id=batch_id,
         )
         run_summaries = [
             {
                 "scenario_id": run.scenario_id,
                 "run_id": run.id,
-                "title": scenario_map.get(run.plan_id, ""),
+                "title": plan_title_map.get(run.plan_id, ""),
             }
             for run in runs
         ]
-        _log.info("Batch enqueued", count=len(runs))
+        _log.info("Batch enqueued", count=len(runs), batch_id=batch_id)
         return {
             "runs": run_summaries + errors,
             "total": len(run_summaries),
+            "batch_id": batch_id,
             "batch_mode": True,
-            "message": f"{len(runs)} scenarios queued as a single batch (one login, one browser)",
         }
     except Exception as e:
         err_detail = f"Batch enqueue failed: {e}\n{_tb.format_exc()[-300:]}"
@@ -586,3 +673,140 @@ async def list_runs(
         .order_by(ExecutionRun.created_at.desc())
     )
     return [ExecutionRunResponse.model_validate(r) for r in result.scalars().all()]
+
+
+# ─── Feature 1: Exploratory Testing ──────────────────────────────────────────
+
+class ExploratoryRequest(BaseModel):
+    target: str                  # e.g. "Test Add Product"
+    application_id: str
+
+
+@router.post("/exploratory", status_code=201)
+async def generate_exploratory_tests(
+    payload: ExploratoryRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Exploratory Testing Engine.
+
+    Given a natural-language target ("Test Add Product"), generates ~18-24
+    exploratory test scenarios across 6 categories:
+      empty_form, invalid_values, boundary_values, duplicate_data,
+      unauthorized_access, max_length
+
+    The AI reads the application's knowledge graph (forms, field validations,
+    workflows) to make the tests specific to the actual UI.
+    """
+    engine = ExploratoryTestEngine(db, get_ai_client())
+    scenarios = await engine.generate(
+        target=payload.target,
+        application_id=payload.application_id,
+        user_id=current_user.id,
+    )
+    modules_by_id = await _load_modules_by_id(db, scenarios)
+    return {
+        "generated": len(scenarios),
+        "target": payload.target,
+        "categories": [
+            "empty_form", "invalid_values", "boundary_values",
+            "duplicate_data", "unauthorized_access", "max_length",
+        ],
+        "scenarios": [_enrich_scenario(s, modules_by_id) for s in scenarios],
+    }
+
+
+# ─── Feature 2: Business Rule Discovery ──────────────────────────────────────
+
+@router.post("/business-rules/{application_id}", status_code=201)
+async def discover_and_generate_business_rule_tests(
+    application_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Business Rule Discovery Engine.
+
+    Analyses the application's knowledge graph (form validations, workflow
+    preconditions, error paths) to infer implicit business rules, then generates
+    a positive test + a negative test for each rule.
+
+    Example inferred rules:
+      - Price must be greater than zero
+      - Email must be unique
+      - Location must be selected before creating a Sample
+      - End date cannot be before start date
+    """
+    engine = BusinessRuleEngine(db, get_ai_client())
+    rules, scenarios = await engine.generate_scenarios(
+        application_id=application_id,
+        user_id=current_user.id,
+    )
+    modules_by_id = await _load_modules_by_id(db, scenarios)
+    return {
+        "rules_discovered": len(rules),
+        "scenarios_generated": len(scenarios),
+        "rules": [
+            {
+                "id": r.get("id"),
+                "name": r.get("name"),
+                "category": r.get("category"),
+                "description": r.get("description"),
+                "entity": r.get("entity"),
+                "field": r.get("field"),
+                "confidence": r.get("confidence"),
+            }
+            for r in rules
+        ],
+        "scenarios": [_enrich_scenario(s, modules_by_id) for s in scenarios],
+    }
+
+
+# ─── Feature 3: Smart Test Generation ────────────────────────────────────────
+
+class SmartGenerateRequest(BaseModel):
+    source_type: str    # user_story | requirement | screenshot | workflow | production_logs
+    content: str        # text content, or workflow name for source_type=workflow
+    application_id: str
+
+
+@router.post("/generate", status_code=201)
+async def smart_generate_scenarios(
+    payload: SmartGenerateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Smart Test Generation Engine.
+
+    Converts multiple artifact types into complete test suites
+    (happy path + edge cases + negative + regression):
+
+      user_story      → test cases per acceptance criterion
+      requirement     → test suite per requirement statement
+      screenshot      → tests for all visible interactive elements
+      workflow        → tests per workflow stage + precondition violations
+      production_logs → regression tests per error pattern
+    """
+    valid_types = {"user_story", "requirement", "screenshot", "workflow", "production_logs"}
+    if payload.source_type not in valid_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"source_type must be one of: {', '.join(sorted(valid_types))}",
+        )
+
+    generator = SmartScenarioGenerator(db, get_ai_client())
+    scenarios = await generator.generate(
+        source_type=payload.source_type,  # type: ignore[arg-type]
+        content=payload.content,
+        application_id=payload.application_id,
+        user_id=current_user.id,
+    )
+    modules_by_id = await _load_modules_by_id(db, scenarios)
+    return {
+        "generated": len(scenarios),
+        "source_type": payload.source_type,
+        "categories": ["happy_path", "edge_case", "negative", "regression"],
+        "scenarios": [_enrich_scenario(s, modules_by_id) for s in scenarios],
+    }

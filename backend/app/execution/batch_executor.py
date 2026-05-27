@@ -30,6 +30,8 @@ from app.execution.test_data_engine import TestDataEngine
 from app.execution.confidence_engine import ConfidenceEngine
 from app.execution.observability import ObservabilityLayer
 from app.intelligence.failure_analyzer import FailureAnalyzer
+from app.intelligence.scenario_planner import ScenarioPlanner
+from app.execution.intent_orchestrator import IntentOrchestrator
 from app.realtime.manager import connection_manager
 from config import settings
 
@@ -83,12 +85,8 @@ class BatchExecutionOrchestrator:
                 await self._single._fail_run(run, "Environment not found")
             return
 
-        # Mark all runs as RUNNING
+        # Keep runs QUEUED — mark each RUNNING individually just before it executes
         batch_start = datetime.utcnow()
-        for run in runs:
-            run.status = ExecutionStatus.RUNNING
-            run.started_at = batch_start
-        await self.db.commit()
 
         await self._emit_batch_event("batch_started", run_ids, {
             "count": len(run_ids),
@@ -127,8 +125,24 @@ class BatchExecutionOrchestrator:
             )
 
             if not login_ok:
+                fail_reason = "BeforeAll login failed — could not authenticate before running scenarios"
                 for run in runs:
-                    await self._single._fail_run(run, "BeforeAll login failed")
+                    # Write a log entry for every run so users can see WHY it failed
+                    entry = ExecutionLog(
+                        run_id=run.id,
+                        level="ERROR",
+                        category="login",
+                        message=fail_reason,
+                        extra={},
+                    )
+                    self.db.add(entry)
+                    await self._single._fail_run(run, fail_reason)
+                await self.db.commit()
+                await self._emit_batch_event("batch_failed", run_ids, {
+                    "reason": fail_reason,
+                    "total": len(runs),
+                    "failed": len(runs),
+                })
                 return
 
             await self._log_batch(run_ids[0], "SUCCESS", "batch",
@@ -136,6 +150,21 @@ class BatchExecutionOrchestrator:
 
             # ── Execute each scenario ─────────────────────────────────────────
             for idx, run in enumerate(runs):
+                # Between scenarios: soft-reset to app home via Angular hash nav.
+                # This avoids carrying over page state from the previous scenario
+                # while preserving the in-memory JWT (no full page reload).
+                if idx > 0:
+                    try:
+                        browser.execute_script("window.location.hash = '/';")
+                        await asyncio.sleep(1.5)
+                    except Exception:
+                        pass
+
+                # Mark THIS run (and only this run) as RUNNING now
+                run.status = ExecutionStatus.RUNNING
+                run.started_at = datetime.utcnow()
+                await self.db.commit()
+
                 await self._emit_event("run_started", run.id, {
                     "scenario_id": run.scenario_id,
                     "plan_id": run.plan_id,
@@ -149,6 +178,36 @@ class BatchExecutionOrchestrator:
                     await self._single._fail_run(run, "Execution plan not found")
                     continue
 
+                # Get scenario for title + AI plan generation
+                scenario_obj = await self._single._load_scenario(run.scenario_id)
+                scenario_title = scenario_obj.title if scenario_obj else plan.plan_data.get("workflow", "Scenario")
+
+                # ── Generate AI plan if this is still a fallback placeholder ──
+                # Fallback plans have only 4 trivial steps; we need real AI steps.
+                if plan.created_by_model == "fallback" and scenario_obj:
+                    await self._log_batch(run.id, "INFO", "execution",
+                        f"[{idx+1}/{len(runs)}] Generating AI test plan for: {scenario_title}")
+                    try:
+                        planner = ScenarioPlanner(self.db)
+                        ai_plan = await asyncio.wait_for(
+                            planner.generate_plan(scenario_obj, plan.execution_mode),
+                            timeout=120.0,
+                        )
+                        # Update run to point to new plan, then use it
+                        run.plan_id = ai_plan.id
+                        await self.db.commit()
+                        plan = ai_plan
+                        await self._log_batch(run.id, "INFO", "execution",
+                            f"[{idx+1}/{len(runs)}] AI plan ready — "
+                            f"{len(ai_plan.plan_data.get('steps', []))} steps, "
+                            f"type: {ai_plan.plan_data.get('workflow_type', '?')}")
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        await self._log_batch(run.id, "WARNING", "execution",
+                            f"[{idx+1}/{len(runs)}] AI plan timed out — using fallback 4-step plan")
+                    except Exception as plan_err:
+                        await self._log_batch(run.id, "WARNING", "execution",
+                            f"[{idx+1}/{len(runs)}] AI plan failed ({str(plan_err)[:120]}) — using fallback")
+
                 # Update runner for this specific run — fresh per-scenario state
                 runner.run_id = run.id
                 runner.event_callback = lambda e, d, rid=run.id: asyncio.create_task(
@@ -159,65 +218,91 @@ class BatchExecutionOrchestrator:
                 runner.confidence    = ConfidenceEngine(run.id)
                 runner.observability = ObservabilityLayer(run.id)
 
-                await self._log_batch(run.id, "INFO", "execution",
-                    f"[{idx+1}/{len(runs)}] Executing: {plan.plan_data.get('workflow', 'Scenario')}")
+                # Build intent context per scenario — entity tracking, workflow classification
+                _orchestrator = IntentOrchestrator(self.db)
+                _exec_ctx = await _orchestrator.prepare(
+                    scenario=scenario_obj,
+                    plan_data=plan.plan_data,
+                    env_base_url=env.base_url,
+                )
+                runner.entity_tracker = _exec_ctx.entity_tracker
 
-                step_start = datetime.utcnow()
+                await self._log_batch(run.id, "INFO", "execution",
+                    f"[{idx+1}/{len(runs)}] Executing: {scenario_title}")
+
                 try:
                     step_results = await runner.execute_plan(plan.plan_data)
-                except Exception as step_err:
-                    log.exception("Batch step execution crashed", run_id=run.id, error=str(step_err))
-                    await self._single._fail_run(run, f"Execution crashed: {str(step_err)[:300]}")
+                    _intent_summary = await _orchestrator.post_execute(step_results, _exec_ctx)
+
+                    # Persist steps
+                    await self._single._persist_steps(
+                        run.id, plan.plan_data.get("steps", []), step_results
+                    )
+
+                    summary = self._single._compute_summary(step_results)
+                    run.total_steps = summary["total"]
+                    run.passed_steps = summary["passed"]
+                    run.failed_steps = summary["failed"]
+                    run.healed_steps = summary["healed"]
+                    run.status = (
+                        ExecutionStatus.COMPLETED if summary["failed"] == 0
+                        else ExecutionStatus.FAILED
+                    )
+                    run.completed_at = datetime.utcnow()
+                    await self.db.commit()
+
+                    # Generate report — capped at 60s so a slow AI call never blocks the batch
+                    checkpoint_results, workflow_context = self._single._extract_execution_intelligence(
+                        plan.plan_data, step_results
+                    )
+                    workflow_context["entity_lifecycle"] = _intent_summary.get("entity_lifecycle", {})
+                    workflow_context["business_outcomes_confirmed"] = _intent_summary.get("business_outcomes_confirmed", True)
+                    workflow_context["primary_entity"] = _exec_ctx.primary_entity
+                    try:
+                        await asyncio.wait_for(
+                            self._single._generate_report(
+                                run, plan.plan_data, step_results, summary,
+                                checkpoint_results=checkpoint_results,
+                                workflow_context=workflow_context,
+                            ),
+                            timeout=60.0,
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        await self._log_batch(run.id, "WARNING", "execution",
+                            "Report generation timed out — skipping report for this scenario")
+                    except Exception as report_err:
+                        await self._log_batch(run.id, "WARNING", "execution",
+                            f"Report generation failed: {str(report_err)[:200]}")
+
+                    await self._emit_event("run_completed", run.id, {
+                        "status": run.status.value,
+                        "passed": summary["passed"],
+                        "failed": summary["failed"],
+                        "total": summary["total"],
+                        "batch_index": idx + 1,
+                        "batch_total": len(runs),
+                        "workflow_type": plan.plan_data.get("workflow_type", ""),
+                        "phases_completed": workflow_context.get("phases_completed", []),
+                        "phases_failed": workflow_context.get("phases_failed", []),
+                        "checkpoints_total": len(checkpoint_results),
+                        "checkpoints_passed": sum(1 for cp in checkpoint_results if cp.get("passed")),
+                    })
+
+                    await self._log_batch(run.id, "INFO", "execution",
+                        f"[{idx+1}/{len(runs)}] Done — "
+                        f"{summary['passed']}/{summary['total']} steps passed")
+
+                    log.info("Batch run completed",
+                        run_id=run.id, status=run.status.value,
+                        passed=summary["passed"], failed=summary["failed"])
+
+                except (Exception, asyncio.CancelledError) as step_err:
+                    err_msg = str(step_err)[:300]
+                    log.exception("Batch scenario crashed", run_id=run.id, error=err_msg)
+                    await self._log_batch(run.id, "ERROR", "execution",
+                        f"[{idx+1}/{len(runs)}] Scenario crashed: {err_msg}")
+                    await self._single._fail_run(run, f"Execution crashed: {err_msg}")
                     # Don't abort the whole batch — continue with next scenario
-                    continue
-
-                # Persist steps
-                await self._single._persist_steps(
-                    run.id, plan.plan_data.get("steps", []), step_results
-                )
-
-                summary = self._single._compute_summary(step_results)
-                run.total_steps = summary["total"]
-                run.passed_steps = summary["passed"]
-                run.failed_steps = summary["failed"]
-                run.healed_steps = summary["healed"]
-                run.status = (
-                    ExecutionStatus.COMPLETED if summary["failed"] == 0
-                    else ExecutionStatus.FAILED
-                )
-                run.completed_at = datetime.utcnow()
-                await self.db.commit()
-
-                # Generate report with full AI intelligence context
-                checkpoint_results, workflow_context = self._single._extract_execution_intelligence(
-                    plan.plan_data, step_results
-                )
-                await self._single._generate_report(
-                    run, plan.plan_data, step_results, summary,
-                    checkpoint_results=checkpoint_results,
-                    workflow_context=workflow_context,
-                )
-
-                await self._emit_event("run_completed", run.id, {
-                    "status": run.status.value,
-                    "passed": summary["passed"],
-                    "failed": summary["failed"],
-                    "total": summary["total"],
-                    "batch_index": idx + 1,
-                    "batch_total": len(runs),
-                    "workflow_type": plan.plan_data.get("workflow_type", ""),
-                    "phases_completed": workflow_context.get("phases_completed", []),
-                    "phases_failed": workflow_context.get("phases_failed", []),
-                    "checkpoints_total": len(checkpoint_results),
-                    "checkpoints_passed": sum(1 for cp in checkpoint_results if cp.get("passed")),
-                })
-
-                log.info("Batch run completed",
-                    run_id=run.id,
-                    status=run.status.value,
-                    passed=summary["passed"],
-                    failed=summary["failed"],
-                )
 
             # ── Batch summary ─────────────────────────────────────────────────
             completed = sum(1 for r in runs if r.status == ExecutionStatus.COMPLETED)
@@ -231,11 +316,26 @@ class BatchExecutionOrchestrator:
             log.info("Batch execution done",
                 total=len(runs), completed=completed, failed=failed)
 
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
+            err_msg = f"Batch crashed: {str(e)[:300]}"
             log.exception("Batch execution crashed", error=str(e))
             for run in runs:
                 if run.status == ExecutionStatus.RUNNING:
-                    await self._single._fail_run(run, f"Batch error: {str(e)[:300]}")
+                    entry = ExecutionLog(
+                        run_id=run.id, level="ERROR", category="batch",
+                        message=err_msg, extra={},
+                    )
+                    self.db.add(entry)
+                    await self._single._fail_run(run, err_msg)
+            try:
+                await self.db.commit()
+            except Exception:
+                pass
+            await self._emit_batch_event("batch_failed", run_ids, {
+                "reason": err_msg,
+                "total": len(runs),
+                "failed": sum(1 for r in runs if r.status == ExecutionStatus.FAILED),
+            })
         finally:
             if browser:
                 browser.quit()

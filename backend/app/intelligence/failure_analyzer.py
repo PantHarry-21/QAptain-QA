@@ -151,7 +151,7 @@ Scenario: {execution_context.get('scenario_title', 'Unknown')}
                 timeout=15.0,
             )
             return response.json()
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
             log.error("Failure analysis failed", error=str(e))
             return self._simple_analysis(failed_step, error_details)
 
@@ -232,7 +232,7 @@ Provide comprehensive root cause analysis."""
                 timeout=30.0,
             )
             return response.json()
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
             log.error("Run RCA failed", error=str(e))
             total_failed = run_summary.get("failed", 0)
             return {

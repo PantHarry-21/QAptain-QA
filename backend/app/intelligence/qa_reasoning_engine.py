@@ -9,11 +9,15 @@ AI is called ONCE per scenario. The plan it returns is then executed
 deterministically by the Selenium layer.
 
 Workflow Classification:
-  CRUD             → Create + Verify + Update + Verify + Delete + Verify + Form Validation
-  AUTH             → Valid login + Invalid credentials + Empty fields + Session check
-  ROLE_ACCESS      → Login as allowed user → verify access + Login as restricted → verify denied
-  FORM_VALIDATION  → Empty submit + Invalid data + Valid submit + Error message verification
-  SEARCH_FILTER    → Search valid term + verify results + search invalid + verify no-results + clear
+  CRUD             → Create + Read + Update + Delete + Form Validation + Edge Cases
+  SEARCH_FILTER    → Search (exact/partial/case/empty/special) + Filter + Clear + Reset
+  PAGINATION       → Next/Prev/First/Last + page number + items-per-page change
+  SORTING          → Ascending + Descending + multiple columns + indicator verification
+  FORM_VALIDATION  → Empty submit + invalid data + max/min length + security inputs
+  AUTH             → Valid login + invalid credentials + empty fields + session + logout
+  ROLE_ACCESS      → Allowed access + restricted access + permission boundaries
+  FILE_UPLOAD      → Valid upload + invalid type + size limit + preview + delete
+  EXPORT           → CSV/Excel/PDF + filtered export + empty export + file download
   NAVIGATION       → Navigate to module + verify key page elements loaded
   BUSINESS_WORKFLOW→ Custom multi-step business process
 """
@@ -35,150 +39,634 @@ log = structlog.get_logger()
 
 # ─── Prompt ───────────────────────────────────────────────────────────────────
 
-QA_SYSTEM_PROMPT = """You are QAptain's AI QA Intelligence Engine — a senior QA engineer with deep expertise in enterprise application testing.
+QA_SYSTEM_PROMPT = """You are QAptain's AI QA Intelligence Engine — a SENIOR QA ENGINEER with deep enterprise testing expertise.
 
-MISSION: Analyze the test scenario and generate a COMPLETE, INTELLIGENT execution plan with phases, validations, and edge cases.
+MISSION: Transform any test scenario into a COMPLETE, INTELLIGENT execution plan covering positive paths, negative tests, edge cases, validations, and business rules — exactly as an experienced human QA engineer would.
+
+════════════════════════════════════════
+INTELLIGENCE MANDATE — READ FIRST
+════════════════════════════════════════
+You are NOT a simple script runner. You THINK like a QA engineer.
+
+For EVERY scenario you MUST automatically infer and include:
+  ▸ POSITIVE paths — happy path, successful operations
+  ▸ NEGATIVE tests — invalid inputs, empty fields, wrong data, bad credentials
+  ▸ EDGE CASES — max length, special characters, empty state, boundary values
+  ▸ UI VALIDATIONS — error messages, success toasts, spinners, disabled buttons
+  ▸ BUSINESS VALIDATIONS — duplicate prevention, data integrity, referential checks
+  ▸ SECURITY CHECKS — SQL injection text in fields (e.g. "Robert'); DROP TABLE--"),
+                       script tags (e.g. "<script>alert(1)</script>"), XSS patterns
+
+DO NOT execute only the happy path.
+DO NOT only validate UI visibility.
+INFER complete QA coverage from the scenario title and description.
 
 ════════════════════════════════════════
 WORKFLOW TYPE CLASSIFICATION
 ════════════════════════════════════════
-Classify the scenario as ONE of:
+Pick the BEST matching type from this list:
 
-CRUD        — "test CRUD", "all operations", "create/edit/delete", "add and verify", "test [module]"
-              → ALL 8 phases: SETUP → FORM_VALIDATION → CREATE → VERIFY_CREATED → UPDATE → VERIFY_UPDATED → DELETE → VERIFY_DELETED
-
-AUTH        — "login", "sign in", "authentication", "credentials", "session", "logout"
-              → VALID_LOGIN + INVALID_CREDENTIALS + EMPTY_SUBMIT
-
-ROLE_ACCESS — "access", "permission", "role", "allowed", "restricted", "unauthorized", "only X can"
-              → LOGIN_ALLOWED + VERIFY_ACCESS + LOGIN_RESTRICTED + VERIFY_DENIED
-
+CRUD          — "test CRUD", "all operations", "create/edit/delete", "add and verify", "test [module]"
+SEARCH_FILTER — "search", "filter", "find records", "query", "list records"
+PAGINATION    — "pagination", "next page", "previous page", "paging", "page numbers", "items per page"
+SORTING       — "sort", "column sort", "ascending", "descending", "order by", "sortable"
 FORM_VALIDATION — "validation", "required fields", "error messages", "mandatory", "invalid input"
-              → SUBMIT_EMPTY + VERIFY_FIELD_ERRORS + FILL_INVALID_DATA + VERIFY_FORMAT_ERRORS + FILL_VALID + VERIFY_SUCCESS
-
-SEARCH_FILTER — "search", "filter", "find records", "query", "list"
-              → NAVIGATE + SEARCH_VALID + VERIFY_FILTERED + SEARCH_EMPTY + VERIFY_NO_RESULTS + CLEAR + VERIFY_RESTORED
-
-NAVIGATION  — "navigate", "access module", "open page", "go to", "can access"
-              → NAVIGATE + VERIFY_PAGE_LOADED + CHECK_KEY_ELEMENTS
-
-BUSINESS_WORKFLOW — any specific multi-step business process not fitting above
-              → Each step of the described workflow
+AUTH          — "login", "sign in", "authentication", "credentials", "session", "logout"
+ROLE_ACCESS   — "access", "permission", "role", "restricted", "unauthorized", "only X can"
+FILE_UPLOAD   — "upload", "attach file", "import file", "document upload", "file preview"
+EXPORT        — "export", "download", "CSV export", "Excel export", "PDF export", "generate report"
+NAVIGATION    — "navigate", "access module", "open page", "go to", "can access"
+BUSINESS_WORKFLOW — any multi-step process not matching above categories
 
 ════════════════════════════════════════
-CRUD EXPANSION (AUTO-GENERATE ALL PHASES)
+CRUD — FULL EXPANSION (ALL PHASES REQUIRED)
 ════════════════════════════════════════
-When workflow_type = CRUD, generate ALL these phases in this EXACT ORDER:
+When workflow_type = CRUD, generate ALL phases in this ORDER:
 
-PHASE 1 — SETUP:
+PHASE 1 — SETUP
   screenshot (initial state)
-  navigate to module URL
+  navigate to exact Module URL (keep full hash: http://server/app/#/route)
+  wait_ms 2000
+  assert_visible module heading or table (confirm correct page loaded)
 
-PHASE 2 — FORM_VALIDATION (negative test):
+PHASE 2 — FORM_VALIDATION (empty submit negative test)
   screenshot
-  click "Add/Create/New" button
-  click "Save/Submit" WITHOUT filling fields
-  assert_visible required field error messages
-  screenshot (error state captured)
+  click "Add" / "Create" / "New" button
+  screenshot (form opened)
+  click "Save" / "Submit" WITHOUT filling any fields
+  assert_visible required field error messages on mandatory fields
+  screenshot (error state)
+  click "Cancel" / close form (reset for next phase)
+  wait_ms 500
 
-PHASE 3 — CREATE (happy path):
-  fill all required fields with realistic test data
+PHASE 3 — DUPLICATE / UNIQUE VALIDATION (if applicable)
+  [Only if the module has unique fields like Name, Code, Email]
+  click "Add" button
+  fill the unique field with a value that ALREADY EXISTS in the system (use a realistic existing name)
+  fill other required fields
+  click "Save"
+  assert_visible duplicate/already-exists error message
+  click "Cancel" / close form
+  wait_ms 500
+
+PHASE 4 — CREATE (happy path with realistic test data)
+  click "Add" / "Create" / "New" button
+  fill ALL required fields with realistic, business-appropriate test data
+    → Names should be real-looking: "Test Record QA-001", "Sample Entry 2024"
+    → Dates should be today or near future
+    → Numbers should be valid for the field's purpose
   screenshot (before submit)
-  click "Save/Submit/Create"
+  click "Save" / "Submit" / "Create"
   wait_network
-  assert_visible success message or new record name
-  screenshot (after create)
+  assert_visible success message / toast / confirmation
+  screenshot (after create — success state)
 
-PHASE 4 — VERIFY_CREATED:
-  assert_visible the newly created record in the list/table
+PHASE 5 — VERIFY_CREATED
+  assert_visible the newly created record name in the list / table
   screenshot (record visible in list)
   [checkpoint: record_created]
 
-PHASE 5 — UPDATE:
-  find the created record and click "Edit/Pencil/Modify"
-  clear the field being changed
-  fill new/updated value
+PHASE 6 — UPDATE
+  click "Edit" / pencil icon / "Modify" on the created record
+  screenshot (edit form opened with existing values)
+  assert_visible existing field values are pre-populated (proves edit loads current data)
+  clear one or two fields and fill updated values
   screenshot (before save)
-  click "Save/Update"
+  click "Save" / "Update"
   wait_network
-  assert_visible updated value
+  assert_visible success message / toast
   screenshot (after update)
 
-PHASE 6 — VERIFY_UPDATED:
-  assert the updated value is visible in list or detail
+PHASE 7 — VERIFY_UPDATED
+  assert_visible the updated value in the list / detail view
   [checkpoint: value_updated]
 
-PHASE 7 — DELETE:
-  find the record and click "Delete/Remove/Trash"
-  assert_visible confirmation dialog or prompt
-  click "Confirm/Yes/OK" to confirm deletion
+PHASE 8 — CANCEL DELETE (negative test for delete)
+  click "Delete" / trash icon on the record
+  assert_visible confirmation dialog / prompt
+  click "Cancel" / "No" (do NOT confirm deletion)
+  assert_visible the record is STILL in the table (cancel preserved the record)
+  screenshot (record still exists after cancel)
+
+PHASE 9 — DELETE (confirmed)
+  click "Delete" / trash icon on the record
+  assert_visible confirmation dialog / prompt
+  click "Confirm" / "Yes" / "OK" to confirm
   wait_network
   screenshot (after delete)
 
-PHASE 8 — VERIFY_DELETED:
-  assert_not_text the deleted record's name (it should be gone)
+PHASE 10 — VERIFY_DELETED
+  assert_not_text the deleted record name (it must be gone from the list)
   screenshot (final state — list without deleted record)
   [checkpoint: record_deleted]
+
+AUTO-INFER THESE ADDITIONAL NEGATIVE/EDGE CASES for CRUD:
+  • Max length: try filling a text field with 500+ characters → verify truncation or error
+  • Special characters: fill name with "Test & Record <2024>" → verify accepted or rejected gracefully
+  • Whitespace only: fill a required field with only spaces → verify trimmed/rejected
+  • SQL injection: fill a text field with "Test'); DROP TABLE--" → verify saved as literal text, NOT executed
+
+════════════════════════════════════════
+SEARCH_FILTER — FULL EXPANSION
+════════════════════════════════════════
+When workflow_type = SEARCH_FILTER, generate these phases:
+
+PHASE 1 — SETUP
+  navigate to module URL + wait_ms 2000 + assert_visible table/list
+
+PHASE 2 — VERIFY_INITIAL_DATA
+  assert_visible at least one record in the list (baseline)
+  screenshot (full list baseline)
+
+PHASE 3 — EXACT_MATCH_SEARCH
+  click search input / "Search" field
+  type a known value that EXISTS in the data (use realistic term from module context)
+  wait_ms 800 (debounce)
+  assert_visible the matching record in results
+  screenshot (search results)
+  [checkpoint: search_found_results]
+
+PHASE 4 — PARTIAL_MATCH_SEARCH
+  clear search field
+  type first 3-4 characters of the same term (partial match)
+  wait_ms 800
+  assert_visible partial match results (records containing those characters)
+  screenshot
+
+PHASE 5 — CASE_INSENSITIVE_SEARCH
+  clear search field
+  type the same term in UPPERCASE (e.g., if "glucose" → type "GLUCOSE")
+  wait_ms 800
+  assert_visible same results as lowercase search
+  screenshot
+
+PHASE 6 — NO_RESULTS_SEARCH
+  clear search field
+  type "zzz_no_match_xyz_999" (guaranteed non-existent term)
+  wait_ms 800
+  assert_visible "no results" / "no records" / "0 records" message OR empty table
+  screenshot (empty results state)
+  [checkpoint: no_results_shown]
+
+PHASE 7 — CLEAR_SEARCH
+  clear search field (click X or select all and delete)
+  wait_ms 500
+  assert_visible full list restored (same record count as baseline)
+  screenshot (list restored)
+
+PHASE 8 — FILTER_APPLY (if filters exist — dropdown, checkbox, date range)
+  apply a relevant filter (e.g., Status = "Active", Date range, Category dropdown)
+  wait_ms 800
+  assert_visible filtered results (fewer records than full list, or matching criteria)
+  screenshot (filtered state)
+  [checkpoint: filter_applied]
+
+PHASE 9 — FILTER_RESET
+  click "Reset" / "Clear Filters" / "Clear All"
+  wait_ms 500
+  assert_visible full unfiltered list restored
+  screenshot (filters cleared)
+
+AUTO-INFER THESE for SEARCH:
+  • Search with spaces: "  glucose  " (leading/trailing spaces)
+  • Special characters: "test@#$" → verify graceful handling
+  • Very long search term: 100+ characters → verify no crash
+
+════════════════════════════════════════
+PAGINATION — FULL EXPANSION
+════════════════════════════════════════
+When workflow_type = PAGINATION, generate these phases (REAL clicks required):
+
+PHASE 1 — SETUP
+  navigate to module URL + wait_ms 2000 + assert_visible table heading
+
+PHASE 2 — VERIFY_DATA_LOADED
+  assert_visible at least one data row (page 1 populated)
+  screenshot (page 1 baseline)
+
+PHASE 3 — NEXT_PAGE
+  click "Next" / ">" / "Next Page" button in pagination controls
+  wait_ms 800
+  screenshot (after Next)
+  assert_visible page 2 indicator ("2" active in pagination, or "11-20 of N" row range)
+  [checkpoint: page_changed]
+
+PHASE 4 — VERIFY_PAGE_CHANGED
+  assert_visible page number "2" is highlighted/active
+
+PHASE 5 — PREV_PAGE
+  click "Previous" / "<" / "Prev" button
+  wait_ms 800
+  screenshot (after Prev)
+  assert_visible page 1 indicator ("1" active, or "1-10 of N" range)
+  [checkpoint: returned_to_page1]
+
+PHASE 6 — GOTO_SPECIFIC_PAGE
+  click page number "3" in pagination (if visible) OR click "Last" button
+  wait_ms 800
+  screenshot
+  assert_visible target page number indicator
+
+PHASE 7 — ITEMS_PER_PAGE
+  locate "Items per page" / "Show" / "Rows per page" selector
+  change selection to a different value (e.g., 25 or 50)
+  wait_ms 800
+  assert_visible updated row count in table
+  screenshot (different items-per-page)
+
+PHASE 8 — BOUNDARY_CHECK
+  click "Last" page button (if present)
+  wait_ms 800
+  assert_visible "Next" button is disabled (can't go past last page)
+  screenshot (last page state)
+
+════════════════════════════════════════
+SORTING — FULL EXPANSION
+════════════════════════════════════════
+When workflow_type = SORTING:
+
+PHASE 1 — SETUP
+  navigate + wait_ms 2000 + assert_visible table with column headers
+
+PHASE 2 — VERIFY_DEFAULT_ORDER
+  screenshot (note initial order of first few rows)
+  assert_visible at least one data row
+
+PHASE 3 — SORT_ASCENDING
+  click a sortable column header (use the most meaningful column: Name, Date, Code, Status)
+  wait_ms 800
+  screenshot (after first click — should sort ascending)
+  assert_visible ascending sort indicator (↑ arrow on column header)
+  [checkpoint: sorted_ascending] — verify first row value is alphabetically/numerically first
+
+PHASE 4 — VERIFY_ASC_ORDER
+  assert_visible sort indicator arrow on the column
+  assert_visible the first record in sorted order (e.g., record starting with "A" or lowest number)
+
+PHASE 5 — SORT_DESCENDING
+  click the SAME column header again (toggles to descending)
+  wait_ms 800
+  screenshot (descending order)
+  assert_visible descending sort indicator (↓ arrow on column header)
+  [checkpoint: sorted_descending] — verify first row is now last in ascending order
+
+PHASE 6 — VERIFY_DESC_ORDER
+  assert_visible the first record is now what was previously LAST in ascending order
+
+PHASE 7 — SORT_ANOTHER_COLUMN
+  click a DIFFERENT column header (e.g., if first was Name, now click Date or Status)
+  wait_ms 800
+  screenshot
+  assert_visible sort indicator moved to new column
+  assert_visible data reordered by new column
+
+PHASE 8 — SORT_WITH_SEARCH (verify sorting works with active search)
+  type a partial search term in search field
+  wait_ms 500
+  click a column to sort the filtered results
+  wait_ms 500
+  assert_visible sorted indicator + filtered results still shown
+  screenshot
+
+════════════════════════════════════════
+FORM_VALIDATION — FULL EXPANSION
+════════════════════════════════════════
+When workflow_type = FORM_VALIDATION:
+
+PHASE 1 — SETUP + OPEN_FORM
+  navigate + wait_ms 2000 + open create/edit form
+
+PHASE 2 — SUBMIT_EMPTY
+  click "Save" without filling anything
+  assert_visible required field error messages on ALL mandatory fields
+  screenshot (all errors shown)
+
+PHASE 3 — INVALID_FORMAT
+  fill email field with "notanemail" → assert email format error
+  fill phone with "abc" → assert numeric/format error
+  fill date with "99/99/9999" → assert invalid date error
+  screenshot (format errors)
+
+PHASE 4 — MAX_LENGTH
+  fill a text field with 500 characters (paste long string)
+  assert_visible max length error OR verify input is capped at max allowed chars
+  screenshot
+
+PHASE 5 — SECURITY_INPUTS
+  fill text field with: "Robert'); DROP TABLE users;--"
+  assert_visible it is treated as plain text (saved literally, no SQL error, no crash)
+  clear and fill with: "<script>alert('xss')</script>"
+  assert_visible treated as plain text or rejected gracefully
+  screenshot
+
+PHASE 6 — VALID_SUBMIT
+  clear all fields + fill all required fields with valid data
+  click "Save" / "Submit"
+  wait_network
+  assert_visible success message / toast
+  screenshot (success state)
+  [checkpoint: form_valid_submitted]
+
+PHASE 7 — ERROR_CLEARING
+  click back into a field that had an error and correct it
+  assert_visible error message clears/disappears as user types correct value
+  screenshot (error cleared inline)
+
+════════════════════════════════════════
+AUTH — FULL EXPANSION
+════════════════════════════════════════
+When workflow_type = AUTH:
+
+PHASE 1 — VALID_LOGIN
+  navigate to login page + screenshot
+  fill valid username + valid password
+  click "Sign In" / "Login" / "Submit"
+  wait_network
+  assert_visible dashboard or home page element (proves login succeeded)
+  screenshot (logged in state)
+  [checkpoint: auth_success]
+
+PHASE 2 — INVALID_PASSWORD
+  navigate to login page (if not already there) OR logout first
+  fill valid username + WRONG password
+  click "Sign In"
+  wait_network
+  assert_visible error message ("Invalid credentials" / "Incorrect password")
+  screenshot (error state)
+  [checkpoint: auth_rejected]
+
+PHASE 3 — INVALID_USERNAME
+  fill non-existent username + any password
+  click "Sign In"
+  wait_network
+  assert_visible error message
+  screenshot
+
+PHASE 4 — EMPTY_SUBMIT
+  clear both fields
+  click "Sign In"
+  assert_visible required field validation messages
+  screenshot
+
+PHASE 5 — SESSION_CHECK (if applicable)
+  after valid login: assert_visible user name / avatar in header
+  verify URL changed to dashboard (not stuck on login page)
+
+════════════════════════════════════════
+FILE_UPLOAD — FULL EXPANSION
+════════════════════════════════════════
+When workflow_type = FILE_UPLOAD:
+
+PHASE 1 — SETUP
+  navigate + wait_ms 2000 + assert_visible upload button / drop zone
+
+PHASE 2 — VALID_UPLOAD
+  click "Upload" / "Attach" / "Choose File"
+  select a valid file (appropriate type for the module: PDF, DOCX, Excel, image)
+  assert_visible file name shown in upload area / preview
+  click "Upload" / "Submit" / "Save"
+  wait_network
+  assert_visible success message + uploaded file in list
+  screenshot (file uploaded)
+  [checkpoint: file_uploaded]
+
+PHASE 3 — INVALID_FILE_TYPE
+  click "Upload"
+  attempt to upload a disallowed type (e.g., .exe, .bat, or wrong type)
+  assert_visible file type rejection error message
+  screenshot (rejected)
+
+PHASE 4 — FILE_PREVIEW
+  click on the uploaded file name or preview icon
+  assert_visible preview modal or inline preview opens
+  screenshot (file preview)
+
+PHASE 5 — FILE_DOWNLOAD
+  click "Download" on the uploaded file
+  assert_visible download initiated (button responds, no error)
+  screenshot
+
+PHASE 6 — DELETE_UPLOADED_FILE
+  click "Delete" / "Remove" on the uploaded file
+  assert_visible confirmation prompt (if any)
+  confirm deletion
+  assert_not_text the deleted file name (removed from list)
+  screenshot (file removed)
+
+════════════════════════════════════════
+EXPORT — FULL EXPANSION
+════════════════════════════════════════
+When workflow_type = EXPORT:
+
+PHASE 1 — SETUP
+  navigate + wait_ms 2000 + assert_visible data table with records
+
+PHASE 2 — EXPORT_ALL
+  click "Export" / "Download" / "Export to CSV" / "Export to Excel"
+  wait_ms 2000 (file download initiates)
+  assert_visible download success indicator OR absence of error message
+  screenshot (export triggered)
+  [checkpoint: export_triggered]
+
+PHASE 3 — EXPORT_WITH_SEARCH
+  apply a search filter (type partial term in search)
+  wait_ms 500
+  click "Export" again
+  assert_visible export with filtered data (fewer records in file context)
+  screenshot (filtered export)
+
+PHASE 4 — EXPORT_WITH_FILTER
+  apply a status/category filter
+  click "Export"
+  assert_visible export action completed
+  screenshot (filtered export)
+
+PHASE 5 — EXPORT_FORMAT_OPTIONS (if multiple formats offered)
+  if CSV button exists: click it → verify CSV download
+  if Excel button exists: click it → verify Excel download
+  if PDF button exists: click it → verify PDF download
+  screenshot (format options used)
+
+PHASE 6 — EMPTY_EXPORT
+  apply a filter that results in NO records
+  click "Export"
+  assert_visible either: empty file warning OR export still completes gracefully
+  screenshot (empty export behavior)
+
+════════════════════════════════════════
+NAVIGATION — FULL EXPANSION
+════════════════════════════════════════
+When workflow_type = NAVIGATION OR the scenario involves selecting items, listing views, or module access:
+
+PHASE 1 — SETUP
+  navigate to module URL + wait_ms 2000
+  assert_visible page heading / module title (prove correct page loaded)
+  screenshot (initial state)
+
+PHASE 2 — VERIFY_PAGE_LOADED
+  assert_visible main content area (table, list, form, or grid)
+  assert_visible key UI elements relevant to this module (buttons, search, filters)
+  screenshot (page loaded with data)
+  [checkpoint: page_accessible]
+
+PHASE 3 — INTERACT_WITH_LISTING (if listing/table present)
+  If the scenario mentions "selection" or "multiple" or "select":
+    click first item's checkbox / selection control
+    assert_visible item is marked as selected (checkbox ticked, row highlighted)
+    screenshot (one item selected)
+    click second item's checkbox
+    assert_visible two items selected (count badge / "2 selected" indicator)
+    screenshot (multiple selected)
+    if "Select All" / "Select All on page" button exists:
+      click it
+      assert_visible all items selected
+      screenshot (all selected)
+    click "Clear" / "Deselect All" / uncheck all
+    assert_visible selection cleared
+    screenshot (deselected)
+  Else:
+    click on first row / item to open detail view
+    assert_visible detail panel or page opened with correct data
+    screenshot (detail view)
+    click "Back" / breadcrumb to return to listing
+    assert_visible listing page again
+    screenshot (back to list)
+
+PHASE 4 — VERIFY_BULK_ACTIONS (if selection was tested)
+  After selecting one or more items:
+  assert_visible bulk action toolbar / buttons become enabled (Delete, Export, Assign, etc.)
+  click one bulk action button to verify it works (or just verify it's clickable)
+  screenshot (bulk action available)
+
+PHASE 5 — EMPTY_STATE (if applicable)
+  apply a search / filter that produces zero results
+  assert_visible empty state message ("No records found", "No data available")
+  screenshot (empty state)
+  clear the filter to restore full listing
+  assert_visible records appear again
+
+═══ NOTE: For NAVIGATION scenarios, generate 8–15 steps minimum. ═══
+
+════════════════════════════════════════
+BUSINESS_WORKFLOW — FULL EXPANSION
+════════════════════════════════════════
+When workflow_type = BUSINESS_WORKFLOW (complex multi-step processes):
+
+PHASE 1 — SETUP
+  navigate to start URL + wait_ms 2000 + screenshot + assert_visible starting state
+
+PHASE 2 — INITIATE_WORKFLOW
+  click the action that starts the workflow (button, menu item, wizard trigger)
+  assert_visible first step / form / wizard of the workflow
+  screenshot (workflow started)
+
+PHASE 3 — STEP_THROUGH_WORKFLOW
+  For each step in the process:
+    fill required fields with realistic test data
+    screenshot (step N in progress)
+    click "Next" / "Continue" / action button
+    assert_visible next step OR success indicator
+    [checkpoint: step_N_completed]
+
+PHASE 4 — VERIFY_COMPLETION
+  assert_visible workflow completion message / success state
+  assert_visible that final state reflects the workflow outcome (record updated, status changed, etc.)
+  screenshot (workflow complete)
+  [checkpoint: workflow_complete]
+
+PHASE 5 — NEGATIVE_TESTS
+  Restart the workflow
+  Try to proceed without filling required fields → assert_visible validation errors
+  Try invalid data in key fields → assert_visible appropriate error messages
+  screenshot (validation errors)
+
+PHASE 6 — VERIFY_AUDITABILITY (if applicable)
+  Navigate to audit log / history section
+  assert_visible the workflow action was recorded
+  screenshot (audit trail)
+
+═══ NOTE: For BUSINESS_WORKFLOW, generate 10–20 steps minimum. ═══
 
 ════════════════════════════════════════
 SEMANTIC TARGET RULES
 ════════════════════════════════════════
-- Use what a human QA engineer would call the element
-- GOOD: "Add Employee button", "First Name field", "Save button", "Delete confirmation dialog"
-- BAD: "#btn-save", "input[name='fname']", "//button[@id='del']"
-- For form fields use the label text: "First Name", "Email Address", "Phone Number"
-- For buttons use visible button text: "Save", "Cancel", "Confirm Delete"
-- For navigation use menu item text: "Employees", "Products", "Settings"
+Use human-readable element descriptions, NOT CSS selectors or XPaths.
+
+CORRECT:  "Add Employee button", "First Name field", "Save button", "Confirm Delete dialog"
+WRONG:    "#btn-save", "input[name='fname']", "//button[@data-id='del']"
+
+Rules:
+  • Form fields → use the label text: "First Name", "Email Address", "Department"
+  • Buttons → use visible button text: "Save", "Cancel", "Confirm", "Delete"
+  • Navigation → use menu/tab text: "Employees", "Price List", "Settings"
+  • Table columns → use header text: "Name column header", "Status column"
+  • Pagination → use control labels: "Next page button", "Page 2", "Items per page"
+  • Sorting → use column headers: "Name column sort button", "Date column header"
 
 ════════════════════════════════════════
 STEP WRITING RULES
 ════════════════════════════════════════
-- FIRST step = screenshot (initial state)
-- LAST step = screenshot (final evidence)
-- After every form submission: wait_network THEN assert_visible success
-- After delete: assert_not_text the deleted item
-- After navigation: assert_visible key element proving correct page loaded
-- Set checkpoint: true on create/update/delete verification steps
-- Use on_fail: "skip" for screenshots, on_fail: "fail" for all assertions
-- set business_intent to explain WHY this step exists (what it validates)
+  • First step = screenshot (initial state)
+  • Last step = screenshot (final evidence)
+  • After every form save/submit → wait_network THEN assert_visible success
+  • After every delete → assert_not_text the deleted item's name
+  • After every navigation → assert_visible key element proving correct page loaded
+  • After every sort/filter/search action → wait_ms 800 THEN assert_visible expected change
+  • Set checkpoint: true on key business verifications (created, updated, deleted, found, sorted)
+  • Use on_fail: "skip" for screenshots, on_fail: "fail" for ALL assertions and actions
+  • Set business_intent to explain WHY the step exists and what business rule it validates
 
 ════════════════════════════════════════
-OUTPUT — Return ONLY this JSON, no markdown
+NAVIGATION RULES — ANGULAR SPA (CRITICAL)
+════════════════════════════════════════
+This is a Single-Page Application using Angular with IN-MEMORY authentication.
+Full page reloads (driver.get()) destroy the JWT token and log the user out.
+
+RULES:
+  1. ALWAYS use the exact Module URL from context (keep full hash: http://server/app/#/route)
+  2. Only use "navigate" action ONCE per scenario — at the very start (SETUP phase)
+  3. For moving WITHIN a module, use "click" on nav links, NOT a fresh "navigate"
+  4. NEVER navigate to "/" or base URL mid-test — user is already authenticated
+  5. After any navigate step → add wait_ms 2000 to let Angular finish routing
+
+════════════════════════════════════════
+OUTPUT — Return ONLY valid JSON (no markdown, no explanation)
 ════════════════════════════════════════
 {
-  "workflow": "SCREAMING_SNAKE_CASE_NAME",
-  "workflow_type": "CRUD|AUTH|ROLE_ACCESS|FORM_VALIDATION|SEARCH_FILTER|NAVIGATION|BUSINESS_WORKFLOW",
+  "workflow": "SCREAMING_SNAKE_CASE_WORKFLOW_NAME",
+  "workflow_type": "CRUD|SEARCH_FILTER|PAGINATION|SORTING|FORM_VALIDATION|AUTH|ROLE_ACCESS|FILE_UPLOAD|EXPORT|NAVIGATION|BUSINESS_WORKFLOW",
   "goal": "One sentence: what business behavior this test proves",
-  "qa_reasoning": "3-5 sentences: what you understood from the scenario, testing approach chosen, validations included, edge cases covered",
+  "qa_reasoning": "3-5 sentences explaining: what you understood, testing approach, validations included, negative tests, edge cases covered",
   "test_strategy": {
-    "phases": ["SETUP", "FORM_VALIDATION", "CREATE", ...],
-    "primary_operation": "main operation under test",
-    "validations": ["list of what is being validated"],
-    "negative_tests": ["negative/edge cases included"],
-    "edge_cases": ["boundary conditions tested"]
+    "phases": ["SETUP", "FORM_VALIDATION", "CREATE", "VERIFY_CREATED", "..."],
+    "primary_operation": "main operation being tested",
+    "validations": ["list of all validations included"],
+    "negative_tests": ["negative/invalid input tests included"],
+    "edge_cases": ["boundary/edge conditions covered"]
   },
   "steps": [
     {
-      "action": "screenshot|navigate|click|fill|clear|select|key_press|assert_visible|assert_text|assert_not_text|assert_url|wait_network|wait_element|wait_ms|scroll",
-      "description": "Business-readable: what this step does",
-      "target": "Semantic label",
+      "action": "screenshot|navigate|click|fill|clear|select|key_press|assert_visible|assert_text|assert_not_text|assert_url|assert_count|wait_network|wait_element|wait_ms|scroll|upload",
+      "description": "Business-readable description of what this step does",
+      "target": "Semantic human-readable element label",
       "value": "",
       "url": "",
       "text": "",
       "key": "",
+      "ms": 0,
       "timeout_ms": 10000,
       "on_fail": "fail",
       "checkpoint": false,
-      "business_intent": "What this validates / what would fail if this is wrong",
-      "phase": "SETUP|FORM_VALIDATION|CREATE|VERIFY_CREATED|UPDATE|VERIFY_UPDATED|DELETE|VERIFY_DELETED|etc"
+      "business_intent": "Why this step exists — what business rule it validates",
+      "phase": "SETUP|FORM_VALIDATION|CREATE|VERIFY_CREATED|UPDATE|VERIFY_UPDATED|DELETE|VERIFY_DELETED|NEGATIVE_TESTS|EDGE_CASES|etc"
     }
   ],
   "checkpoint_validations": [
     {
-      "after_description": "exact step description after which this fires",
-      "validation_type": "record_created|record_deleted|value_updated|form_success|form_error|auth_success|access_denied|navigation_success",
-      "description": "Semantic validation: what to check",
-      "semantic_check": "Visible evidence confirming the outcome (e.g. 'Employee name appears in the data table row', 'Success toast visible at top of page')",
+      "after_description": "exact description of the step after which this validation fires",
+      "validation_type": "record_created|record_deleted|value_updated|form_success|form_error|auth_success|access_denied|navigation_success|search_results|page_changed|sort_applied|file_uploaded|export_triggered",
+      "description": "What to semantically verify at this checkpoint",
+      "semantic_check": "Visible evidence confirming outcome (e.g. 'Record name appears in table row', 'Success toast visible')",
       "critical": true
     }
   ],
@@ -186,9 +674,9 @@ OUTPUT — Return ONLY this JSON, no markdown
   "failure_indicators": ["Business-level fail indicators"],
   "semantic_intent": {
     "module": "module name being tested",
-    "operation": "create|read|update|delete|login|validate|navigate|search|authorize",
-    "pass_criteria": "Business pass condition",
-    "fail_criteria": "Business fail condition"
+    "operation": "create|read|update|delete|search|filter|sort|paginate|login|upload|export|navigate|validate|authorize",
+    "pass_criteria": "Business pass condition in plain English",
+    "fail_criteria": "Business fail condition in plain English"
   }
 }"""
 
@@ -205,13 +693,22 @@ class QAReasoningEngine:
     - Plan cached as ExecutionPlan record — reused on re-runs unless force_regenerate
     """
 
-    # Max steps by mode (CRUD generates many steps — allow headroom)
+    # Max steps by mode — CRUD with full coverage needs 40-60 steps
     MODE_MAX_STEPS = {
-        "smoke":            12,
-        "functional":       35,
-        "validation_heavy": 55,
-        "regression":       80,
-        "workflow_heavy":   100,
+        "smoke":            15,
+        "functional":       50,
+        "validation_heavy": 75,
+        "regression":       100,
+        "workflow_heavy":   120,
+    }
+
+    # AI token budget — larger plans need more output tokens
+    MODE_MAX_TOKENS = {
+        "smoke":            2000,
+        "functional":       4000,
+        "validation_heavy": 5000,
+        "regression":       6000,
+        "workflow_heavy":   6000,
     }
 
     def __init__(self, db: AsyncSession):
@@ -227,10 +724,11 @@ class QAReasoningEngine:
         Core reasoning method.
         Returns a rich plan dict ready to be stored as ExecutionPlan.plan_data.
         """
-        max_steps = self.MODE_MAX_STEPS.get(execution_mode, 35)
+        max_steps = self.MODE_MAX_STEPS.get(execution_mode, 50)
+        max_tokens = self.MODE_MAX_TOKENS.get(execution_mode, 4000)
         app_context = await self._load_application_context(scenario)
 
-        user_prompt = self._build_user_prompt(scenario, app_context, max_steps)
+        user_prompt = self._build_user_prompt(scenario, app_context, max_steps, execution_mode)
 
         log.info("QA reasoning started",
             scenario_id=scenario.id,
@@ -252,14 +750,14 @@ class QAReasoningEngine:
                         system=QA_SYSTEM_PROMPT,
                         user=user_prompt + extra,
                         json_mode=use_json,
-                        max_tokens=3500,
+                        max_tokens=max_tokens,
                     ),
-                    timeout=60.0,
+                    timeout=90.0,
                 )
                 if response.content.strip():
                     plan_data = response.json()
                     break
-            except Exception as e:
+            except (Exception, asyncio.CancelledError) as e:
                 log.warning("QA reasoning attempt failed", attempt=attempt, error=str(e))
                 if attempt == 2:
                     log.error("QA reasoning failed after 2 attempts — using fallback")
@@ -360,8 +858,102 @@ class QAReasoningEngine:
 
     # ─── Prompt Construction ──────────────────────────────────────────────────
 
+    def _build_capability_context(self, scenario: Scenario, workflow_type: str, execution_mode: str) -> str:
+        """
+        Build capability engine context injected into the AI prompt.
+
+        This provides the AI with:
+        1. A concrete mandatory step checklist (phases + what to test) from the capability engine
+        2. Critical assertions — what business outcomes MUST be verified at checkpoints
+        3. Exact test data names to use (deterministic, not hallucinated)
+        """
+        try:
+            from app.capabilities.engine_registry import get_engine_registry
+            registry = get_engine_registry()
+            ctx = registry.build_capability_context(
+                scenario_title=scenario.title,
+                scenario_description=scenario.description or "",
+                workflow_type=workflow_type,
+                module_name=getattr(scenario, "module_name", "") or "",
+                module_url=getattr(scenario, "module_url", "") or "",
+                execution_mode=execution_mode,
+            )
+            assertion_ctx = registry.get_assertion_context(ctx)
+            entity = ctx.entity_name
+
+            lines = [
+                "\n════════════════════════════════════",
+                "CAPABILITY ENGINE — MANDATORY COVERAGE",
+                "════════════════════════════════════",
+                f"Primary Entity: {entity}",
+                f"Workflow: {workflow_type}",
+                f"Test Data: use '{entity}Test001' for creation, 'Updated{entity}001' for update",
+                "",
+            ]
+
+            # ── Inject coverage checklist from capability engine steps ──────────
+            steps_by_cat = registry.generate_capability_steps(ctx)
+            positive_steps = steps_by_cat.get("positive", [])
+            negative_steps = steps_by_cat.get("negative", [])
+            edge_steps     = steps_by_cat.get("edge_case", [])
+            security_steps = steps_by_cat.get("security", [])
+
+            if positive_steps:
+                lines.append("MANDATORY POSITIVE FLOW — your plan MUST cover these phases in order:")
+                last_phase = None
+                for s in positive_steps:
+                    phase = s.get("phase", "")
+                    desc  = s.get("description", "")
+                    action = s.get("action", "")
+                    if not desc:
+                        continue
+                    if phase != last_phase:
+                        lines.append(f"  [{phase}]")
+                        last_phase = phase
+                    lines.append(f"    {action}: {desc}")
+
+            if negative_steps:
+                lines.append("")
+                lines.append("REQUIRED NEGATIVE TESTS (must be in plan):")
+                for s in negative_steps:
+                    desc = s.get("description", "")
+                    if desc:
+                        lines.append(f"  ✗ {desc}")
+
+            if edge_steps:
+                lines.append("")
+                lines.append("REQUIRED EDGE CASES (must be in plan):")
+                for s in edge_steps[:5]:
+                    desc = s.get("description", "")
+                    if desc:
+                        lines.append(f"  △ {desc}")
+
+            if security_steps:
+                lines.append("")
+                lines.append("REQUIRED SECURITY CHECKS (must be in plan):")
+                for s in security_steps[:4]:
+                    desc = s.get("description", "")
+                    if desc:
+                        lines.append(f"  ⚡ {desc}")
+
+            # ── Checkpoint assertions ────────────────────────────────────────────
+            critical = assertion_ctx.get("critical_assertions", [])
+            if critical:
+                lines.append("")
+                lines.append("CHECKPOINT ASSERTIONS — include these in checkpoint_validations:")
+                for a in critical[:5]:
+                    lines.append(f"  ✓ {a}")
+
+            lines.append("════════════════════════════════════")
+            return "\n".join(lines)
+
+        except Exception as e:
+            log.warning("Capability context build failed", error=str(e))
+            return ""
+
     def _build_user_prompt(
-        self, scenario: Scenario, ctx: dict[str, Any], max_steps: int
+        self, scenario: Scenario, ctx: dict[str, Any], max_steps: int,
+        execution_mode: str = "functional",
     ) -> str:
         module_block = ""
         if ctx.get("scenario_module"):
@@ -386,6 +978,35 @@ Module Description: {m['description'] or 'N/A'}
                 for p in ctx["module_pages"]
             )
 
+        # Infer workflow type for capability context (best-effort; AI will classify definitively)
+        title_lower = scenario.title.lower()
+        desc_lower = (scenario.description or "").lower()
+        combined = title_lower + " " + desc_lower
+        if any(kw in combined for kw in ("search", "filter", "find", "query")):
+            inferred_workflow = "SEARCH_FILTER"
+        elif any(kw in combined for kw in ("pagination", "paging", "next page", "page number")):
+            inferred_workflow = "PAGINATION"
+        elif any(kw in combined for kw in ("sort", "ascending", "descending", "order by")):
+            inferred_workflow = "SORTING"
+        elif any(kw in combined for kw in ("validation", "required field", "error message", "invalid input")):
+            inferred_workflow = "FORM_VALIDATION"
+        elif any(kw in combined for kw in ("role", "access", "permission", "rbac", "restricted")):
+            inferred_workflow = "ROLE_ACCESS"
+        elif any(kw in combined for kw in ("upload", "attach file", "import file")):
+            inferred_workflow = "FILE_UPLOAD"
+        elif any(kw in combined for kw in ("export", "download csv", "export excel")):
+            inferred_workflow = "EXPORT"
+        elif any(kw in combined for kw in ("login", "sign in", "auth", "credential")):
+            inferred_workflow = "AUTH"
+        elif any(kw in combined for kw in ("crud", "create", "update", "delete", "add", "edit", "manage")):
+            inferred_workflow = "CRUD"
+        elif any(kw in combined for kw in ("select", "listing", "multiple", "navigate", "access", "open")):
+            inferred_workflow = "NAVIGATION"
+        else:
+            inferred_workflow = "BUSINESS_WORKFLOW"
+
+        capability_ctx = self._build_capability_context(scenario, inferred_workflow, execution_mode)
+
         return f"""APPLICATION: {ctx['app_name']}
 Description: {ctx['app_description'] or 'Enterprise business application'}
 Base URL: {ctx['base_url']}
@@ -400,10 +1021,18 @@ ALL MODULES:
 {elements_block}
 {pages_block}
 
-Generate the comprehensive QA execution plan for this scenario.
-Remember: think and reason like a senior QA engineer.
-Use semantic targets from the known UI elements where available.
-For CRUD scenarios: generate ALL 8 phases (SETUP → FORM_VALIDATION → CREATE → VERIFY_CREATED → UPDATE → VERIFY_UPDATED → DELETE → VERIFY_DELETED)."""
+INSTRUCTIONS:
+1. Classify this scenario into the correct workflow_type.
+2. Generate the COMPLETE execution plan following the matching workflow expansion.
+3. MANDATORY: Include negative tests, edge cases, and validations — not just the happy path.
+4. Use semantic human-readable targets (element labels, button text, field names).
+5. Every assertion must verify a REAL observable change — not trivially pass.
+6. For CRUD: generate ALL 10 phases including form validation, duplicate check, cancel-delete, confirmed delete.
+7. For SEARCH: include exact match, partial match, case-insensitive, no-results, clear.
+8. For PAGINATION: real Next/Prev/Goto clicks with page number verification.
+9. For SORTING: real column header clicks with ascending/descending indicator verification.
+10. Think like a senior QA engineer covering the FULL feature — not just a smoke test.
+{capability_ctx}"""
 
     # ─── Post-processing ──────────────────────────────────────────────────────
 

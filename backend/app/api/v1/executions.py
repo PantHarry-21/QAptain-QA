@@ -3,11 +3,101 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.db.session import get_db
-from app.db.models import User, ExecutionRun, ExecutionStep, ExecutionLog, ExecutionReport, ExecutionStatus
+from app.db.models import User, ExecutionRun, ExecutionStep, ExecutionLog, ExecutionReport, ExecutionStatus, Scenario
 from app.core.dependencies import get_current_user
 from app.schemas.scenario import ExecutionRunResponse, ExecutionStepResponse, ReportResponse
 
 router = APIRouter()
+
+
+@router.get("/batch-history")
+async def get_batch_history(
+    application_id: str,
+    limit: int = 30,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return batch execution history grouped by batch_id.
+    Each entry represents one 'Run All' press, with all its scenario runs.
+    """
+    # Get all runs for the application (via Scenario join)
+    result = await db.execute(
+        select(ExecutionRun, Scenario.title.label("scenario_title"))
+        .join(Scenario, ExecutionRun.scenario_id == Scenario.id)
+        .where(Scenario.application_id == application_id)
+        .order_by(ExecutionRun.created_at.desc())
+        .limit(limit * 60)  # fetch enough to fill limit batches
+    )
+    rows = result.all()
+
+    # Group by batch_id stored in browser_metadata
+    batches: dict[str, dict] = {}
+    for run, scenario_title in rows:
+        meta = run.browser_metadata or {}
+        batch_id = meta.get("batch_id")
+        if not batch_id:
+            continue
+        if batch_id not in batches:
+            batches[batch_id] = {
+                "batch_id": batch_id,
+                "started_at": run.created_at,
+                "environment_id": run.environment_id,
+                "runs": [],
+            }
+        batches[batch_id]["runs"].append({
+            "run_id": run.id,
+            "title": scenario_title or "",
+            "status": run.status.value,
+            "passed_steps": run.passed_steps or 0,
+            "failed_steps": run.failed_steps or 0,
+            "total_steps": run.total_steps or 0,
+            "completed_at": run.completed_at,
+        })
+
+    # Sort batches newest-first, cap at limit
+    sorted_batches = sorted(
+        batches.values(),
+        key=lambda b: b["started_at"],
+        reverse=True,
+    )[:limit]
+
+    return [
+        {
+            "batch_id": b["batch_id"],
+            "started_at": b["started_at"],
+            "environment_id": b["environment_id"],
+            "total": len(b["runs"]),
+            "passed": sum(1 for r in b["runs"] if r["status"] == "COMPLETED"),
+            "failed": sum(1 for r in b["runs"] if r["status"] == "FAILED"),
+            "running": sum(1 for r in b["runs"] if r["status"] in ("RUNNING", "QUEUED")),
+            "runs": b["runs"],
+        }
+        for b in sorted_batches
+    ]
+
+
+@router.get("/batch/{batch_id}")
+async def get_batch_runs(
+    batch_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return all runs belonging to a specific batch_id."""
+    result = await db.execute(
+        select(ExecutionRun, Scenario.title.label("scenario_title"))
+        .join(Scenario, ExecutionRun.scenario_id == Scenario.id)
+        .order_by(ExecutionRun.created_at.asc())
+    )
+    rows = result.all()
+    runs = [
+        {"run_id": run.id, "title": scenario_title or ""}
+        for run, scenario_title in rows
+        if (run.browser_metadata or {}).get("batch_id") == batch_id
+    ]
+    if not runs:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    return {"batch_id": batch_id, "runs": runs}
 
 
 @router.get("/{run_id}", response_model=ExecutionRunResponse)

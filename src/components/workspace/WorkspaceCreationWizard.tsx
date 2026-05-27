@@ -32,20 +32,12 @@ const EXPLORE_OPTIONS: Array<{
   icon: string;
 }> = [
   {
-    mode: 'FULL',
-    title: 'Full Explore',
-    description: 'Deep application exploration. Maps all modules, pages, forms, tables, and workflows. AI builds a comprehensive knowledge graph.',
+    mode: 'SMART',
+    title: 'Smart Explore',
+    description: 'Complete application mapping — clicks every module, sub-module, and link. Builds a full knowledge graph including forms, workflows, and test scenarios. Recommended for first-time onboarding.',
     duration: '15–45 minutes',
     badge: 'Recommended',
     icon: '🔍',
-  },
-  {
-    mode: 'SMART',
-    title: 'Smart Explore',
-    description: 'Main modules and major workflows only. Faster onboarding with good coverage for most enterprise applications.',
-    duration: '5–15 minutes',
-    badge: 'Fast',
-    icon: '⚡',
   },
   {
     mode: 'SKIP',

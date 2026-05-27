@@ -122,10 +122,12 @@ async def enqueue_batch_execution(
     environment_id: str,
     credential_id: str | None,
     triggered_by: str,
+    batch_id: str | None = None,
 ) -> list[ExecutionRun]:
     """
     Create N ExecutionRun records and submit a SINGLE batch job.
     All scenarios share one browser session (BeforeAll login).
+    batch_id links runs together for history queries.
     """
     runs: list[ExecutionRun] = []
     for plan in plans:
@@ -136,6 +138,7 @@ async def enqueue_batch_execution(
             credential_id=credential_id,
             status=ExecutionStatus.QUEUED,
             triggered_by=triggered_by,
+            browser_metadata={"batch_id": batch_id} if batch_id else {},
         )
         db.add(run)
         runs.append(run)

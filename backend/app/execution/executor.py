@@ -32,6 +32,7 @@ from app.intelligence.semantic_extractor import SemanticUIExtractor
 from app.intelligence.failure_analyzer import FailureAnalyzer
 from app.intelligence.workflow_memory import WorkflowMemoryEngine
 from app.intelligence.domain_strategies import DomainStrategyEngine
+from app.execution.intent_orchestrator import IntentOrchestrator
 from app.core.security import decrypt_credential
 from app.realtime.manager import connection_manager
 from config import settings
@@ -104,6 +105,17 @@ class ExecutionOrchestrator:
                 observability=obs,
             )
 
+            # ── IntentOrchestrator: build execution context ───────────────────
+            # Understands WHAT is being tested (entity, workflow, business rules)
+            # and gives the runner an EntityTracker for live entity lifecycle.
+            _orchestrator = IntentOrchestrator(self.db)
+            _exec_ctx = await _orchestrator.prepare(
+                scenario=scenario,
+                plan_data=plan.plan_data,
+                env_base_url=env.base_url,
+            )
+            runner.entity_tracker = _exec_ctx.entity_tracker
+
             login_success = await self._execute_login(
                 runner=runner,
                 browser=browser,
@@ -121,6 +133,9 @@ class ExecutionOrchestrator:
             plan_data = plan.plan_data
             step_results = await runner.execute_plan(plan_data)
 
+            # ── Post-execution business intelligence ──────────────────────────
+            _intent_summary = await _orchestrator.post_execute(step_results, _exec_ctx)
+
             await self._persist_steps(run_id, plan_data.get("steps", []), step_results)
 
             summary = self._compute_summary(step_results)
@@ -136,6 +151,10 @@ class ExecutionOrchestrator:
             checkpoint_results, workflow_context = self._extract_execution_intelligence(
                 plan_data, step_results
             )
+            # Merge entity lifecycle into workflow context for reporting
+            workflow_context["entity_lifecycle"] = _intent_summary.get("entity_lifecycle", {})
+            workflow_context["business_outcomes_confirmed"] = _intent_summary.get("business_outcomes_confirmed", True)
+            workflow_context["primary_entity"] = _exec_ctx.primary_entity
             await self._generate_report(
                 run, plan_data, step_results, summary,
                 checkpoint_results=checkpoint_results,
@@ -223,11 +242,19 @@ class ExecutionOrchestrator:
         browser.navigate(env.base_url)
 
         # Wait up to 90s for Angular SPA to bootstrap and render login form
-        await self._log(run_id, "INFO", "login", "Waiting for login form to render (up to 90s)")
-        page_ready = await asyncio.to_thread(self._wait_for_any_input, browser, timeout=90)
+        # Emit progress logs every 15s so the UI shows something is happening
+        await self._log(run_id, "INFO", "login", "Waiting for login form to render (up to 90s)…")
+        page_ready = False
+        for elapsed in range(0, 90, 15):
+            page_ready = await asyncio.to_thread(self._wait_for_any_input, browser, timeout=15)
+            if page_ready:
+                break
+            if elapsed + 15 < 90:
+                await self._log(run_id, "INFO", "login",
+                    f"Still loading app… ({elapsed + 15}s elapsed, waiting up to 90s)")
         if not page_ready:
             await self._log(run_id, "WARNING", "login",
-                "No input fields within 90s — page may be unreachable")
+                "Login form did not appear within 90s — app may be unreachable or taking too long to load")
             return False
 
         # Find username + password fields (Angular Material aware)
@@ -372,91 +399,100 @@ class ExecutionOrchestrator:
     ) -> None:
         """
         Handle post-login context selection (portal dropdown, location selector, etc.)
-        Mirrors explore_engine._handle_login_context_selection.
+        Loops up to 3 times to handle chained steps (e.g. pick location → click Sign In).
+        After every selection it always looks for a submit/sign-in button and clicks it.
         """
-        # Wait for async overlay / redirect (up to 8s with retries)
-        selector_info: dict = {"type": "unknown"}
-        for attempt in range(4):
-            selector_info = await asyncio.to_thread(
-                self._inspect_dom_for_selectors, browser
-            )
-            if selector_info.get("type") not in ("unknown", None):
-                break
-            if attempt < 3:
-                await asyncio.sleep(2)
+        from app.intelligence.field_inspector import FieldInspector
 
-        sel_type = selector_info.get("type", "unknown")
-        if sel_type == "unknown":
-            return
-
-        label = selector_info.get("label", "")
-        await self._log(run_id, "INFO", "login",
-            f"Post-login selector detected: {label!r} ({sel_type})")
-
-        # Check for saved preference
         pref = await self._get_login_preference(app_id, "login.location")
         preferred_value = pref.get("value") if pref else None
 
-        from app.intelligence.field_inspector import FieldInspector
-        inspector = FieldInspector(browser.driver)
-
-        if sel_type == "trigger_button":
-            # Use FieldInspector for portal/custom dropdowns (e.g. YLIMS)
-            if preferred_value:
-                ok = await asyncio.to_thread(
-                    inspector.select_by_label_text, label, preferred_value
+        for step in range(3):
+            # Wait for async overlay / redirect (up to 8s with retries)
+            selector_info: dict = {"type": "unknown"}
+            for attempt in range(4):
+                selector_info = await asyncio.to_thread(
+                    self._inspect_dom_for_selectors, browser
                 )
-                if ok:
-                    await self._log(run_id, "INFO", "login",
-                        f"Portal selected: {preferred_value!r}")
-                    await asyncio.sleep(1.5)
-                    return
-
-            # No preference — find trigger button and pick first option
-            healer = SelfHealingEngine(browser.driver)
-            result = healer.find_element(label)
-            if result[0]:
-                options = await asyncio.to_thread(inspector.get_options, result[0])
-                if options:
-                    first_label = options[0].label
-                    ok = await asyncio.to_thread(
-                        inspector.select_option, result[0], first_label
-                    )
-                    if ok:
-                        await self._log(run_id, "INFO", "login",
-                            f"Auto-selected first portal option: {first_label!r}")
-                        await asyncio.sleep(1.5)
-                        return
-
-        elif sel_type in ("select", "list", "radio", "button_group"):
-            options = selector_info.get("options", [])
-            if options:
-                target = preferred_value
-                if not target:
-                    first = options[0]
-                    target = first.get("label") if isinstance(first, dict) else str(first)
-                if target:
-                    ok = await asyncio.to_thread(
-                        inspector.select_by_label_text, label, target
-                    )
-                    if ok:
-                        await self._log(run_id, "INFO", "login",
-                            f"Context selected: {target!r}")
-                        await asyncio.sleep(1.5)
-
-        # After selection, click any submit/continue button
-        await asyncio.sleep(0.5)
-        healer = SelfHealingEngine(browser.driver)
-        for btn_label in ("Sign In", "Continue", "Submit", "OK", "Proceed", "Next"):
-            result = healer.find_element(btn_label)
-            if result[0]:
-                try:
-                    result[0].click()
+                if selector_info.get("type") not in ("unknown", None):
                     break
-                except Exception:
-                    pass
+                if attempt < 3:
+                    await asyncio.sleep(2)
 
-        await asyncio.sleep(2)
+            sel_type = selector_info.get("type", "unknown")
+            if sel_type == "unknown":
+                break
+
+            label = selector_info.get("label", "")
+            await self._log(run_id, "INFO", "login",
+                f"Post-login step {step + 1}: {label!r} ({sel_type})")
+
+            inspector = FieldInspector(browser.driver)
+            selected = False
+
+            if sel_type == "trigger_button":
+                if preferred_value:
+                    ok = await asyncio.to_thread(
+                        inspector.select_by_label_text, label, preferred_value
+                    )
+                    if ok:
+                        await self._log(run_id, "INFO", "login",
+                            f"Portal selected (saved preference): {preferred_value!r}")
+                        selected = True
+
+                if not selected:
+                    healer = SelfHealingEngine(browser.driver)
+                    result = healer.find_element(label)
+                    if result[0]:
+                        options = await asyncio.to_thread(inspector.get_options, result[0])
+                        if options:
+                            first_label = options[0].label
+                            ok = await asyncio.to_thread(
+                                inspector.select_option, result[0], first_label
+                            )
+                            if ok:
+                                await self._log(run_id, "INFO", "login",
+                                    f"Auto-selected first portal option: {first_label!r}")
+                                selected = True
+
+            elif sel_type in ("select", "list", "radio", "button_group"):
+                options = selector_info.get("options", [])
+                if options:
+                    target = preferred_value
+                    if not target:
+                        first = options[0]
+                        target = first.get("label") if isinstance(first, dict) else str(first)
+                    if target:
+                        ok = await asyncio.to_thread(
+                            inspector.select_by_label_text, label, target
+                        )
+                        if ok:
+                            await self._log(run_id, "INFO", "login",
+                                f"Context selected: {target!r}")
+                            selected = True
+
+            if not selected:
+                break
+
+            # After every selection: look for Sign In / Submit and click it
+            await asyncio.sleep(0.8)
+            healer = SelfHealingEngine(browser.driver)
+            for btn_label in ("Sign In", "Login", "Continue", "Submit", "Proceed", "OK", "Next"):
+                btn_result = healer.find_element(btn_label)
+                if btn_result[0]:
+                    try:
+                        btn_result[0].click()
+                        await self._log(run_id, "INFO", "login",
+                            f"Clicked '{btn_label}' after context selection")
+                        break
+                    except Exception:
+                        pass
+
+            await asyncio.sleep(2)
+
+            # If we've navigated away from login, no more steps needed
+            if not await asyncio.to_thread(self._is_on_login_page, browser, ""):
+                break
 
     # ─── Login helper statics ─────────────────────────────────────────────────
 

@@ -36,46 +36,101 @@ from config import settings
 log = structlog.get_logger()
 
 
-SYSTEM_PROMPT_EXPLORE = """You are QAptain's Application Intelligence Engine performing semantic application exploration.
+SYSTEM_PROMPT_EXPLORE = """You are QAptain's Application Intelligence Engine. Extract comprehensive structured knowledge from a page for QA test generation.
 
-Your role: Analyze semantic UI state and provide structured understanding.
+RESPOND WITH VALID JSON ONLY. No markdown, no explanation.
 
-You MUST respond with valid JSON only.
-
-For PAGE ANALYSIS, output:
 {
-  "page_name": "Human-readable page name",
-  "page_type": "dashboard|list|form|detail|modal|wizard|login|settings",
-  "module": "Which application module this belongs to",
+  "page_name": "Human-readable name",
+  "page_type": "dashboard|list|form|detail|modal|wizard|login|settings|report|calendar|upload",
+  "module": "Which application module this page belongs to",
+  "key_business_objects": ["Entity types this page manages, e.g. User, Sample, Order, Invoice"],
+
   "forms": [
     {
       "name": "Form name",
-      "purpose": "What this form does",
+      "purpose": "Business action this form performs",
+      "entity": "Entity being created or edited, e.g. Sample, User",
       "fields": [
-        {"label": "field label", "type": "text|email|password|number|date|dropdown|checkbox|textarea", "required": true, "purpose": "Why this field exists"}
+        {
+          "label": "Field label",
+          "type": "text|email|password|number|date|datetime|dropdown|multiselect|checkbox|radio|textarea|file|search|autocomplete",
+          "required": true,
+          "validation": "Specific rules: min/max length, format, uniqueness constraint, allowed range",
+          "options": ["Option 1", "Option 2"],
+          "depends_on": "Label of field this depends on, or null"
+        }
       ],
-      "submit_action": "What happens on submission"
+      "submit_action": "What happens on form submission",
+      "success_message": "Expected success indicator after submit",
+      "cancel_action": "What cancel or close does"
     }
   ],
+
   "tables": [
     {
       "name": "Table name",
-      "purpose": "What data this shows",
-      "columns": ["col1", "col2"],
-      "has_actions": true
+      "entity": "Entity rows represent, e.g. Users, Samples",
+      "purpose": "What data this table shows",
+      "columns": [
+        {"name": "Column header", "type": "text|number|date|status|boolean|link|badge|action", "sortable": true}
+      ],
+      "row_actions": ["Edit", "Delete", "View", "Approve", "Export"],
+      "bulk_actions": ["Delete", "Export", "Assign"],
+      "has_search": true,
+      "has_filter": true,
+      "has_pagination": true,
+      "pagination_type": "page-numbers|load-more|infinite-scroll|none"
     }
   ],
+
   "workflows": [
     {
       "name": "Workflow name",
-      "type": "crud_create|crud_read|crud_update|crud_delete|approval|search|navigation",
-      "entry_trigger": "What starts this workflow",
-      "steps": ["Step 1", "Step 2"]
+      "type": "crud_create|crud_read|crud_update|crud_delete|approval|search|export|import|navigation|login|upload",
+      "entity": "Entity this workflow operates on",
+      "entry_trigger": "Button, link or event that starts this workflow",
+      "preconditions": ["User must be logged in", "Record must exist", "Location must be selected"],
+      "steps": [
+        {"step": 1, "action": "User clicks Add button", "expected_result": "Create form opens"},
+        {"step": 2, "action": "User fills required fields", "expected_result": "Fields validate in real time"},
+        {"step": 3, "action": "User clicks Submit", "expected_result": "Record saved, success message shown"}
+      ],
+      "success_criteria": ["Record appears in list", "Confirmation toast shown", "Count increments"],
+      "error_paths": ["Required field missing shows inline error", "Duplicate entry rejected with message"]
     }
   ],
-  "dynamic_behaviors": ["Any conditional rendering or multi-step behaviors observed"],
-  "navigation_links": ["Links that lead to other modules/pages"],
-  "key_business_objects": ["What entities this page manages"]
+
+  "crud_operations": {
+    "entity": "Primary entity managed on this page",
+    "can_create": true,
+    "can_read": true,
+    "can_update": true,
+    "can_delete": true,
+    "create_trigger": "Add / New button label or null",
+    "update_trigger": "Edit button label or null",
+    "delete_trigger": "Delete button label or null",
+    "requires_confirmation": true,
+    "soft_delete": false
+  },
+
+  "navigation_structure": {
+    "breadcrumbs": ["Home", "Module", "Page"],
+    "parent_module": "Module this page belongs to",
+    "child_pages": ["Sub-pages accessible from here"],
+    "related_pages": ["Functionally related pages a tester should also test"]
+  },
+
+  "dynamic_behaviors": [
+    {
+      "trigger": "button_click|field_change|page_load|hover|scroll",
+      "element": "Element label or description",
+      "behavior": "modal_opens|section_expands|field_appears|field_hides|data_loads|redirect|toast_appears|dialog_opens",
+      "description": "Specific observable change"
+    }
+  ],
+
+  "navigation_links": ["Link text that navigates to another page or module"]
 }"""
 
 
@@ -85,8 +140,7 @@ class ExploreEngine:
     Emits live semantic logs (not technical logs) throughout.
     """
 
-    MAX_PAGES_FULL = 200   # hard cap — use percentage logic in run()
-    MAX_PAGES_SMART = 100  # hard cap — use percentage logic in run()
+    MAX_PAGES = 200   # hard cap — use percentage logic in run()
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -97,6 +151,7 @@ class ExploreEngine:
         self._extractor: SemanticUIExtractor | None = None
         self._healer: SelfHealingEngine | None = None
         self._discovered_urls: set[str] = set()
+        self._phase3_analyzed: set[str] = set()  # URLs analyzed in Phase 3 (dedup across click + URL paths)
         self._module_map: dict[str, str] = {}  # url_pattern -> module_id
         self._raw_nav_items: list[dict] = []  # nav items from Phase 2 {text, href}
         self._login_url: str = ""       # full URL of the login page (set in Phase 1)
@@ -156,22 +211,10 @@ class ExploreEngine:
 
             # Phase 3: Deep exploration — AI analysis + element extraction
             if session.mode != ExploreMode.SKIP:
-                # Percentage-based limits: FULL=100%, SMART=50% of discovered URLs
-                nav_url_count = len([
-                    item for item in self._raw_nav_items
-                    if item.get("href", "").strip()
-                        and item.get("href", "").strip() not in ("#", "/", "javascript:void(0)", "javascript:;")
-                ])
-                total_urls = max(nav_url_count, len(self._discovered_urls), 5)
-                if session.mode == ExploreMode.FULL:
-                    max_pages = min(total_urls, self.MAX_PAGES_FULL)
-                else:  # SMART: at least 5 pages, up to 50% of all discovered
-                    max_pages = min(max(5, total_urls // 2), self.MAX_PAGES_SMART)
-
                 await self._log("INFO", "exploration",
-                    f"Exploration mode: {session.mode.value} — targeting {max_pages} of ~{total_urls} discovered URLs")
-                await self._phase_explore_pages(max_pages)
-                # Deep-scan each discovered page for elements, selectors, CRUD forms
+                    "Exploration mode: SMART — exploring all discovered URLs")
+                await self._phase_explore_pages(self.MAX_PAGES)
+                # Deep element scan — extracts detailed selectors, CRUD forms, and interactive elements
                 await self._phase_deep_scan_elements()
 
             # Phase 4: Build knowledge graph
@@ -1676,21 +1719,21 @@ class ExploreEngine:
             await self._log("WARNING", "scan", "No pages to deep-scan")
             return
 
-        for i, page in enumerate(pages[:self.MAX_PAGES_FULL]):
+        for i, page in enumerate(pages[:self.MAX_PAGES]):
             try:
                 await self._log("INFO", "scan", f"Scanning [{i+1}/{len(pages)}] {page.title}")
                 await asyncio.to_thread(self._browser.navigate, page.url)
-                await asyncio.sleep(3.0)
+                await asyncio.sleep(1.5)
                 if await asyncio.to_thread(self._is_login_page):
                     # Try session recovery via dashboard before giving up
                     recovered = False
                     if self._dashboard_url:
                         try:
                             await asyncio.to_thread(self._browser.navigate, self._dashboard_url)
-                            await asyncio.sleep(3.0)
+                            await asyncio.sleep(1.5)
                             if not await asyncio.to_thread(self._is_login_page):
                                 await asyncio.to_thread(self._browser.navigate, page.url)
-                                await asyncio.sleep(3.0)
+                                await asyncio.sleep(1.5)
                                 recovered = not await asyncio.to_thread(self._is_login_page)
                         except Exception:
                             pass
@@ -2046,194 +2089,94 @@ class ExploreEngine:
 
     async def _generate_test_scenarios(self, application_id: str, session_id: str) -> int:
         """
-        Phase 6: Generate AI test scenarios from all exploration data.
-        Saves Scenario records with source='ai_generated'.
+        Phase 6: Generate AI test scenarios from exploration data.
+        Uses batched generation (5 modules per call) to avoid token-limit truncation
+        and content-filter issues with large single-shot prompts.
         """
         await self._log("MILESTONE", "scenarios", "Generating test scenarios from exploration data")
 
-        # Skip if AI scenarios already exist for this application
-        existing_count_result = await self.db.execute(
-            select(func.count(Scenario.id)).where(
+        # Delete old AI-generated scenarios so we regenerate fresh ones
+        existing_result = await self.db.execute(
+            select(Scenario).where(
                 Scenario.application_id == application_id,
                 Scenario.source == "ai_generated",
             )
         )
-        if (existing_count_result.scalar() or 0) > 0:
-            # Delete old generated scenarios to regenerate fresh ones
-            old_result = await self.db.execute(
-                select(Scenario).where(
-                    Scenario.application_id == application_id,
-                    Scenario.source == "ai_generated",
-                )
-            )
-            for old in old_result.scalars().all():
-                await self.db.delete(old)
-            await self.db.commit()
+        for old in existing_result.scalars().all():
+            await self.db.delete(old)
+        await self.db.commit()
 
-        # Load modules
+        # Load modules, pages, workflows
         mods_result = await self.db.execute(
             select(ApplicationModule).where(ApplicationModule.application_id == application_id)
         )
-        modules = mods_result.scalars().all()
+        modules = list(mods_result.scalars().all())
 
-        # Load pages (with forms, for context)
         pages_result = await self.db.execute(
             select(ApplicationPage)
             .join(ApplicationModule, ApplicationPage.module_id == ApplicationModule.id)
             .where(ApplicationModule.application_id == application_id)
-            .limit(25)
+            .limit(30)
         )
-        pages = pages_result.scalars().all()
+        pages = list(pages_result.scalars().all())
 
-        # Load workflows
         wf_result = await self.db.execute(
             select(ApplicationWorkflow)
             .join(ApplicationModule, ApplicationWorkflow.module_id == ApplicationModule.id)
             .where(ApplicationModule.application_id == application_id)
-            .limit(15)
+            .limit(20)
         )
-        workflows = wf_result.scalars().all()
+        workflows = list(wf_result.scalars().all())
 
-        # Build compact context for AI
-        module_context = [
-            {
-                "name": m.name,
-                "url": m.url_pattern or "",
-                "description": m.description or "",
-            }
-            for m in modules
-        ]
-        page_summaries = [
-            {
-                "page": p.title,
-                "url": p.url,
-                "module": next((m.name for m in modules if m.id == p.module_id), None),
-                "type": p.page_type,
-                "forms": [
-                    {
-                        "name": f.get("name", ""),
-                        "fields": [fld.get("label", "") for fld in f.get("fields", [])[:6]],
-                        "submit_action": f.get("submit_action", ""),
-                    }
-                    for f in (p.forms or [])[:3]
-                ],
-                "tables": [t.get("name", "") for t in (p.tables or [])[:3]],
-            }
-            for p in pages if p.forms or p.tables
-        ]
-        workflow_summaries = [
-            {"name": w.name, "type": w.workflow_type, "module": next((m.name for m in modules if m.id == w.module_id), None)}
-            for w in workflows
-        ]
+        if not modules:
+            await self._log("WARNING", "scenarios", "No modules found — skipping scenario generation")
+            return 0
 
-        min_per_module = 5
-        module_names = [m.name for m in modules]
-        # Build a per-module page/form context so AI can generate informed scenarios
-        module_detail_context = []
-        for m in modules:
+        # Build per-module detail context (forms, tables, workflows)
+        def _module_ctx(m) -> dict:
             m_pages = [p for p in pages if p.module_id == m.id]
-            m_forms = []
-            for p in m_pages[:4]:
-                for f in (p.forms or [])[:2]:
-                    m_forms.append({
-                        "name": f.get("name", ""),
-                        "fields": [fld.get("label", "") for fld in f.get("fields", [])[:8]],
-                        "submit_action": f.get("submit_action", ""),
-                    })
-            m_tables = []
-            for p in m_pages[:3]:
-                for t in (p.tables or [])[:2]:
-                    m_tables.append(t.get("name", ""))
-            module_detail_context.append({
+            m_forms = [
+                {
+                    "name": f.get("name", ""),
+                    "fields": [fld.get("label", "") for fld in f.get("fields", [])[:6]],
+                    "submit_action": f.get("submit_action", ""),
+                }
+                for p in m_pages[:3] for f in (p.forms or [])[:3]
+            ]
+            m_tables = [
+                t.get("name", "")
+                for p in m_pages[:3] for t in (p.tables or [])[:3]
+            ]
+            m_wfs = [w.name for w in workflows if w.module_id == m.id][:6]
+
+            # Dynamic target: 5 base + extras for CRUD forms, tables, and workflows
+            target = 5
+            target += len(m_forms) * 3        # create, edit, delete per form
+            if m_tables:
+                target += 3                   # search, filter, sort
+            if len(m_wfs) > 1:
+                target += (len(m_wfs) - 1) * 2
+            target = min(target, 20)
+
+            # Derive which coverage types apply
+            coverage = ["view list", "navigation"]
+            if m_forms:
+                coverage += ["create record", "edit record", "delete record", "field validation", "required field validation"]
+            if m_tables:
+                coverage += ["search", "filter", "sort/pagination"]
+            if m_wfs:
+                coverage += ["end-to-end workflow", "workflow error handling"]
+            coverage += ["boundary values", "permission/access"]
+
+            return {
                 "module": m.name,
                 "url": m.url_pattern or "",
-                "description": m.description or "",
-                "forms": m_forms,
-                "tables": m_tables,
-            })
-
-        prompt = f"""Application: {self._app.name or 'Web Application'}
-Description: {self._app.description or 'Business application'}
-Base URL: {self._app.base_url}
-
-MODULES ({len(modules)} total):
-{json.dumps(module_detail_context[:20], indent=1)}
-
-WORKFLOWS DISCOVERED:
-{json.dumps(workflow_summaries, indent=1)}
-
-TASK: Generate MINIMUM {min_per_module} test scenarios PER MODULE (total minimum: {len(modules) * min_per_module}).
-Also add 2-3 cross-module / login / regression scenarios.
-
-For EACH module, generate scenarios covering:
-1. List/view records — navigate to module, verify table/list loads
-2. Create/add — fill the form with valid data and submit
-3. Edit/update — open an existing record and modify it
-4. Delete — delete/deactivate a record
-5. Search/filter — use search/filter and verify results
-6. Form validation — try invalid/empty inputs, verify error messages
-
-For the login module add: successful login, invalid credentials, session timeout.
-
-Each scenario MUST have:
-- title: "Verb + object + expected outcome" (max 100 chars), starting with a verb
-- description: numbered step-by-step (1. Navigate to X. 2. Click Y. 3. Verify Z. Pass if: ...)
-- priority: CRITICAL/HIGH/MEDIUM/LOW
-- module: EXACT module name from the list above (or null for app-wide)
-- tags: array of relevant tags
-- test_type: smoke|functional|regression
-
-Output ONLY this JSON (no markdown, no explanation):
-{{
-  "scenarios": [
-    {{
-      "title": "...",
-      "description": "...",
-      "priority": "HIGH",
-      "module": "exact module name",
-      "tags": ["functional","crud"],
-      "test_type": "functional"
-    }}
-  ]
-}}"""
-
-        _system = (
-            "You are a senior QA engineer. Generate MINIMUM 5 specific, actionable test scenarios "
-            "per module from the exploration data. Each title starts with a verb. "
-            "Descriptions are numbered step-by-step. Output valid JSON ONLY — no markdown."
-        )
-        scenarios_data: dict | None = None
-        # Increase token budget for larger output (many modules × 5+ scenarios)
-        max_tokens = min(8000, max(4000, len(modules) * 600))
-
-        for attempt, use_json_mode in enumerate([True, False], 1):
-            try:
-                extra = "" if attempt == 1 else (
-                    "\n\nIMPORTANT: Return ONLY the raw JSON object. No markdown fences, no extra text."
-                )
-                response = await asyncio.wait_for(
-                    self.ai.complete(
-                        system=_system,
-                        user=prompt + extra,
-                        json_mode=use_json_mode,
-                        max_tokens=max_tokens,
-                    ),
-                    timeout=120.0,
-                )
-                if response.content.strip():
-                    scenarios_data = response.json()
-                    break
-                log.warning("Scenario generation returned empty content", attempt=attempt)
-            except Exception as e:
-                log.warning("Scenario generation attempt failed", attempt=attempt, error=str(e))
-                if attempt == 2:
-                    await self._log("WARNING", "scenarios",
-                        f"Could not generate scenarios: {str(e)[:100]}")
-                    return 0
-
-        if not scenarios_data:
-            await self._log("WARNING", "scenarios", "AI returned empty scenario data — skipping")
-            return 0
+                "forms": m_forms[:6],
+                "tables": m_tables[:6],
+                "workflows": m_wfs,
+                "target_scenario_count": target,
+                "coverage_types": coverage,
+            }
 
         priority_map = {
             "CRITICAL": ScenarioPriority.CRITICAL,
@@ -2242,17 +2185,91 @@ Output ONLY this JSON (no markdown, no explanation):
             "LOW": ScenarioPriority.LOW,
         }
 
-        # Track per-module counts so we can log coverage
+        _system = (
+            "You are a QA engineer. Generate test scenarios from the application data provided. "
+            "Output ONLY a JSON object: {\"scenarios\": [...]}. No markdown, no explanation."
+        )
+
+        app_header = (
+            f"Application: {self._app.name or 'Web Application'}\n"
+            f"URL: {self._app.base_url}\n\n"
+        )
+
+        # ── Batch: 3 modules per AI call (smaller batches = more scenarios without truncation) ──
+        BATCH_SIZE = 3
+        all_scenario_infos: list[dict] = []
+        batches = [modules[i:i+BATCH_SIZE] for i in range(0, len(modules), BATCH_SIZE)]
+
+        for batch_idx, batch in enumerate(batches):
+            batch_ctx = [_module_ctx(m) for m in batch]
+            module_names_str = ", ".join(m.name for m in batch)
+
+            prompt = (
+                f"{app_header}"
+                f"MODULES TO COVER: {module_names_str}\n\n"
+                f"MODULE DETAILS:\n{json.dumps(batch_ctx, indent=1)}\n\n"
+                "TASK: For each module, generate exactly the number of scenarios specified in "
+                "its 'target_scenario_count' field, covering all types listed in its "
+                "'coverage_types' field. Modules with forms need create/edit/delete/validation "
+                "scenarios. Modules with tables need search/filter/sort scenarios. "
+                "Modules with workflows need end-to-end and error-handling scenarios. "
+                "Each scenario needs: title (verb + object, max 80 chars), "
+                "description (numbered steps with clear actions and expected results, min 4 steps), "
+                "priority (CRITICAL/HIGH/MEDIUM/LOW — CRITICAL for core workflows, HIGH for CRUD, "
+                "MEDIUM for search/filter, LOW for edge cases), "
+                "module (exact name from MODULES TO COVER), tags (array), "
+                "test_type (functional/smoke/regression/negative).\n\n"
+                "Return ONLY this JSON:\n"
+                "{\"scenarios\": [{\"title\": \"...\", \"description\": \"...\", "
+                "\"priority\": \"HIGH\", \"module\": \"...\", "
+                "\"tags\": [\"functional\"], \"test_type\": \"functional\"}]}"
+            )
+
+            batch_scenarios: list[dict] = []
+            for attempt in range(1, 3):
+                try:
+                    response = await asyncio.wait_for(
+                        self.ai.complete(
+                            system=_system,
+                            user=prompt,
+                            fast=True,
+                            json_mode=True,
+                            max_tokens=6000,
+                        ),
+                        timeout=90.0,
+                    )
+                    content = response.content.strip()
+                    if not content:
+                        log.warning("Scenario batch returned empty", batch=batch_idx, attempt=attempt)
+                        continue
+                    data = response.json()
+                    batch_scenarios = data.get("scenarios") or []
+                    if batch_scenarios:
+                        break
+                except Exception as e:
+                    log.warning("Scenario batch failed", batch=batch_idx, attempt=attempt, error=str(e)[:80])
+
+            if batch_scenarios:
+                all_scenario_infos.extend(batch_scenarios)
+                await self._log("INFO", "scenarios",
+                    f"Batch {batch_idx+1}/{len(batches)}: {len(batch_scenarios)} scenarios for [{module_names_str}]")
+            else:
+                await self._log("WARNING", "scenarios",
+                    f"Batch {batch_idx+1}/{len(batches)}: no scenarios generated for [{module_names_str}]")
+
+        if not all_scenario_infos:
+            await self._log("WARNING", "scenarios", "No scenario data from any batch — skipping")
+            return 0
+
+        # ── Persist all collected scenarios ──────────────────────────────────
         module_counts: dict[str, int] = {}
         count = 0
-        max_scenarios = max(200, len(modules) * 10)
 
-        for s_info in (scenarios_data.get("scenarios") or [])[:max_scenarios]:
+        for s_info in all_scenario_infos[:500]:
             title = (s_info.get("title") or "").strip()
             if not title or len(title) > 500:
                 continue
 
-            # Match to a module
             module_id = None
             s_module = (s_info.get("module") or "").lower().strip()
             if s_module:
@@ -2271,7 +2288,7 @@ Output ONLY this JSON (no markdown, no explanation):
             if test_type and test_type not in tags:
                 tags.append(test_type)
 
-            scenario = Scenario(
+            self.db.add(Scenario(
                 application_id=application_id,
                 title=title,
                 description=(s_info.get("description") or "").strip(),
@@ -2280,17 +2297,15 @@ Output ONLY this JSON (no markdown, no explanation):
                 module_id=module_id,
                 source="ai_generated",
                 is_active=True,
-            )
-            self.db.add(scenario)
+            ))
             count += 1
 
         if count:
             await self.db.commit()
-            # Log coverage summary
-            modules_with_5plus = sum(1 for c in module_counts.values() if c >= min_per_module)
+            modules_with_5plus = sum(1 for c in module_counts.values() if c >= 5)
             await self._log("SUCCESS", "scenarios",
-                f"{count} AI test scenarios generated across {len(module_counts)} modules "
-                f"({modules_with_5plus}/{len(modules)} modules have {min_per_module}+ scenarios)")
+                f"{count} test scenarios generated across {len(module_counts)} modules "
+                f"({modules_with_5plus}/{len(modules)} modules have 5+ scenarios)")
 
         return count
 
@@ -3176,8 +3191,26 @@ Group these into logical modules.""",
                         url_map[text] = after_url
                         self._discovered_urls.add(after_url)
                         await self._log("INFO", "navigation", f"Module URL: {text!r} → {after_url}")
+                        # Some nav items navigate AND reveal sub-items in the sidebar simultaneously
+                        # (common in Angular sidebars with accordion + direct-link behavior)
+                        child_texts = await asyncio.to_thread(self._get_revealed_child_items, text)
+                        if child_texts:
+                            await self._log("INFO", "navigation",
+                                f"  {text!r} also revealed {len(child_texts)} sub-items")
+                            for child_text in child_texts:
+                                child_url = await self._navigate_to_child_item(child_text)
+                                if child_url:
+                                    url_map[child_text] = child_url
+                                    self._discovered_urls.add(child_url)
+                                    await self._log("INFO", "navigation",
+                                        f"    Sub-item: {child_text!r} → {child_url}")
+                            try:
+                                await asyncio.to_thread(self._browser.navigate, dashboard_url)
+                                await asyncio.sleep(1.0)
+                            except Exception:
+                                pass
                     else:
-                        # Possibly a parent — check for newly revealed child items
+                        # Accordion parent that didn't navigate — check for newly revealed child items
                         child_texts = await asyncio.to_thread(self._get_revealed_child_items, text)
                         if child_texts:
                             await self._log("INFO", "navigation",
@@ -3533,51 +3566,72 @@ Group these into logical modules.""",
         await self.db.commit()
 
     async def _phase_explore_pages(self, max_pages: int):
-        """Phase 3: Navigate through pages and build semantic maps."""
+        """Phase 3: Navigate through all pages and build semantic maps.
+
+        Primary strategy: click-based navigation via nav items.
+        Clicking nav items uses the SPA router — no full page reload, so the in-memory JWT
+        stays valid. This is critical for Angular/React SPAs (YLIMS, etc.) where a full
+        page reload re-checks the stored JWT and can redirect to login if it has expired.
+
+        Secondary strategy: direct URL navigation for any pages not reached via nav clicks
+        (deep links, sub-routes discovered in Phase 2b that aren't top-level nav items).
+        """
         await self._log("MILESTONE", "exploration", f"Starting deep page exploration (max {max_pages} pages)")
 
-        # Collect URLs to visit
         urls_to_visit = await self._collect_urls_to_visit()
-        reliable_count = sum(
-            1 for url, _ in urls_to_visit
-            if url in self._discovered_urls or any(
-                item.get("href", "").strip() and url.endswith(item.get("href", "").strip())
-                for item in self._raw_nav_items
-            )
-        )
         await self._log("INFO", "exploration",
-            f"URL list: {len(urls_to_visit)} URLs ({reliable_count} from nav clicks/hrefs)")
+            f"URL list: {len(urls_to_visit)} URLs, {len(self._raw_nav_items)} nav items available")
 
-        # If we have very few reliable URLs, use click-based exploration to discover pages
-        if len(urls_to_visit) <= 2:
-            await self._log("INFO", "exploration",
-                "Few URLs from navigation — using click-based page discovery")
+        # Primary: click-based navigation when nav items are present.
+        # This is the only session-safe approach for SPAs with short-lived JWTs.
+        if self._raw_nav_items:
+            await self._explore_via_nav_clicks(max_pages)
+
+            # Secondary: visit any discovered URLs not yet reached via nav clicks
+            # (Phase 2b child URLs, deep links, etc.)
+            remaining = max_pages - len(self._phase3_analyzed)
+            if remaining > 0 and urls_to_visit:
+                await self._log("INFO", "exploration",
+                    f"Visiting up to {remaining} additional URLs not covered by nav clicks")
+                for url, module_id in urls_to_visit:
+                    if remaining <= 0:
+                        break
+                    if url in self._phase3_analyzed:
+                        continue
+                    try:
+                        await self._explore_single_page(url, module_id)
+                        self._discovered_urls.add(url)
+                        remaining -= 1
+                        await asyncio.sleep(0.5)
+                    except Exception as e:
+                        log.warning("URL fallback exploration failed", url=url, error=str(e))
+
+            await self._log("SUCCESS", "exploration",
+                f"Page exploration complete — {len(self._phase3_analyzed)} pages analyzed")
+            return
+
+        # Fallback: URL-based navigation for non-SPA apps (no nav items detected)
+        if not urls_to_visit:
             await self._explore_via_nav_clicks(max_pages)
             return
 
-        visited = 0
-        analyzed_this_phase: set[str] = set()  # local dedup — _discovered_urls tracks nav URLs already
         for url, module_id in urls_to_visit:
-            if visited >= max_pages:
+            if len(self._phase3_analyzed) >= max_pages:
                 break
-            if url in analyzed_this_phase:
+            if url in self._phase3_analyzed:
                 continue
-
             try:
                 await self._explore_single_page(url, module_id)
-                analyzed_this_phase.add(url)
                 self._discovered_urls.add(url)
-                visited += 1
-
-                if visited % 5 == 0:
-                    await self._log("INFO", "exploration", f"Explored {visited} pages so far")
-
+                if len(self._phase3_analyzed) % 5 == 0:
+                    await self._log("INFO", "exploration",
+                        f"Explored {len(self._phase3_analyzed)} pages so far")
                 await asyncio.sleep(0.5)
-
             except Exception as e:
                 log.warning("Page exploration failed", url=url, error=str(e))
 
-        await self._log("SUCCESS", "exploration", f"Page exploration complete — {visited} pages analyzed")
+        await self._log("SUCCESS", "exploration",
+            f"Page exploration complete — {len(self._phase3_analyzed)} pages analyzed")
 
     async def _explore_via_nav_clicks(self, max_pages: int):
         """
@@ -3613,6 +3667,8 @@ Group these into logical modules.""",
                 continue
 
             try:
+                await self._log("INFO", "exploration", f"Navigating to: {text}")
+
                 # Return to dashboard before each top-level nav click
                 before_url = await asyncio.to_thread(self._get_full_url)
                 clicked = await asyncio.to_thread(self._click_nav_item, text)
@@ -3624,18 +3680,20 @@ Group these into logical modules.""",
                         try:
                             await asyncio.to_thread(self._browser.navigate, nav_url)
                         except Exception:
+                            await self._log("WARNING", "exploration", f"Could not navigate to: {text}")
                             continue
                     else:
+                        await self._log("WARNING", "exploration", f"Skipping (no clickable target): {text}")
                         continue
 
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1.0)
                 after_url = await asyncio.to_thread(self._get_full_url)
                 on_login = await asyncio.to_thread(self._is_login_page)
 
                 if on_login:
                     await self._log("WARNING", "exploration", f"Login redirect after clicking {text!r}")
                     await asyncio.to_thread(self._browser.navigate, dashboard_url)
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(0.8)
                     continue
 
                 page_title = await asyncio.to_thread(lambda: self._browser.driver.title)
@@ -3643,23 +3701,27 @@ Group these into logical modules.""",
                 if page_title in seen_titles and after_url == before_url:
                     # Parent item that didn't navigate — try expanding children
                     child_items = await asyncio.to_thread(self._get_revealed_child_items, text)
-                    for child_text in child_items[:5]:
+                    if child_items:
+                        await self._log("INFO", "exploration",
+                            f"{text} → expanded {len(child_items)} sub-items: {', '.join(child_items[:5])}")
+                    for child_text in child_items:
                         if visited >= max_pages:
                             break
+                        await self._log("INFO", "exploration", f"Navigating to: {text} → {child_text}")
                         child_clicked = await asyncio.to_thread(self._click_nav_item, child_text)
                         if not child_clicked:
                             continue
-                        await asyncio.sleep(1.5)
+                        await asyncio.sleep(1.0)
                         if not await asyncio.to_thread(self._is_login_page):
                             child_url = await asyncio.to_thread(self._get_full_url)
                             mod_id = await self._find_module_for_url(child_url)
-                            await self._explore_single_page(child_url, mod_id)
+                            await self._explore_single_page(child_url, mod_id, nav_hint=f"{text} → {child_text}", skip_navigate=True)
                             self._discovered_urls.add(child_url)
                             visited += 1
                 else:
                     seen_titles.add(page_title)
                     mod_id = await self._find_module_for_url(after_url)
-                    await self._explore_single_page(after_url, mod_id)
+                    await self._explore_single_page(after_url, mod_id, nav_hint=text, skip_navigate=True)
                     self._discovered_urls.add(after_url)
                     visited += 1
 
@@ -3668,7 +3730,7 @@ Group these into logical modules.""",
 
                 # Return to dashboard for next nav click
                 await asyncio.to_thread(self._browser.navigate, dashboard_url)
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(0.4)
 
             except Exception as e:
                 log.warning("Click-based exploration failed", nav_item=text, error=str(e))
@@ -3681,11 +3743,13 @@ Group these into logical modules.""",
         await self._log("SUCCESS", "exploration",
             f"Click-based exploration complete — {visited} pages analyzed")
 
-    async def _explore_single_page(self, url: str, module_id: str | None):
+    async def _explore_single_page(self, url: str, module_id: str | None, nav_hint: str | None = None, skip_navigate: bool = False):
         """Explore a single page and build its semantic map."""
         try:
-            await asyncio.to_thread(self._browser.navigate, url)
-            await asyncio.sleep(3.0)  # Angular SPAs need 2-3s to bootstrap and run route guards
+            self._phase3_analyzed.add(url)  # mark attempted — prevents duplicate analysis
+            if not skip_navigate:
+                await asyncio.to_thread(self._browser.navigate, url)
+                await asyncio.sleep(2.0)  # Angular SPAs need ~2s to bootstrap after a full load
 
             # Skip error pages — not worth analyzing
             page_title = await asyncio.to_thread(lambda: self._browser.driver.title)
@@ -3709,10 +3773,10 @@ Group these into logical modules.""",
                 if self._dashboard_url:
                     try:
                         await asyncio.to_thread(self._browser.navigate, self._dashboard_url)
-                        await asyncio.sleep(3.0)
+                        await asyncio.sleep(2.0)
                         if not await asyncio.to_thread(self._is_login_page):
                             await asyncio.to_thread(self._browser.navigate, url)
-                            await asyncio.sleep(3.0)
+                            await asyncio.sleep(2.0)
                             recovered = not await asyncio.to_thread(self._is_login_page)
                     except Exception:
                         pass
@@ -3722,8 +3786,9 @@ Group these into logical modules.""",
 
             state = self._extractor.extract_page_state()
             page_name = state.get("page", "Unknown Page")
+            display_name = nav_hint or page_name
 
-            await self._log("INFO", "exploration", f"Analyzing: {page_name}")
+            await self._log("INFO", "exploration", f"Analyzing: {display_name}")
 
             # AI-powered page analysis with keepalive to prevent session expiry
             page_analysis = await self._analyze_with_keepalive(state, url)
@@ -3732,13 +3797,19 @@ Group these into logical modules.""",
             if not module_id:
                 module_id = await self._find_module_for_url(url)
 
-            # Persist page
+            # Persist page — store crud_operations and navigation_structure in semantic_map
+            enriched_state = {
+                **state,
+                "crud_operations": page_analysis.get("crud_operations", {}),
+                "navigation_structure": page_analysis.get("navigation_structure", {}),
+                "key_business_objects": page_analysis.get("key_business_objects", []),
+            }
             page = ApplicationPage(
                 module_id=module_id or await self._get_default_module_id(),
                 title=page_analysis.get("page_name", page_name),
                 url=url,
                 page_type=page_analysis.get("page_type", "unknown"),
-                semantic_map=state,
+                semantic_map=enriched_state,
                 forms=page_analysis.get("forms", []),
                 tables=page_analysis.get("tables", []),
                 navigation_links=page_analysis.get("navigation_links", []),
@@ -3747,28 +3818,58 @@ Group these into logical modules.""",
             self.db.add(page)
             await self.db.flush()
 
-            # Persist workflows found on this page
+            # Persist workflows — store full step metadata, entity, preconditions, success criteria
             for wf in page_analysis.get("workflows", []):
+                raw_steps = wf.get("steps", [])
+                stages = []
+                for i, step in enumerate(raw_steps):
+                    if isinstance(step, dict):
+                        stages.append(step)
+                    else:
+                        stages.append({"step": i + 1, "action": str(step), "expected_result": ""})
+
                 workflow = ApplicationWorkflow(
                     module_id=module_id or page.module_id,
                     name=wf.get("name", "Unknown Workflow"),
                     description=wf.get("description", ""),
                     workflow_type=wf.get("type", "unknown"),
-                    stages=[{"name": s} for s in wf.get("steps", [])],
-                    entry_point={"trigger": wf.get("entry_trigger", "")},
+                    stages=stages,
+                    entry_point={
+                        "trigger": wf.get("entry_trigger", ""),
+                        "entity": wf.get("entity", ""),
+                        "preconditions": wf.get("preconditions", []),
+                    },
+                    success_indicators=wf.get("success_criteria", []),
                 )
                 self.db.add(workflow)
 
             await self.db.commit()
 
-            # Log meaningful discoveries
+            # Log what AI identified for this page
+            ai_page_name = page_analysis.get("page_name", display_name)
+            page_type = page_analysis.get("page_type", "")
+            forms_count = len(page_analysis.get("forms", []))
+            wf_count = len(page_analysis.get("workflows", []))
+
+            summary_parts = []
+            if page_type:
+                summary_parts.append(page_type)
+            if forms_count:
+                summary_parts.append(f"{forms_count} form{'s' if forms_count != 1 else ''}")
+            if wf_count:
+                summary_parts.append(f"{wf_count} workflow{'s' if wf_count != 1 else ''}")
+
+            summary = f" ({', '.join(summary_parts)})" if summary_parts else ""
+            await self._log("SUCCESS", "exploration",
+                f"Mapped: {ai_page_name}{summary}")
+
             if page_analysis.get("forms"):
-                forms_str = ", ".join(f.get("name", "form") for f in page_analysis["forms"][:3])
-                await self._log("SUCCESS", "exploration", f"Forms discovered on {page_name}: {forms_str}")
+                forms_str = ", ".join(f.get("name", "form") for f in page_analysis["forms"][:4])
+                await self._log("INFO", "exploration", f"  Forms: {forms_str}")
 
             if page_analysis.get("workflows"):
-                wf_str = ", ".join(w.get("name", "workflow") for w in page_analysis["workflows"][:3])
-                await self._log("SUCCESS", "exploration", f"Workflows identified on {page_name}: {wf_str}")
+                wf_str = ", ".join(w.get("name", "workflow") for w in page_analysis["workflows"][:4])
+                await self._log("INFO", "exploration", f"  Workflows: {wf_str}")
 
         except Exception as e:
             await self._log("WARNING", "exploration", f"Could not fully analyze page at {url}: {str(e)[:100]}")
@@ -3814,7 +3915,11 @@ Group these into logical modules.""",
             "navigation": state.get("navigation", {}),
         }
 
-        app_context = f"Application description: {self._app.description or 'Business application'}"
+        app_context = (
+            f"Application: {self._app.name or 'Business application'}\n"
+            f"Description: {self._app.description or 'Web application'}\n"
+            f"Base URL: {self._app.base_url}"
+        )
 
         try:
             response = await asyncio.wait_for(
@@ -3823,9 +3928,9 @@ Group these into logical modules.""",
                     user=f"{app_context}\n\nPage semantic state:\n{compact_state}",
                     fast=True,
                     json_mode=True,
-                    max_tokens=2000,
+                    max_tokens=3000,
                 ),
-                timeout=45.0,
+                timeout=60.0,
             )
             return response.json()
         except Exception as e:
@@ -3884,21 +3989,163 @@ Group these into logical modules.""",
         return kg
 
     async def _build_graph_data(self, application_id: str) -> dict:
-        """Serialize discovered knowledge into graph format."""
+        """Build a complete multi-layer knowledge graph: Application → Modules → Pages → Workflows."""
         modules_result = await self.db.execute(
             select(ApplicationModule).where(ApplicationModule.application_id == application_id)
         )
-        modules = modules_result.scalars().all()
+        modules = list(modules_result.scalars().all())
 
-        graph = {"nodes": [], "edges": []}
-        for module in modules:
+        pages_result = await self.db.execute(
+            select(ApplicationPage)
+            .join(ApplicationModule, ApplicationPage.module_id == ApplicationModule.id)
+            .where(ApplicationModule.application_id == application_id)
+        )
+        pages = list(pages_result.scalars().all())
+
+        workflows_result = await self.db.execute(
+            select(ApplicationWorkflow)
+            .join(ApplicationModule, ApplicationWorkflow.module_id == ApplicationModule.id)
+            .where(ApplicationModule.application_id == application_id)
+        )
+        workflows = list(workflows_result.scalars().all())
+
+        graph: dict = {"nodes": [], "edges": []}
+
+        # ── Application root node ──────────────────────────────────────────────
+        graph["nodes"].append({
+            "id": application_id,
+            "type": "application",
+            "label": self._app.name or "Application",
+            "url": self._app.base_url,
+            "modules_count": len(modules),
+            "pages_count": len(pages),
+            "workflows_count": len(workflows),
+        })
+
+        # ── Module nodes ───────────────────────────────────────────────────────
+        for m in modules:
             graph["nodes"].append({
-                "id": module.id,
+                "id": m.id,
                 "type": "module",
-                "label": module.name,
-                "description": module.description,
-                "tags": module.semantic_tags or [],
+                "label": m.name,
+                "description": m.description or "",
+                "url_pattern": m.url_pattern or "",
+                "tags": m.semantic_tags or [],
             })
+            graph["edges"].append({"from": application_id, "to": m.id, "type": "has_module"})
+
+        # ── Page nodes ─────────────────────────────────────────────────────────
+        for p in pages:
+            sem = p.semantic_map or {}
+            crud_ops = sem.get("crud_operations", {})
+            biz_objs = sem.get("key_business_objects", [])
+            nav_struct = sem.get("navigation_structure", {})
+            graph["nodes"].append({
+                "id": p.id,
+                "type": "page",
+                "label": p.title or p.url,
+                "url": p.url,
+                "page_type": p.page_type or "unknown",
+                "forms_count": len(p.forms or []),
+                "tables_count": len(p.tables or []),
+                "dynamic_behaviors_count": len(p.dynamic_behaviors or []),
+                "business_objects": biz_objs,
+                "crud_operations": crud_ops,
+                "breadcrumbs": nav_struct.get("breadcrumbs", []),
+                "related_pages": nav_struct.get("related_pages", []),
+                # Flatten form field details for quick lookup
+                "form_fields": [
+                    {
+                        "form": f.get("name", ""),
+                        "entity": f.get("entity", ""),
+                        "field": fld.get("label", ""),
+                        "type": fld.get("type", "text"),
+                        "required": fld.get("required", False),
+                        "validation": fld.get("validation", ""),
+                    }
+                    for f in (p.forms or [])
+                    for fld in (f.get("fields") or [])
+                ][:40],
+                # Table capabilities summary
+                "table_capabilities": [
+                    {
+                        "name": t.get("name", ""),
+                        "entity": t.get("entity", ""),
+                        "row_actions": t.get("row_actions", []),
+                        "bulk_actions": t.get("bulk_actions", []),
+                        "has_search": t.get("has_search", False),
+                        "has_filter": t.get("has_filter", False),
+                        "has_pagination": t.get("has_pagination", False),
+                        "pagination_type": t.get("pagination_type", ""),
+                    }
+                    for t in (p.tables or [])
+                ][:10],
+            })
+            graph["edges"].append({"from": p.module_id, "to": p.id, "type": "has_page"})
+
+        # ── Workflow nodes ─────────────────────────────────────────────────────
+        for wf in workflows:
+            ep = wf.entry_point or {}
+            graph["nodes"].append({
+                "id": wf.id,
+                "type": "workflow",
+                "label": wf.name,
+                "workflow_type": wf.workflow_type or "unknown",
+                "entity": ep.get("entity", ""),
+                "entry_trigger": ep.get("trigger", ""),
+                "preconditions": ep.get("preconditions", []),
+                "stages_count": len(wf.stages or []),
+                "stages": wf.stages or [],
+                "success_criteria": wf.success_indicators or [],
+            })
+            graph["edges"].append({"from": wf.module_id, "to": wf.id, "type": "has_workflow"})
+
+        # ── Summary indexes ────────────────────────────────────────────────────
+        # Collect all business objects across pages
+        all_biz_objs: set[str] = set()
+        for p in pages:
+            sem = p.semantic_map or {}
+            for obj in sem.get("key_business_objects", []):
+                if obj and isinstance(obj, str):
+                    all_biz_objs.add(obj)
+            for f in (p.forms or []):
+                if f.get("entity"):
+                    all_biz_objs.add(f["entity"])
+            for t in (p.tables or []):
+                if t.get("entity"):
+                    all_biz_objs.add(t["entity"])
+
+        # CRUD coverage map: entity → [create, read, update, delete]
+        crud_coverage: dict[str, list[str]] = {}
+        for wf in workflows:
+            wtype = wf.workflow_type or ""
+            entity = (wf.entry_point or {}).get("entity", "")
+            if entity and "crud" in wtype:
+                if entity not in crud_coverage:
+                    crud_coverage[entity] = []
+                op = wtype.replace("crud_", "")
+                if op not in crud_coverage[entity]:
+                    crud_coverage[entity].append(op)
+
+        # Dynamic behavior catalog
+        behavior_types: dict[str, int] = {}
+        for p in pages:
+            for beh in (p.dynamic_behaviors or []):
+                btype = beh.get("behavior", "") if isinstance(beh, dict) else str(beh)
+                behavior_types[btype] = behavior_types.get(btype, 0) + 1
+
+        graph["summary"] = {
+            "application": self._app.name or "Application",
+            "modules_count": len(modules),
+            "pages_count": len(pages),
+            "workflows_count": len(workflows),
+            "business_objects": sorted(all_biz_objs),
+            "crud_coverage": crud_coverage,
+            "dynamic_behavior_catalog": behavior_types,
+            "forms_total": sum(len(p.forms or []) for p in pages),
+            "tables_total": sum(len(p.tables or []) for p in pages),
+            "module_names": [m.name for m in modules],
+        }
 
         return graph
 

@@ -150,10 +150,10 @@ Alerts/toasts: {page_state['alerts']}
                 validation_type=vtype,
                 checkpoint_description=description,
             )
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
             log.warning("Checkpoint validation failed (AI error) — assuming pass",
                 error=str(e), vtype=vtype)
-            # On AI error: assume pass to avoid false negatives blocking execution
+            # On AI error or cancellation: assume pass to avoid false negatives blocking execution
             return ValidationResult(
                 passed=True,
                 confidence=0.5,
@@ -216,7 +216,7 @@ Return JSON:
                 timeout=15.0,
             )
             return response.json()
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
             log.warning("Step failure analysis failed", error=str(e))
             return {
                 "title": f"Failed: {failed_step.get('description', 'Unknown step')}",

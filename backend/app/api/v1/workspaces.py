@@ -1,11 +1,15 @@
 ﻿from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, delete as sql_delete
+from sqlalchemy import select, func, delete as sql_delete, update as sql_update
 from slugify import slugify
 import uuid
 
 from app.db.session import get_db
-from app.db.models import User, Workspace, WorkspaceMember, WorkspaceRole, Application
+from app.db.models import (
+    User, Workspace, WorkspaceMember, WorkspaceRole, Application,
+    Environment, Credential, EnvironmentType,
+    Scenario, ExecutionRun,
+)
 from app.core.dependencies import get_current_user, get_workspace_access
 from app.schemas.workspace import (
     WorkspaceCreate, WorkspaceResponse,
@@ -13,7 +17,6 @@ from app.schemas.workspace import (
     EnvironmentCreate, EnvironmentResponse,
     MemberInvite,
 )
-from app.db.models import Environment, Credential, EnvironmentType
 from app.core.security import encrypt_credential
 
 router = APIRouter()
@@ -87,8 +90,43 @@ async def delete_workspace(
     if not ws_result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    # Use a raw DELETE so PostgreSQL's ondelete=CASCADE constraints cascade
-    # through workspace_members, applications, and all child tables automatically.
+    # Several FKs lack ondelete=CASCADE so PostgreSQL blocks the cascade chain.
+    # Clean them up manually in dependency order before deleting the workspace.
+    app_ids_result = await db.execute(
+        select(Application.id).where(Application.workspace_id == workspace_id)
+    )
+    app_ids = [row[0] for row in app_ids_result.all()]
+
+    if app_ids:
+        # 1. Break circular FK: applications.knowledge_graph_id → knowledge_graphs
+        await db.execute(
+            sql_update(Application)
+            .where(Application.workspace_id == workspace_id)
+            .values(knowledge_graph_id=None)
+        )
+
+        # 2. Null out scenarios.module_id so module cascade-delete doesn't conflict
+        #    (scenarios also cascade from application, but order vs modules is undefined)
+        await db.execute(
+            sql_update(Scenario)
+            .where(Scenario.application_id.in_(app_ids))
+            .values(module_id=None)
+        )
+
+        # 3. Delete execution_runs — no cascade from environments, scenarios, or plans.
+        #    execution_steps / execution_logs / execution_reports cascade from runs.
+        scenario_ids_result = await db.execute(
+            select(Scenario.id).where(Scenario.application_id.in_(app_ids))
+        )
+        scenario_ids = [row[0] for row in scenario_ids_result.all()]
+        if scenario_ids:
+            await db.execute(
+                sql_delete(ExecutionRun).where(ExecutionRun.scenario_id.in_(scenario_ids))
+            )
+
+        await db.commit()
+
+    # Now delete the workspace — CASCADE handles the rest cleanly
     await db.execute(sql_delete(Workspace).where(Workspace.id == workspace_id))
     await db.commit()
 
