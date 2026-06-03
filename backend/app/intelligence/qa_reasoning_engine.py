@@ -31,7 +31,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.db.models import (
-    Application, ApplicationModule, ApplicationPage, SemanticElement, Scenario,
+    Application, ApplicationModule, ApplicationPage, ApplicationWorkflow,
+    SemanticElement, Scenario,
 )
 from app.intelligence.ai_client import get_ai_client
 
@@ -646,7 +647,7 @@ OUTPUT — Return ONLY valid JSON (no markdown, no explanation)
   },
   "steps": [
     {
-      "action": "screenshot|navigate|click|fill|clear|select|key_press|assert_visible|assert_text|assert_not_text|assert_url|assert_count|wait_network|wait_element|wait_ms|scroll|upload",
+      "action": "screenshot|navigate|click|fill|clear|select|key_press|hover|assert_visible|assert_text|assert_not_text|assert_url|assert_count|wait_network|wait_element|wait_ms|scroll|upload",
       "description": "Business-readable description of what this step does",
       "target": "Semantic human-readable element label",
       "value": "",
@@ -695,20 +696,23 @@ class QAReasoningEngine:
 
     # Max steps by mode — CRUD with full coverage needs 40-60 steps
     MODE_MAX_STEPS = {
-        "smoke":            15,
-        "functional":       50,
-        "validation_heavy": 75,
-        "regression":       100,
-        "workflow_heavy":   120,
+        "smoke":            10,
+        "functional":       30,
+        "validation_heavy": 40,
+        "regression":       60,
+        "workflow_heavy":   80,
     }
 
-    # AI token budget — larger plans need more output tokens
+    # AI token budget — reasoning models (gpt-5-mini, o3-mini) consume internal thinking
+    # tokens BEFORE writing output. With a ~8k-token system+user prompt, gpt-5-mini uses
+    # roughly 6,000-10,000 reasoning tokens internally, leaving the rest for the plan JSON.
+    # A 20-step plan JSON is ~3,000-5,000 tokens, so 24k gives comfortable headroom.
     MODE_MAX_TOKENS = {
-        "smoke":            2000,
-        "functional":       4000,
-        "validation_heavy": 5000,
-        "regression":       6000,
-        "workflow_heavy":   6000,
+        "smoke":            12000,
+        "functional":       16000,
+        "validation_heavy": 20000,
+        "regression":       24000,
+        "workflow_heavy":   28000,
     }
 
     def __init__(self, db: AsyncSession):
@@ -736,7 +740,13 @@ class QAReasoningEngine:
             mode=execution_mode,
         )
 
+        # Resolve module URL now so the fallback can navigate to the right place
+        _module_url = "/"
+        if app_context.get("scenario_module"):
+            _module_url = app_context["scenario_module"].get("url") or "/"
+
         plan_data: dict | None = None
+        last_error: str = ""
 
         # Two attempts: json_mode first, raw second (Azure doesn't always support json_mode)
         for attempt, use_json in enumerate([True, False], 1):
@@ -752,19 +762,29 @@ class QAReasoningEngine:
                         json_mode=use_json,
                         max_tokens=max_tokens,
                     ),
-                    timeout=90.0,
+                    timeout=120.0,
                 )
                 if response.content.strip():
                     plan_data = response.json()
                     break
+                else:
+                    last_error = f"AI returned empty content (attempt {attempt})"
+                    log.warning("QA reasoning empty response", attempt=attempt,
+                                finish_reason="empty", content_len=0)
             except (Exception, asyncio.CancelledError) as e:
-                log.warning("QA reasoning attempt failed", attempt=attempt, error=str(e))
+                last_error = f"{type(e).__name__}: {str(e)[:200]}"
+                log.warning("QA reasoning attempt failed", attempt=attempt, error=last_error)
                 if attempt == 2:
-                    log.error("QA reasoning failed after 2 attempts — using fallback")
-                    return self._fallback_plan(scenario)
+                    log.error("QA reasoning failed after 2 attempts — using fallback",
+                              module_url=_module_url, last_error=last_error)
+                    fb = self._fallback_plan(scenario, module_url=_module_url)
+                    fb["qa_reasoning"] = f"Fallback plan — AI error: {last_error}"
+                    return fb
 
         if not plan_data:
-            return self._fallback_plan(scenario)
+            fb = self._fallback_plan(scenario, module_url=_module_url)
+            fb["qa_reasoning"] = f"Fallback plan — AI returned no data. {last_error}"
+            return fb
 
         # Post-process: sanitize + cap + enforce screenshots
         plan_data = self._post_process(plan_data, max_steps)
@@ -822,13 +842,14 @@ class QAReasoningEngine:
                         "css": el.css_selector or "",
                     })
 
-        # Pages for the scenario module
+        # Pages for the scenario module — with full form field details
         module_pages: list[dict] = []
+        module_forms: list[dict] = []   # full form definitions including all fields
         if scenario.module_id:
             pages_result = await self.db.execute(
                 select(ApplicationPage)
                 .where(ApplicationPage.module_id == scenario.module_id)
-                .limit(5)
+                .limit(8)
             )
             for p in pages_result.scalars().all():
                 module_pages.append({
@@ -836,7 +857,61 @@ class QAReasoningEngine:
                     "url": p.url,
                     "type": p.page_type,
                     "forms": [f.get("name", "") for f in (p.forms or [])[:3]],
-                    "tables": [t.get("name", "") for t in (p.tables or [])[:2]],
+                    "tables": [
+                        {
+                            "name": t.get("name", ""),
+                            "columns": [c.get("name", "") for c in t.get("columns", [])[:8]],
+                            "row_actions": t.get("row_actions", [])[:5],
+                            "has_search": t.get("has_search", False),
+                            "has_filter": t.get("has_filter", False),
+                        }
+                        for t in (p.tables or [])[:3]
+                    ],
+                })
+                # Collect full form definitions with field details
+                for form in (p.forms or [])[:3]:
+                    fields = form.get("fields", [])
+                    if not fields:
+                        continue
+                    module_forms.append({
+                        "name": form.get("name", ""),
+                        "purpose": form.get("purpose", ""),
+                        "entity": form.get("entity", ""),
+                        "page_title": p.title,
+                        "page_url": p.url,
+                        "fields": [
+                            {
+                                "label": f.get("label", ""),
+                                "type": f.get("type", "text"),
+                                "required": bool(f.get("required", False)),
+                                "validation": f.get("validation", ""),
+                                "options": (f.get("options") or [])[:6],
+                                "depends_on": f.get("depends_on"),
+                            }
+                            for f in fields[:25]
+                            if f.get("label")
+                        ],
+                        "submit_action": form.get("submit_action", ""),
+                        "success_message": form.get("success_message", ""),
+                        "cancel_action": form.get("cancel_action", ""),
+                    })
+
+        # Workflows for the scenario module
+        module_workflows: list[dict] = []
+        if scenario.module_id:
+            wf_result = await self.db.execute(
+                select(ApplicationWorkflow)
+                .where(ApplicationWorkflow.module_id == scenario.module_id)
+                .limit(6)
+            )
+            for wf in wf_result.scalars().all():
+                module_workflows.append({
+                    "name": wf.name,
+                    "type": wf.workflow_type or "",
+                    "description": wf.description or "",
+                    "entry_point": wf.entry_point or {},
+                    "stages": (wf.stages or [])[:8],
+                    "success_indicators": (wf.success_indicators or [])[:3],
                 })
 
         return {
@@ -854,6 +929,8 @@ class QAReasoningEngine:
             ],
             "known_elements": known_elements[:15],
             "module_pages": module_pages,
+            "module_forms": module_forms,        # NEW: full form field definitions
+            "module_workflows": module_workflows, # NEW: discovered workflow definitions
         }
 
     # ─── Prompt Construction ──────────────────────────────────────────────────
@@ -973,10 +1050,62 @@ Module Description: {m['description'] or 'N/A'}
 
         pages_block = ""
         if ctx.get("module_pages"):
-            pages_block = "\nEXPLORED PAGES:\n" + "\n".join(
-                f"  - {p['title']} ({p['url']}) forms={p['forms']} tables={p['tables']}"
-                for p in ctx["module_pages"]
-            )
+            lines = ["\nEXPLORED PAGES:"]
+            for p in ctx["module_pages"]:
+                tables_info = ""
+                for t in p.get("tables", []):
+                    cols = ", ".join(t.get("columns", []))
+                    acts = ", ".join(t.get("row_actions", []))
+                    tables_info += f"\n      TABLE '{t['name']}': columns=[{cols}] row_actions=[{acts}]"
+                lines.append(
+                    f"  - {p['title']} ({p['url']}) forms={p['forms']}{tables_info}"
+                )
+            pages_block = "\n".join(lines)
+
+        forms_block = ""
+        if ctx.get("module_forms"):
+            lines = ["\nDISCOVERED FORMS WITH FIELDS (use these exact field names in your plan):"]
+            for form in ctx["module_forms"][:4]:
+                lines.append(
+                    f"\n  FORM: \"{form['name']}\" on {form['page_title']}"
+                )
+                if form.get("purpose"):
+                    lines.append(f"  Purpose: {form['purpose']}")
+                if form.get("entity"):
+                    lines.append(f"  Entity: {form['entity']}")
+                if form.get("submit_action"):
+                    lines.append(f"  Submit button: \"{form['submit_action']}\"")
+                if form.get("success_message"):
+                    lines.append(f"  Success indicator: \"{form['success_message']}\"")
+                lines.append("  Fields:")
+                for f in form.get("fields", []):
+                    req = " [REQUIRED]" if f.get("required") else ""
+                    val = f" — {f['validation']}" if f.get("validation") else ""
+                    opts_list = f.get("options") or []
+                    opts = f" options=[{', '.join(str(o) for o in opts_list[:5])}]" if opts_list else ""
+                    lines.append(f"    • \"{f['label']}\" ({f['type']}){req}{val}{opts}")
+            forms_block = "\n".join(lines)
+
+        workflows_block = ""
+        if ctx.get("module_workflows"):
+            lines = ["\nDISCOVERED WORKFLOWS (from exploration):"]
+            for wf in ctx["module_workflows"][:4]:
+                lines.append(f"\n  WORKFLOW: \"{wf['name']}\" ({wf.get('type', '')})")
+                if wf.get("description"):
+                    lines.append(f"  Description: {wf['description']}")
+                ep = wf.get("entry_point") or {}
+                if ep.get("trigger"):
+                    lines.append(f"  Entry trigger: \"{ep['trigger']}\"")
+                for stage in wf.get("stages", [])[:6]:
+                    step_n = stage.get("step") or stage.get("stage", "?")
+                    action = stage.get("action", stage.get("description", ""))
+                    expected = stage.get("expected_result", "")
+                    if action:
+                        suffix = f" → {expected}" if expected else ""
+                        lines.append(f"    Step {step_n}: {action}{suffix}")
+                for si in wf.get("success_indicators", [])[:2]:
+                    lines.append(f"  ✓ Success: {si}")
+            workflows_block = "\n".join(lines)
 
         # Infer workflow type for capability context (best-effort; AI will classify definitively)
         title_lower = scenario.title.lower()
@@ -1020,24 +1149,28 @@ ALL MODULES:
 {json.dumps(ctx['all_modules'], indent=1)}
 {elements_block}
 {pages_block}
+{forms_block}
+{workflows_block}
 
 INSTRUCTIONS:
 1. Classify this scenario into the correct workflow_type.
 2. Generate the COMPLETE execution plan following the matching workflow expansion.
 3. MANDATORY: Include negative tests, edge cases, and validations — not just the happy path.
-4. Use semantic human-readable targets (element labels, button text, field names).
+4. Use semantic human-readable targets — use EXACT field labels from DISCOVERED FORMS above (e.g., "First Name field", "Email field", "Save button").
 5. Every assertion must verify a REAL observable change — not trivially pass.
 6. For CRUD: generate ALL 10 phases including form validation, duplicate check, cancel-delete, confirmed delete.
 7. For SEARCH: include exact match, partial match, case-insensitive, no-results, clear.
 8. For PAGINATION: real Next/Prev/Goto clicks with page number verification.
 9. For SORTING: real column header clicks with ascending/descending indicator verification.
 10. Think like a senior QA engineer covering the FULL feature — not just a smoke test.
+11. CRITICAL: For the navigate step, use the exact Module URL from context. NEVER navigate to "/" — use the module's specific URL hash route.
+12. If DISCOVERED FORMS are provided, reference the exact field names and the submit button label in your steps.
 {capability_ctx}"""
 
     # ─── Post-processing ──────────────────────────────────────────────────────
 
     ALLOWED_ACTIONS = frozenset([
-        "navigate", "click", "fill", "clear", "select", "key_press",
+        "navigate", "click", "fill", "clear", "select", "key_press", "hover",
         "assert_visible", "assert_text", "assert_not_text", "assert_url",
         "assert_count", "wait_network", "wait_element", "wait_ms",
         "scroll", "upload", "screenshot", "assert_ai_semantic",
@@ -1104,7 +1237,13 @@ INSTRUCTIONS:
 
     # ─── Fallback ─────────────────────────────────────────────────────────────
 
-    def _fallback_plan(self, scenario: Scenario) -> dict:
+    def _fallback_plan(self, scenario: Scenario, module_url: str = "/") -> dict:
+        """
+        Minimal but executable fallback plan used when AI reasoning fails.
+        Uses the module URL when available so the test at least opens the right page.
+        """
+        nav_url = module_url or "/"
+        # assert_visible needs a non-empty text/target; use a page-agnostic heading check
         return {
             "workflow": "BASIC_NAVIGATE",
             "workflow_type": "NAVIGATION",
@@ -1120,12 +1259,14 @@ INSTRUCTIONS:
             "steps": [
                 {"action": "screenshot", "description": "Capture initial state", "timeout_ms": 5000,
                  "on_fail": "skip", "checkpoint": False, "business_intent": "Initial evidence", "phase": "SETUP"},
-                {"action": "navigate", "description": "Open application", "url": "/",
+                {"action": "navigate", "description": f"Open {scenario.title}", "url": nav_url,
                  "timeout_ms": 15000, "on_fail": "fail", "checkpoint": False,
-                 "business_intent": "Navigate to application", "phase": "NAVIGATE"},
-                {"action": "assert_visible", "description": "Verify page loaded", "text": "",
-                 "target": "page body", "timeout_ms": 10000, "on_fail": "fail", "checkpoint": True,
-                 "business_intent": "Application responds and loads", "phase": "VERIFY_LOADED"},
+                 "business_intent": "Navigate to target module", "phase": "NAVIGATE"},
+                {"action": "wait_ms", "description": "Wait for Angular SPA to render", "ms": 2000,
+                 "timeout_ms": 5000, "on_fail": "skip", "checkpoint": False,
+                 "business_intent": "Allow SPA route change to complete", "phase": "NAVIGATE"},
+                {"action": "screenshot", "description": "Capture page after navigation", "timeout_ms": 5000,
+                 "on_fail": "skip", "checkpoint": True, "business_intent": "Evidence page loaded", "phase": "VERIFY_LOADED"},
                 {"action": "screenshot", "description": "Capture final state", "timeout_ms": 5000,
                  "on_fail": "skip", "checkpoint": False, "business_intent": "Final evidence", "phase": "TEARDOWN"},
             ],

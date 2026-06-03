@@ -175,6 +175,7 @@ class Application(Base):
     modules = relationship("ApplicationModule", back_populates="application", cascade="all, delete-orphan")
     memory_chunks = relationship("AIMemoryChunk", back_populates="application", cascade="all, delete-orphan")
     workspace_preferences = relationship("WorkspacePreference", back_populates="application", cascade="all, delete-orphan")
+    rbac_scans = relationship("RBACScan", back_populates="application", cascade="all, delete-orphan")
 
 
 class Environment(Base):
@@ -209,6 +210,23 @@ class Credential(Base):
 
     application = relationship("Application", back_populates="credentials")
     environment = relationship("Environment", back_populates="credentials")
+
+
+class RBACScan(Base):
+    """RBAC permission scan — logs in as each role and records accessible modules."""
+    __tablename__ = "rbac_scans"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    application_id = Column(String, ForeignKey("applications.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String(50), default="pending")  # pending, running, completed, failed
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+    results = Column(JSON, default=dict)  # {modules, roles, scanned_at, progress}
+    error_message = Column(Text)
+    triggered_by = Column(String, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=_now)
+
+    application = relationship("Application", back_populates="rbac_scans")
 
 
 # ─── Explore Engine ───────────────────────────────────────────────────────────

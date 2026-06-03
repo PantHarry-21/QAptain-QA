@@ -619,6 +619,7 @@ async def generate_execution_plan(
             select(ExecutionPlan)
             .where(ExecutionPlan.scenario_id == scenario_id)
             .order_by(ExecutionPlan.created_at.desc())
+            .limit(1)
         )
         existing_plan = existing.scalar_one_or_none()
         if existing_plan:
@@ -810,3 +811,318 @@ async def smart_generate_scenarios(
         "categories": ["happy_path", "edge_case", "negative", "regression"],
         "scenarios": [_enrich_scenario(s, modules_by_id) for s in scenarios],
     }
+
+
+# ─── AI Copilot: generate scenarios / user stories from plain description ─────
+
+class AICopilotRequest(BaseModel):
+    description: str
+    application_id: str
+    output_type: str = "scenarios"   # "scenarios" | "user_stories"
+
+
+@router.post("/ai-copilot/generate")
+async def ai_copilot_generate(
+    payload: AICopilotRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    AI Copilot: generate test scenarios / user stories from plain-language description.
+
+    When exploration data exists for the application, the AI receives:
+      - Exact module name + URL
+      - Exact form field labels (Name, Code, Status…)
+      - Exact trigger button labels ("New Generic Master")
+      - Table structure for list-verification steps
+      - Discovered workflow steps from real navigation
+
+    Without exploration data, falls back to generic AI generation.
+    """
+    import asyncio
+    from app.db.models import Application
+    from app.intelligence.copilot_context_builder import CopilotContextBuilder
+
+    app_result = await db.execute(select(Application).where(Application.id == payload.application_id))
+    app = app_result.scalar_one_or_none()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    # ── Build exploration context ──────────────────────────────────────────────
+    ctx = await CopilotContextBuilder(db).build(payload.description, payload.application_id)
+    is_user_stories = payload.output_type == "user_stories"
+
+    if ctx["has_exploration_data"]:
+        system_prompt, user_prompt = _build_contextual_prompt(app, ctx, payload.description, is_user_stories)
+    else:
+        system_prompt, user_prompt = _build_generic_prompt(app, ctx, payload.description, is_user_stories)
+
+    ai = get_ai_client()
+    try:
+        response = await asyncio.wait_for(
+            ai.complete(system=system_prompt, user=user_prompt, fast=False, json_mode=True, max_tokens=16000),
+            timeout=60.0,
+        )
+        result = response.json()
+        items = result.get("items", [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI generation failed: {str(e)[:200]}")
+
+    return {
+        "output_type": payload.output_type,
+        "items": items,
+        "application_id": payload.application_id,
+        "context_used": ctx["has_exploration_data"],
+        "matched_module": ctx.get("module", {}).get("name") if ctx["has_exploration_data"] else None,
+    }
+
+
+# ─── Prompt builders ──────────────────────────────────────────────────────────
+
+def _build_contextual_prompt(
+    app,
+    ctx: dict,
+    description: str,
+    is_user_stories: bool,
+) -> tuple[str, str]:
+    """
+    Build a prompt grounded in real exploration data.
+    Includes exact module URL, button labels, form fields, and table columns.
+    """
+    module = ctx["module"]
+    operation = ctx["operation"]
+    forms = ctx["forms"]
+    tables = ctx["tables"]
+    elements = ctx["elements"]
+    matched_wf = ctx.get("matched_workflow")
+
+    # ── Module section ─────────────────────────────────────────────────────────
+    mod_section = f"MODULE: {module['name']}\nURL: {module['url'] or 'not captured'}\n"
+    if module.get("description"):
+        mod_section += f"Description: {module['description']}\n"
+
+    # ── Form fields section ────────────────────────────────────────────────────
+    form_section = ""
+    if forms:
+        form_section = "\nFORMS (discovered during exploration):\n"
+        for form in forms[:3]:
+            form_section += f"  Form: {form.get('name', 'Form')}\n"
+            if form.get("purpose"):
+                form_section += f"  Purpose: {form['purpose']}\n"
+            fields = form.get("fields") or []
+            if fields:
+                form_section += "  Fields:\n"
+                for f in fields[:20]:
+                    req = " (REQUIRED)" if f.get("required") else ""
+                    opts = ""
+                    if f.get("options"):
+                        opts = f" [options: {', '.join(str(o) for o in f['options'][:5])}]"
+                    val = f" — validation: {f['validation']}" if f.get("validation") else ""
+                    form_section += f"    - {f['label']}: {f.get('type', 'text')}{req}{opts}{val}\n"
+            if form.get("success_message"):
+                form_section += f"  Success indicator: {form['success_message']}\n"
+            if form.get("submit_action"):
+                form_section += f"  Submit action: {form['submit_action']}\n"
+
+    # ── Buttons / elements section ─────────────────────────────────────────────
+    button_labels = [e["label"] for e in elements if e["type"] in ("button", "link", "element")]
+    field_labels  = [e["label"] for e in elements if e["type"] in ("textbox", "input", "dropdown", "select")]
+    elem_section = ""
+    if button_labels:
+        elem_section += f"\nACTION BUTTONS (exact labels from exploration):\n"
+        for b in button_labels[:15]:
+            elem_section += f"  - \"{b}\"\n"
+    if field_labels:
+        elem_section += f"\nFORM INPUTS (exact labels from exploration):\n"
+        for f in field_labels[:15]:
+            elem_section += f"  - \"{f}\"\n"
+
+    # ── Tables section ─────────────────────────────────────────────────────────
+    table_section = ""
+    if tables:
+        table_section = "\nLIST/TABLE (for verification steps):\n"
+        for tbl in tables[:2]:
+            table_section += f"  Table: {tbl.get('name', 'List')}\n"
+            cols = tbl.get("columns") or []
+            if cols:
+                table_section += f"  Columns: {', '.join(c.get('name', '') for c in cols[:8])}\n"
+            row_actions = tbl.get("row_actions") or []
+            if row_actions:
+                table_section += f"  Row actions: {', '.join(str(a) for a in row_actions[:5])}\n"
+            if tbl.get("has_search"):
+                table_section += "  Has search bar: YES\n"
+
+    # ── Workflow section ───────────────────────────────────────────────────────
+    wf_section = ""
+    if matched_wf:
+        wf_section = f"\nDISCOVERED WORKFLOW: {matched_wf['name']} (type: {matched_wf['type']})\n"
+        if matched_wf.get("trigger"):
+            wf_section += f"  Entry trigger: \"{matched_wf['trigger']}\"\n"
+        if matched_wf.get("preconditions"):
+            wf_section += f"  Preconditions: {', '.join(matched_wf['preconditions'][:3])}\n"
+        stages = matched_wf.get("stages") or []
+        if stages:
+            wf_section += "  Steps discovered:\n"
+            for stage in stages[:8]:
+                action = stage.get("action", "")
+                expected = stage.get("expected_result", "")
+                wf_section += f"    {stage.get('step', '')}. {action}"
+                if expected:
+                    wf_section += f" → {expected}"
+                wf_section += "\n"
+        if matched_wf.get("success_indicators"):
+            wf_section += f"  Success indicators: {', '.join(str(s) for s in matched_wf['success_indicators'][:3])}\n"
+
+    # ── Operation hint ─────────────────────────────────────────────────────────
+    op_hints = {
+        "crud_create": "Generate: validation tests (empty, spaces, boundaries) + happy path + list verification + duplicates",
+        "crud_update": "Generate: validation on edit form + happy path update + verify changes persist + cancel flow",
+        "crud_delete": "Generate: delete confirmation flow + verify removed from list + undo/soft-delete if applicable",
+        "crud_read":   "Generate: list loads correctly + pagination + sorting + empty state + data accuracy",
+        "search":      "Generate: exact match + partial match + no results + special characters + filter combinations",
+    }
+    op_instruction = op_hints.get(operation, "Generate comprehensive test scenarios covering happy path and failure cases.")
+
+    ground_truth = f"{mod_section}{form_section}{elem_section}{table_section}{wf_section}"
+
+    if is_user_stories:
+        system_prompt = f"""You are a QA Business Analyst. Generate User Stories grounded in real application data.
+
+GROUND TRUTH FROM APPLICATION EXPLORATION:
+{ground_truth}
+
+Rules:
+- Use EXACT field names, button labels, and module names from the exploration data above
+- Reference the actual URL when describing navigation
+- acceptance_criteria must be testable Given/When/Then statements using exact UI labels
+- test_hints must reference specific fields and buttons by exact name
+
+Return ONLY valid JSON:
+{{
+  "items": [
+    {{
+      "title": "As a user, I want to [action using exact module/entity name] so that [benefit]",
+      "acceptance_criteria": [
+        "Given I navigate to [exact URL], When I click '[exact button]', Then the form opens",
+        "Given the form is open, When I fill '[exact field]' and click '[submit button]', Then [success message]",
+        "Given the form is open, When I leave '[required field]' empty and click Save, Then a validation error appears"
+      ],
+      "priority": "HIGH | MEDIUM | LOW",
+      "test_hints": [
+        "Test '[exact button]' without filling '[required field]'",
+        "Test with valid data in all fields",
+        "Test search in list for the created record"
+      ]
+    }}
+  ]
+}}"""
+
+        user_prompt = f"""Application: {app.name} (base URL: {app.base_url})
+User request: {description}
+Operation type detected: {operation}
+{op_instruction}
+
+Generate 3-5 User Stories using ONLY the exact element names and URLs from the ground truth above."""
+
+    else:
+        system_prompt = f"""You are a Senior QA Engineer generating executable test scenarios from real application data.
+
+GROUND TRUTH FROM APPLICATION EXPLORATION:
+{ground_truth}
+
+Rules:
+- Use EXACT button labels (e.g. "New Generic Master", not "Add button")
+- Use EXACT field labels (e.g. "Name", "Code", "Status" — as listed in FORM INPUTS above)
+- Include the exact module URL in navigation steps
+- Each scenario description must be a step-by-step instruction a Selenium test runner can follow
+- For CRUD_CREATE: always include validation test (empty save), spaces test, valid data test, and list verification
+- description format: "Navigate to [URL]. Click '[Button]'. [Fill/Assert/Verify steps with exact labels]."
+
+Return ONLY valid JSON:
+{{
+  "items": [
+    {{
+      "title": "Verify [specific action] on [exact module name]",
+      "description": "Navigate to [exact URL]. Click '[exact button label]'. [Step-by-step with exact field names]. Verify [exact success indicator].",
+      "priority": "HIGH | MEDIUM | LOW",
+      "category": "happy_path | negative | edge_case | validation | regression"
+    }}
+  ]
+}}"""
+
+        user_prompt = f"""Application: {app.name} (base URL: {app.base_url})
+User request: {description}
+Operation type detected: {operation}
+{op_instruction}
+
+Generate 5-7 test scenarios using ONLY the exact element names, field labels, and URLs from the ground truth above.
+Do NOT invent field names or button labels — use what is listed."""
+
+    return system_prompt, user_prompt
+
+
+def _build_generic_prompt(
+    app,
+    ctx: dict,
+    description: str,
+    is_user_stories: bool,
+) -> tuple[str, str]:
+    """
+    Fallback prompt when no exploration data is available.
+    Identical to the original behavior.
+    """
+    all_module_names = ctx.get("all_module_names", [])
+    module_hint = ""
+    if all_module_names:
+        module_hint = "Known modules: " + ", ".join(all_module_names[:10]) + "\n"
+
+    if is_user_stories:
+        system_prompt = """You are a QA Business Analyst. Convert a plain description into well-structured User Stories for testing.
+
+Format each user story as:
+- title: "As a [role], I want to [action] so that [benefit]"
+- acceptance_criteria: list of 3-5 testable conditions (Given/When/Then format)
+- priority: HIGH | MEDIUM | LOW
+- test_hints: 2-3 specific test scenarios this story implies
+
+Return ONLY valid JSON:
+{
+  "items": [
+    {
+      "title": "As an admin, I want to add a product so that inventory is updated",
+      "acceptance_criteria": [
+        "Given I am on the Products page, When I click Add, Then the Add Product form opens",
+        "Given the form is open, When I fill all required fields and click Save, Then the product appears in the list",
+        "Given the form is open, When I click Save without filling Name, Then an error is shown"
+      ],
+      "priority": "HIGH",
+      "test_hints": ["Test empty form submission", "Test with valid data", "Test duplicate name"]
+    }
+  ]
+}"""
+    else:
+        system_prompt = """You are a Senior QA Engineer. Convert a plain description into specific, executable test scenarios.
+
+Include: happy path, negative tests, edge cases, and business rule validations.
+
+Return ONLY valid JSON:
+{
+  "items": [
+    {
+      "title": "Verify successful creation with all required fields",
+      "description": "Navigate to the module. Click Add/New. Fill all required fields with valid data. Save and verify the record appears in the list.",
+      "priority": "HIGH",
+      "category": "happy_path"
+    }
+  ]
+}"""
+
+    user_prompt = (
+        f"Application: {app.name}\nBase URL: {app.base_url}\n"
+        f"{module_hint}"
+        f"\nNote: This application has not been explored yet — no element data available. "
+        f"Generate best-effort scenarios.\n"
+        f"\nUser request: {description}"
+    )
+
+    return system_prompt, user_prompt

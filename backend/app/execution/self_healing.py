@@ -186,79 +186,133 @@ class SelfHealingEngine:
         """
         Build ordered list of (strategy_name, by, selector) tuples.
         Semantic strategies first, technical last.
+        Angular Material strategies are interleaved throughout because
+        mat-label / mat-form-field don't use standard HTML label[for] binding.
         """
         label_lower = label.lower().strip()
         label_escaped = label.replace('"', '\\"')
+        xl = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        xs = "abcdefghijklmnopqrstuvwxyz"
+        ci = f'translate(., "{xl}", "{xs}")'          # normalize case on text()
+        ca = f'translate(@aria-label, "{xl}", "{xs}")'  # normalize case on aria-label
+
         strategies = []
 
-        # 1. Aria-label exact match
+        # 1. Aria-label exact match (works for many Angular components)
         strategies.append((
             "aria_label_exact",
             By.CSS_SELECTOR,
             f'[aria-label="{label_escaped}"]',
         ))
 
-        # 2. Aria-label contains (case-insensitive via XPath)
+        # 2. Aria-label contains (case-insensitive)
         strategies.append((
             "aria_label_contains",
             By.XPATH,
-            f'//*[contains(translate(@aria-label, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "{label_lower}")]',
+            f'//*[contains({ca}, "{label_lower}")]',
         ))
 
-        # 3. Label[for] match
+        # 3. Angular Material: mat-form-field containing a mat-label or label with matching text
+        #    Returns the actual input/textarea/mat-select inside that field.
+        #    This is the PRIMARY strategy for all Angular Material form inputs.
+        strategies.append((
+            "mat_form_field_input",
+            By.XPATH,
+            f'//mat-form-field[.//*[contains({ci}, "{label_lower}")]]//input',
+        ))
+        strategies.append((
+            "mat_form_field_textarea",
+            By.XPATH,
+            f'//mat-form-field[.//*[contains({ci}, "{label_lower}")]]//textarea',
+        ))
+        strategies.append((
+            "mat_form_field_select",
+            By.XPATH,
+            f'//mat-form-field[.//*[contains({ci}, "{label_lower}")]]//mat-select',
+        ))
+
+        # 4. Standard label[for] match (HTML5 forms)
         strategies.append((
             "label_text",
             By.XPATH,
-            f'//label[contains(translate(text(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "{label_lower}")]//following::input[1]',
+            f'//label[contains({ci}, "{label_lower}")]//following::input[1]',
         ))
 
-        # 4. Placeholder match
+        # 5. Placeholder match
         strategies.append((
             "placeholder",
             By.XPATH,
-            f'//*[contains(translate(@placeholder, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "{label_lower}")]',
+            f'//*[contains(translate(@placeholder, "{xl}", "{xs}"), "{label_lower}")]',
         ))
 
-        # 5. Button/link text match
-        if not element_type or element_type in ("button", "link", "element"):
+        # 6. Button/link text match (Angular Material buttons render text in inner <span>)
+        if not element_type or element_type in ("button", "link", "element", None):
             strategies.append((
                 "button_text",
                 By.XPATH,
-                f'//button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "{label_lower}")]',
+                f'//button[contains({ci}, "{label_lower}")]',
+            ))
+            strategies.append((
+                "mat_button",
+                By.XPATH,
+                f'//*[@mat-button or @mat-raised-button or @mat-flat-button or @mat-stroked-button or @mat-icon-button]'
+                f'[contains({ci}, "{label_lower}")]',
             ))
             strategies.append((
                 "link_text",
                 By.XPATH,
-                f'//a[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "{label_lower}")]',
+                f'//a[contains({ci}, "{label_lower}")]',
             ))
 
-        # 6. Any element with matching text
+        # 7. Any interactive element with matching text
         strategies.append((
             "text_content",
             By.XPATH,
-            f'//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "{label_lower}") and (self::button or self::a or self::span or self::div or self::input)]',
+            f'//*[contains({ci}, "{label_lower}") and '
+            f'(self::button or self::a or self::span or self::div or self::input or self::mat-select)]',
         ))
 
-        # 7. Name attribute
+        # 8. Angular Material list/nav items (sidebar links, menu items)
+        strategies.append((
+            "mat_list_item",
+            By.XPATH,
+            f'//mat-list-item[contains({ci}, "{label_lower}")] | '
+            f'//*[@role="menuitem"][contains({ci}, "{label_lower}")] | '
+            f'//*[@role="option"][contains({ci}, "{label_lower}")]',
+        ))
+
+        # 9. Name attribute
         strategies.append((
             "name_attr",
             By.XPATH,
-            f'//*[contains(translate(@name, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "{label_lower}")]',
+            f'//*[contains(translate(@name, "{xl}", "{xs}"), "{label_lower}")]',
         ))
 
-        # 8. Title attribute
+        # 10. Title / data-testid attribute
         strategies.append((
             "title_attr",
             By.XPATH,
-            f'//*[contains(translate(@title, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "{label_lower}")]',
+            f'//*[contains(translate(@title, "{xl}", "{xs}"), "{label_lower}")] | '
+            f'//*[contains(translate(@data-testid, "{xl}", "{xs}"), "{label_lower}")]',
         ))
 
-        # Type-specific strategies
+        # Type-specific fallback strategies
         if element_type == "textbox":
-            strategies.append(("input_any", By.CSS_SELECTOR, "input:not([type='hidden']):not([type='submit'])"))
+            # For textarea fields (Angular Material and standard)
+            strategies.append((
+                "mat_form_field_any_input",
+                By.XPATH,
+                f'//mat-form-field[.//*[contains({ci}, "{label_lower}")]]'
+                f'//*[self::input or self::textarea]',
+            ))
+            strategies.append(("input_any", By.CSS_SELECTOR,
+                                "input:not([type='hidden']):not([type='submit']):not([type='checkbox']):not([type='radio'])"))
         elif element_type in ("dropdown", "combobox"):
+            strategies.append(("mat_select_any", By.CSS_SELECTOR, "mat-select"))
             strategies.append(("select_any", By.CSS_SELECTOR, "select"))
             strategies.append(("combobox_role", By.CSS_SELECTOR, '[role="combobox"]'))
+        elif element_type == "file_upload":
+            strategies.append(("file_input", By.CSS_SELECTOR, 'input[type="file"]'))
 
         return strategies
 

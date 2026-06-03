@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     AZURE_OPENAI_API_KEY: str = ""
     AZURE_OPENAI_ENDPOINT: str = ""
     AZURE_OPENAI_DEPLOYMENT: str = "gpt-4o"
-    AZURE_OPENAI_API_VERSION: str = "2024-02-01"
+    AZURE_OPENAI_API_VERSION: str = "2025-01-01-preview"
 
     # AI Models
     PRIMARY_MODEL: str = "claude-opus-4-7"

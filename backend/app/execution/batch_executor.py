@@ -85,21 +85,105 @@ class BatchExecutionOrchestrator:
                 await self._single._fail_run(run, "Environment not found")
             return
 
-        # Keep runs QUEUED — mark each RUNNING individually just before it executes
-        batch_start = datetime.utcnow()
-
+        # ── Phase 1: Pre-generate all AI plans BEFORE launching the browser ────
+        # Doing plan generation during execution (while the browser is running) doubles
+        # Azure rate-limit pressure. Pre-generating sequentially with gaps avoids 429s.
         await self._emit_batch_event("batch_started", run_ids, {
             "count": len(run_ids),
             "environment": env.name,
         })
 
+        def _plan_is_trivial(plan) -> bool:
+            """Return True if the plan is a fallback/trivial plan that needs AI regeneration."""
+            if not plan:
+                return True
+            if plan.created_by_model == "fallback":
+                return True
+            qa_reasoning = plan.plan_data.get("qa_reasoning", "")
+            if qa_reasoning.startswith("Fallback plan"):
+                return True
+            # 5 or fewer steps = trivial fallback (screenshot, navigate, wait, screenshot, screenshot)
+            if len(plan.plan_data.get("steps", [])) <= 5:
+                return True
+            return False
+
+        for pre_idx, pre_run in enumerate(runs):
+            pre_plan = await self._single._load_plan(pre_run.plan_id)
+            if not _plan_is_trivial(pre_plan):
+                continue  # already has a real AI plan — skip
+
+            pre_scenario = await self._single._load_scenario(pre_run.scenario_id)
+            if not pre_scenario:
+                continue
+
+            if pre_idx > 0:
+                await asyncio.sleep(20)   # rate-limit cooldown between scenarios (Azure 429 recovery needs ~20s)
+
+            # Try to generate a real AI plan — up to 3 attempts with cooldown on retry
+            MAX_ATTEMPTS = 3
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                await self._log_batch(pre_run.id, "INFO", "execution",
+                    f"[{pre_idx+1}/{len(runs)}] Generating AI plan: {pre_scenario.title[:60]}"
+                    + (f" (attempt {attempt}/{MAX_ATTEMPTS})" if attempt > 1 else ""))
+                try:
+                    planner = ScenarioPlanner(self.db)
+                    ai_plan = await asyncio.wait_for(
+                        planner.generate_plan(pre_scenario, pre_plan.execution_mode if pre_plan else "functional"),
+                        timeout=180.0,
+                    )
+                    pre_run.plan_id = ai_plan.id
+                    await self.db.commit()
+                    ai_reasoning = ai_plan.plan_data.get("qa_reasoning", "")
+                    is_fallback = ai_reasoning.startswith("Fallback plan")
+                    n_steps = len(ai_plan.plan_data.get("steps", []))
+
+                    if not is_fallback and n_steps > 5:
+                        # Real AI plan generated successfully
+                        await self._log_batch(pre_run.id, "INFO", "execution",
+                            f"[{pre_idx+1}/{len(runs)}] AI plan ready — "
+                            f"{n_steps} steps, type: {ai_plan.plan_data.get('workflow_type', '?')}")
+                        break
+                    else:
+                        # AI returned a fallback or trivially short plan
+                        err_detail = ai_reasoning[len("Fallback plan — "):][: 120] if is_fallback else f"only {n_steps} steps"
+                        if attempt < MAX_ATTEMPTS:
+                            await self._log_batch(pre_run.id, "WARNING", "execution",
+                                f"[{pre_idx+1}/{len(runs)}] AI plan is trivial ({err_detail}) — retrying in 30s")
+                            await asyncio.sleep(30)
+                        else:
+                            await self._log_batch(pre_run.id, "ERROR", "execution",
+                                f"[{pre_idx+1}/{len(runs)}] AI plan failed after {MAX_ATTEMPTS} attempts: {err_detail}")
+
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    if attempt < MAX_ATTEMPTS:
+                        await self._log_batch(pre_run.id, "WARNING", "execution",
+                            f"[{pre_idx+1}/{len(runs)}] AI plan timed out (attempt {attempt}) — retrying in 30s")
+                        await asyncio.sleep(30)
+                    else:
+                        await self._log_batch(pre_run.id, "ERROR", "execution",
+                            f"[{pre_idx+1}/{len(runs)}] AI plan timed out after {MAX_ATTEMPTS} attempts — execution will be skipped")
+                except Exception as plan_err:
+                    err_msg = str(plan_err)[:120]
+                    if attempt < MAX_ATTEMPTS:
+                        await self._log_batch(pre_run.id, "WARNING", "execution",
+                            f"[{pre_idx+1}/{len(runs)}] AI plan error ({err_msg}) — retrying in 30s")
+                        await asyncio.sleep(30)
+                    else:
+                        await self._log_batch(pre_run.id, "ERROR", "execution",
+                            f"[{pre_idx+1}/{len(runs)}] AI plan failed after {MAX_ATTEMPTS} attempts: {err_msg}")
+
+        # ── Phase 2: Launch browser + execute all plans ───────────────────────
+        batch_start = datetime.utcnow()
+
         browser = None
         try:
             # ── BeforeAll: Launch browser + Login once ────────────────────────
-            browser = BrowserManager.create()
-            validation_engine = ValidationEngine(browser)
-            ui_engine         = UITransitionEngine(browser)
-            safety            = SafetyGuardrails(env.base_url)
+            browser = BrowserManager.create(window_size=(1920, 1080))
+            # Checkpoint AI validation is disabled in batch mode — each call hits the Azure
+            # rate limit and 429s cascade across all scenarios in the batch.
+            # Individual single-run execution still uses ValidationEngine.
+            ui_engine = UITransitionEngine(browser)
+            safety    = SafetyGuardrails(env.base_url)
 
             runner = PlanRunner(
                 browser=browser,
@@ -109,7 +193,7 @@ class BatchExecutionOrchestrator:
                 event_callback=lambda e, d: asyncio.create_task(
                     self._emit_event(e, run_ids[0], d)
                 ),
-                validation_engine=validation_engine,
+                validation_engine=None,   # disabled — conserves rate limit for plan generation
                 ui_engine=ui_engine,
                 safety=safety,
             )
@@ -178,35 +262,29 @@ class BatchExecutionOrchestrator:
                     await self._single._fail_run(run, "Execution plan not found")
                     continue
 
-                # Get scenario for title + AI plan generation
+                # Plans were pre-generated in Phase 1 — just reload the (possibly updated) plan
                 scenario_obj = await self._single._load_scenario(run.scenario_id)
                 scenario_title = scenario_obj.title if scenario_obj else plan.plan_data.get("workflow", "Scenario")
+                # Reload plan in case Phase 1 updated run.plan_id
+                plan = await self._single._load_plan(run.plan_id) or plan
 
-                # ── Generate AI plan if this is still a fallback placeholder ──
-                # Fallback plans have only 4 trivial steps; we need real AI steps.
-                if plan.created_by_model == "fallback" and scenario_obj:
-                    await self._log_batch(run.id, "INFO", "execution",
-                        f"[{idx+1}/{len(runs)}] Generating AI test plan for: {scenario_title}")
-                    try:
-                        planner = ScenarioPlanner(self.db)
-                        ai_plan = await asyncio.wait_for(
-                            planner.generate_plan(scenario_obj, plan.execution_mode),
-                            timeout=120.0,
-                        )
-                        # Update run to point to new plan, then use it
-                        run.plan_id = ai_plan.id
-                        await self.db.commit()
-                        plan = ai_plan
-                        await self._log_batch(run.id, "INFO", "execution",
-                            f"[{idx+1}/{len(runs)}] AI plan ready — "
-                            f"{len(ai_plan.plan_data.get('steps', []))} steps, "
-                            f"type: {ai_plan.plan_data.get('workflow_type', '?')}")
-                    except (asyncio.TimeoutError, asyncio.CancelledError):
-                        await self._log_batch(run.id, "WARNING", "execution",
-                            f"[{idx+1}/{len(runs)}] AI plan timed out — using fallback 4-step plan")
-                    except Exception as plan_err:
-                        await self._log_batch(run.id, "WARNING", "execution",
-                            f"[{idx+1}/{len(runs)}] AI plan failed ({str(plan_err)[:120]}) — using fallback")
+                # Guard: refuse to execute a trivial/fallback plan and pretend it passed.
+                # A fallback plan has only 5 steps (screenshot→navigate→wait→screenshot→screenshot)
+                # and no real test actions. Running it would produce a false "PASSED" result.
+                plan_reasoning = plan.plan_data.get("qa_reasoning", "")
+                plan_steps = plan.plan_data.get("steps", [])
+                if plan_reasoning.startswith("Fallback plan") or len(plan_steps) <= 5:
+                    reason = (
+                        "AI plan generation failed — " +
+                        plan_reasoning[len("Fallback plan — "):][: 200]
+                        if plan_reasoning.startswith("Fallback plan")
+                        else f"Only {len(plan_steps)} trivial steps available — real AI plan was not generated"
+                    )
+                    await self._log_batch(run.id, "ERROR", "execution",
+                        f"[{idx+1}/{len(runs)}] SKIPPED — AI plan unavailable: {reason[:200]}. "
+                        "Check Azure OpenAI rate limits and retry the batch.")
+                    await self._single._fail_run(run, f"AI plan unavailable: {reason[:200]}")
+                    continue
 
                 # Update runner for this specific run — fresh per-scenario state
                 runner.run_id = run.id
@@ -343,7 +421,20 @@ class BatchExecutionOrchestrator:
     # ─── Event / log helpers ──────────────────────────────────────────────────
 
     async def _log_batch(self, run_id: str, level: str, category: str, message: str):
+        import uuid as _uuid_mod
+        from datetime import timezone
+        log_id = str(_uuid_mod.uuid4())
+        ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        # Emit WS first so the UI sees it immediately
+        await self._emit_event("run_log", run_id, {
+            "id": log_id,
+            "level": level,
+            "category": category,
+            "message": message,
+            "timestamp": ts,
+        })
         entry = ExecutionLog(
+            id=log_id,
             run_id=run_id,
             level=level,
             category=category,
@@ -352,11 +443,6 @@ class BatchExecutionOrchestrator:
         )
         self.db.add(entry)
         await self.db.commit()
-        await self._emit_event("run_log", run_id, {
-            "level": level,
-            "category": category,
-            "message": message,
-        })
 
     async def _emit_event(self, event: str, run_id: str, data: dict):
         msg = {"event": event, "run_id": run_id, **data}

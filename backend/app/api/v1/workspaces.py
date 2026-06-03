@@ -12,7 +12,7 @@ from app.db.models import (
 )
 from app.core.dependencies import get_current_user, get_workspace_access
 from app.schemas.workspace import (
-    WorkspaceCreate, WorkspaceResponse,
+    WorkspaceCreate, WorkspaceUpdate, WorkspaceResponse,
     ApplicationCreate, ApplicationResponse,
     EnvironmentCreate, EnvironmentResponse,
     MemberInvite,
@@ -68,6 +68,37 @@ async def get_workspace(
 
 
 # â”€â”€â”€ Applications within a Workspace â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@router.put("/{workspace_id}", response_model=WorkspaceResponse)
+async def update_workspace(
+    workspace_id: str,
+    payload: WorkspaceUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Rename / update a workspace (owner only)."""
+    ws_result = await db.execute(select(Workspace).where(Workspace.id == workspace_id))
+    ws = ws_result.scalar_one_or_none()
+    if not ws:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    member_result = await db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace_id,
+            WorkspaceMember.user_id == current_user.id,
+            WorkspaceMember.role == WorkspaceRole.OWNER,
+        )
+    )
+    if not member_result.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Only workspace owners can edit a workspace")
+    if payload.name is not None:
+        ws.name = payload.name.strip()
+        ws.slug = slugify(ws.name) or ws.slug
+    if payload.description is not None:
+        ws.description = payload.description
+    await db.commit()
+    await db.refresh(ws)
+    return WorkspaceResponse.model_validate(ws)
+
 
 @router.delete("/{workspace_id}", status_code=204)
 async def delete_workspace(

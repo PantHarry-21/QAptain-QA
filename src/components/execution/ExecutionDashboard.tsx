@@ -72,13 +72,27 @@ export function ExecutionDashboard({ runId }: ExecutionDashboardProps) {
   const [report, setReport] = useState<ExecutionReport | null>(null);
   const [showReport, setShowReport] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
+  // Track the last DB log id for incremental polling — avoids re-fetching the entire log list
+  const [lastLogId, setLastLogId] = useState<string | undefined>(undefined);
+  const lastLogIdRef = useRef<string | undefined>(undefined);
+  lastLogIdRef.current = lastLogId;
   const feedRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const socket = getSocket();
 
-  function addEntry(entry: Omit<TimelineEntry, 'id'>) {
-    setTimeline((prev) => [...prev, { ...entry, id: `${Date.now()}-${Math.random()}` }]);
+  // Merge log entries, deduplicating by id (handles WS + poll overlap)
+  function mergeLogEntries(prev: TimelineEntry[], newEntries: TimelineEntry[]): TimelineEntry[] {
+    if (newEntries.length === 0) return prev;
+    const existingIds = new Set(prev.map((e) => e.id));
+    const fresh = newEntries.filter((e) => !existingIds.has(e.id));
+    return fresh.length > 0 ? [...prev, ...fresh] : prev;
   }
+
+  // Add a client-side entry (WS step events that don't come through run_log)
+  const addEntry = (entry: Omit<TimelineEntry, 'id'>) => {
+    const id = `client-${Date.now()}-${Math.random()}`;
+    setTimeline((prev) => [...prev, { ...entry, id }]);
+  };
 
   // ── Initial load ─────────────────────────────────────────────────────────
 
@@ -90,7 +104,6 @@ export function ExecutionDashboard({ runId }: ExecutionDashboardProps) {
       ]);
       setRun(r);
 
-      // Seed timeline from existing logs
       const seeded: TimelineEntry[] = logs.map((l) => ({
         id: l.id,
         ts: l.timestamp,
@@ -100,6 +113,11 @@ export function ExecutionDashboard({ runId }: ExecutionDashboardProps) {
         message: l.message || '',
       }));
       setTimeline(seeded);
+      if (logs.length > 0) {
+        const last = logs[logs.length - 1].id;
+        setLastLogId(last);
+        lastLogIdRef.current = last;
+      }
 
       if (r.status === 'COMPLETED' || r.status === 'FAILED') {
         const rep = await executionsApi.getReport(runId);
@@ -109,7 +127,7 @@ export function ExecutionDashboard({ runId }: ExecutionDashboardProps) {
     load().catch(console.error);
   }, [runId]);
 
-  // ── Poll run + logs while active ─────────────────────────────────────────
+  // ── Poll run + logs (incremental via since_id) while active ──────────────
 
   useEffect(() => {
     if (!run) return;
@@ -117,33 +135,33 @@ export function ExecutionDashboard({ runId }: ExecutionDashboardProps) {
 
     const poll = async () => {
       try {
+        // Fetch only logs newer than what we already have
         const [r, freshLogs] = await Promise.all([
           executionsApi.get(runId),
-          executionsApi.getLogs(runId),
+          executionsApi.getLogs(runId, lastLogIdRef.current),
         ]);
         setRun(r);
 
-        // Merge new logs not already in timeline
-        setTimeline((prev) => {
-          const existingIds = new Set(prev.map((e) => e.id));
-          const newEntries: TimelineEntry[] = freshLogs
-            .filter((l) => !existingIds.has(l.id))
-            .map((l) => ({
-              id: l.id,
-              ts: l.timestamp,
-              kind: 'log' as const,
-              level: (l.level || 'INFO') as TimelineEntry['level'],
-              category: l.category || '',
-              message: l.message || '',
-            }));
-          return newEntries.length ? [...prev, ...newEntries] : prev;
-        });
+        if (freshLogs.length > 0) {
+          const newEntries: TimelineEntry[] = freshLogs.map((l) => ({
+            id: l.id,
+            ts: l.timestamp,
+            kind: 'log' as const,
+            level: (l.level || 'INFO') as TimelineEntry['level'],
+            category: l.category || '',
+            message: l.message || '',
+          }));
+          setTimeline((prev) => mergeLogEntries(prev, newEntries));
+          const newLastId = freshLogs[freshLogs.length - 1].id;
+          setLastLogId(newLastId);
+          lastLogIdRef.current = newLastId;
+        }
 
         if (r.status === 'COMPLETED' || r.status === 'FAILED') {
           const rep = await executionsApi.getReport(runId);
           setReport(rep);
         }
-      } catch { /* ignore */ }
+      } catch { /* ignore poll errors */ }
     };
 
     const t = setInterval(poll, 2500);
@@ -158,13 +176,26 @@ export function ExecutionDashboard({ runId }: ExecutionDashboardProps) {
 
     const offLog = socket.on('run_log', (data) => {
       if (data.run_id !== runId) return;
-      addEntry({
-        ts: new Date().toISOString(),
-        kind: 'log',
-        level: (data.level || 'INFO') as TimelineEntry['level'],
-        category: String(data.category || ''),
-        message: String(data.message || ''),
+      // Use server-provided id so polling deduplication works correctly.
+      // If id is absent (old server), fall back to a random id.
+      const entryId = data.id ? String(data.id) : `ws-${Date.now()}-${Math.random()}`;
+      const ts = data.timestamp ? String(data.timestamp) : new Date().toISOString();
+      setTimeline((prev) => {
+        if (prev.some((e) => e.id === entryId)) return prev;  // already have it
+        return [...prev, {
+          id: entryId,
+          ts,
+          kind: 'log' as const,
+          level: (data.level || 'INFO') as TimelineEntry['level'],
+          category: String(data.category || ''),
+          message: String(data.message || ''),
+        }];
       });
+      // Advance the incremental poll cursor so we don't re-fetch what WS delivered
+      if (data.id) {
+        lastLogIdRef.current = String(data.id);
+        setLastLogId(String(data.id));
+      }
     });
 
     const offStepStarted = socket.on('step_started', (data) => {

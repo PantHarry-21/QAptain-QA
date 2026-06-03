@@ -59,6 +59,7 @@ class PlanRunner:
     - Checkpoint validation hooks (AI validates at workflow transitions)
     - Self-healing on element not found
     - CDP-enhanced state capture
+    - Cancellation: checks `_cancelled` flag between steps
     """
 
     def __init__(
@@ -94,6 +95,7 @@ class PlanRunner:
         self._step_counter = 0
         self._current_phase = ""
         self._recent_actions: list[str] = []
+        self._cancelled = False  # set externally to abort mid-run
 
     async def execute_plan(
         self,
@@ -132,6 +134,11 @@ class PlanRunner:
         })
 
         for idx, step in enumerate(steps):
+            # Check cancellation flag between every step
+            if self._cancelled:
+                self._emit("plan_aborted", {"at_step": idx + 1, "reason": "Execution cancelled by user"})
+                break
+
             self._step_counter = idx + 1
 
             # Track current phase
@@ -361,6 +368,7 @@ class PlanRunner:
             "clear": self._action_clear,
             "select": self._action_select,
             "key_press": self._action_key_press,
+            "hover": self._action_hover,
             "assert_visible": self._action_assert_visible,
             "assert_text": self._action_assert_text,
             "assert_not_text": self._action_assert_not_text,
@@ -515,32 +523,36 @@ class PlanRunner:
             )
 
         try:
-            # JS native setter — works with Angular Material, React, Vue
+            # JS fill — works for <input> and <textarea> in Angular Material, React, Vue.
+            # Uses the native prototype setter so Angular's ControlValueAccessor detects the change.
+            # Also dispatches keydown/keyup so autocomplete/validation logic triggers.
             self.browser.execute_script("""
                 const el = arguments[0];
                 const value = arguments[1];
+                const tag = el.tagName.toLowerCase();
                 try {
-                    const setter = Object.getOwnPropertyDescriptor(
-                        window.HTMLInputElement.prototype, 'value'
-                    );
+                    const proto = tag === 'textarea'
+                        ? window.HTMLTextAreaElement.prototype
+                        : window.HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value');
                     if (setter && setter.set) {
                         setter.set.call(el, value);
                     } else {
                         el.value = value;
                     }
                 } catch(e) { el.value = value; }
-                el.dispatchEvent(new Event('input',  { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                el.dispatchEvent(new Event('blur',   { bubbles: true }));
+                ['keydown','input','keyup','change','blur'].forEach(evtName => {
+                    el.dispatchEvent(new Event(evtName, { bubbles: true }));
+                });
             """, element, str(value))
             return StepExecutionResult(
                 success=True,
-                message=f"Filled '{target}'",
+                message=f"Filled '{target}' with '{str(value)[:40]}'",
                 healing_used=strategy != "stored_selector",
                 healing_attempts=[a.__dict__ for a in attempts],
             )
         except Exception:
-            # Fallback: standard send_keys
+            # Fallback: standard send_keys (works when JS setter approach doesn't)
             try:
                 element.clear()
                 element.send_keys(str(value))
@@ -551,7 +563,7 @@ class PlanRunner:
                     healing_attempts=[a.__dict__ for a in attempts],
                 )
             except Exception as e:
-                return StepExecutionResult(success=False, message=f"Fill failed: {e}")
+                return StepExecutionResult(success=False, message=f"Fill failed for '{target}': {e}")
 
     async def _action_clear(self, step: dict) -> StepExecutionResult:
         target = step.get("target", step.get("field", ""))
@@ -614,6 +626,8 @@ class PlanRunner:
         if element is None:
             return await self._handle_custom_dropdown(target, value, attempts)
 
+        # Try native <select> first; if the element is a mat-select or custom
+        # component, Select() will throw — fall through to the custom dropdown handler.
         try:
             sel = Select(element)
             try:
@@ -621,8 +635,9 @@ class PlanRunner:
             except Exception:
                 sel.select_by_value(str(value))
             return StepExecutionResult(success=True, message=f"Selected '{value}' in '{target}'")
-        except Exception as e:
-            return StepExecutionResult(success=False, message=f"Select failed: {e}")
+        except Exception:
+            # Not a native <select> — treat as Angular Material / custom dropdown
+            return await self._handle_custom_dropdown(target, value, attempts)
 
     async def _handle_custom_dropdown(
         self, target: str, value: str, prior_attempts: list
@@ -661,11 +676,15 @@ class PlanRunner:
         )
 
     async def _action_assert_visible(self, step: dict) -> StepExecutionResult:
-        text = step.get("text", step.get("target", ""))
-        timeout = max(step.get("timeout_ms", 10000) / 1000, 10.0)
+        # Use `or` so an explicit empty "text": "" falls back to "target"
+        text = step.get("text") or step.get("target", "")
+        timeout = step.get("timeout_ms", 10000) / 1000
 
         if not text:
-            return StepExecutionResult(success=True, message="Assert visible: no target specified (pass)")
+            return StepExecutionResult(
+                success=False,
+                message="assert_visible step has no target — plan generation produced an incomplete step. Fix the test plan.",
+            )
 
         # JS-based visibility check: walks only text nodes inside specific element
         # types, ignoring <script>/<style> and hidden Angular internals.
@@ -673,10 +692,6 @@ class PlanRunner:
         # whose text lives in child <span> nodes rather than direct text content.
         _JS = """
         var needle = arguments[0];
-        var TAGS = {h1:1,h2:1,h3:1,h4:1,h5:1,p:1,span:1,label:1,
-                    td:1,th:1,li:1,dt:1,dd:1,button:1,a:1,
-                    'mat-cell':1,'mat-header-cell':1,'mat-label':1,
-                    'mat-chip':1,'mat-option':1};
         function vis(el) {
             if (!el || !el.getBoundingClientRect) return false;
             var s = window.getComputedStyle(el);
@@ -684,18 +699,34 @@ class PlanRunner:
             return s.display !== 'none' && s.visibility !== 'hidden' &&
                    parseFloat(s.opacity||'1') > 0 && r.width > 0 && r.height > 0;
         }
+        // Broad selector covering standard elements + Angular Material components:
+        //   - mat-snack-bar-container : success/error toasts
+        //   - mat-error               : inline form validation errors
+        //   - mat-hint                : field hints
+        //   - [role="alert"]          : ARIA alert messages
+        //   - [role="status"]         : status messages
+        //   - snack-bar-container     : older Angular Material
+        //   - [class*="toast"]        : generic toast classes
+        //   - [class*="snack"]        : generic snackbar classes
         var els = document.querySelectorAll(
-            'h1,h2,h3,h4,h5,p,span,label,td,th,li,dt,dd,' +
+            'h1,h2,h3,h4,h5,p,span,label,td,th,li,dt,dd,div,' +
             'button,a,mat-cell,mat-header-cell,mat-label,mat-chip,mat-option,' +
-            '[role="cell"],[role="columnheader"],[role="gridcell"],[role="option"]'
+            'mat-error,mat-hint,mat-snack-bar-container,snack-bar-container,' +
+            'mat-list-item,mat-nav-list a,' +
+            '[role="cell"],[role="columnheader"],[role="gridcell"],[role="option"],' +
+            '[role="alert"],[role="status"],[role="tooltip"],' +
+            '[class*="toast"],[class*="snack"],[class*="notification"],[class*="alert"],' +
+            '[class*="error"],[class*="success"],[class*="message"]'
         );
         for (var i = 0; i < els.length; i++) {
             var el = els[i];
             if (!vis(el)) continue;
+            // Check direct text nodes first (avoids matching hidden nested content)
             var own = '';
             for (var j = 0; j < el.childNodes.length; j++) {
                 if (el.childNodes[j].nodeType === 3) own += el.childNodes[j].textContent;
             }
+            if (!own.trim()) own = (el.textContent || el.innerText || '').trim();
             if (own.toLowerCase().indexOf(needle) >= 0) return true;
             var aria = (el.getAttribute('aria-label')||'').toLowerCase();
             if (aria.indexOf(needle) >= 0) return true;
@@ -722,23 +753,38 @@ class PlanRunner:
 
     async def _action_assert_text(self, step: dict) -> StepExecutionResult:
         text = step.get("text", "")
-        if text.lower() in self.browser.driver.page_source.lower():
-            return StepExecutionResult(success=True, message=f"Text '{text}' found on page")
+        timeout = step.get("timeout_ms", 10000) / 1000
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if text.lower() in (self.browser.driver.page_source or "").lower():
+                    return StepExecutionResult(success=True, message=f"Text '{text}' found on page")
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
         screenshot = self._take_step_screenshot("assert_fail")
         return StepExecutionResult(
             success=False,
-            message=f"Expected text '{text}' not found on page",
+            message=f"Expected text '{text}' not found after {timeout:.0f}s",
             screenshot_path=screenshot,
         )
 
     async def _action_assert_not_text(self, step: dict) -> StepExecutionResult:
         text = step.get("text", step.get("target", ""))
-        if text.lower() not in self.browser.driver.page_source.lower():
-            return StepExecutionResult(success=True, message=f"Confirmed '{text}' is NOT on page")
+        timeout = step.get("timeout_ms", 10000) / 1000
+        deadline = time.monotonic() + timeout
+        # Retry: element may still be transitioning away (Angular exit animations, HTTP request in flight)
+        while time.monotonic() < deadline:
+            try:
+                if text.lower() not in (self.browser.driver.page_source or "").lower():
+                    return StepExecutionResult(success=True, message=f"Confirmed '{text}' is NOT on page")
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
         screenshot = self._take_step_screenshot("assert_fail")
         return StepExecutionResult(
             success=False,
-            message=f"Text '{text}' is still on page (expected to be absent)",
+            message=f"Text '{text}' is still on page after {timeout:.0f}s (expected to be absent)",
             screenshot_path=screenshot,
         )
 
@@ -753,18 +799,30 @@ class PlanRunner:
         )
 
     async def _action_assert_count(self, step: dict) -> StepExecutionResult:
-        target = step.get("target", "row")
         count_expr = step.get("value", step.get("count", ""))
         try:
-            # Count rows/items matching target
-            elements = self.browser.driver.find_elements(
-                By.XPATH,
-                f'//*[contains(normalize-space(text()), "{target}") '
-                f'or self::tr or self::li]',
-            )
-            actual = len(elements)
+            # Count visible data rows — Angular Material mat-row first, then standard tbody tr
+            actual = self.browser.execute_script("""
+                function isVis(el) {
+                    var r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                }
+                // Angular Material data rows (excludes header rows)
+                var matRows = document.querySelectorAll(
+                    'mat-row, [role="row"].mat-mdc-row, [role="row"]:not(.mat-header-row):not(.mat-mdc-header-row)'
+                );
+                var visible = Array.from(matRows).filter(isVis);
+                if (visible.length > 0) return visible.length;
+                // Standard HTML table body rows
+                var tbodyRows = document.querySelectorAll('tbody tr');
+                visible = Array.from(tbodyRows).filter(isVis);
+                if (visible.length > 0) return visible.length;
+                // Generic list items
+                var listItems = document.querySelectorAll('ul li, ol li, [role="listitem"]');
+                return Array.from(listItems).filter(isVis).length;
+            """) or 0
+
             if count_expr:
-                # Support: ">0", ">=5", "==10", "3"
                 count_expr = str(count_expr).strip()
                 op = ">=" if ">=" in count_expr else (">" if ">" in count_expr else
                      "<=" if "<=" in count_expr else ("<" if "<" in count_expr else "=="))
@@ -774,12 +832,14 @@ class PlanRunner:
                        "==": lambda a, b: a == b}
                 passed = ops.get(op, ops[">="])(actual, num)
                 if passed:
-                    return StepExecutionResult(success=True, message=f"Count check: {actual} {op} {num}")
+                    return StepExecutionResult(success=True, message=f"Row count: {actual} {op} {num} ✓")
+                screenshot = self._take_step_screenshot("assert_fail")
                 return StepExecutionResult(
                     success=False,
-                    message=f"Count check failed: found {actual} items, expected {op} {num}",
+                    message=f"Row count check failed: found {actual} rows, expected {op} {num}",
+                    screenshot_path=screenshot,
                 )
-            return StepExecutionResult(success=True, message=f"Found {actual} items matching '{target}'")
+            return StepExecutionResult(success=True, message=f"Found {actual} visible rows")
         except Exception as e:
             return StepExecutionResult(success=False, message=f"Count assertion failed: {e}")
 
@@ -794,8 +854,8 @@ class PlanRunner:
 
         if not self.validation_engine:
             return StepExecutionResult(
-                success=True,
-                message="assert_ai_semantic: validation engine not configured — assumed pass",
+                success=False,
+                message="assert_ai_semantic: validation engine not available — cannot perform semantic check",
             )
 
         checkpoint = {
@@ -849,10 +909,29 @@ class PlanRunner:
     async def _action_wait_element(self, step: dict) -> StepExecutionResult:
         target = step.get("target", "")
         timeout = step.get("timeout_ms", 10000) / 1000
-        result_tuple = self.healer.find_element(target)
-        element, strategy, attempts = result_tuple
-        if element:
-            return StepExecutionResult(success=True, message=f"Element '{target}' appeared")
+        target_lower = target.lower().replace('"', '\\"')
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                # Quick JS check — no Selenium wait overhead per iteration
+                found = self.browser.execute_script(f"""
+                    var t = "{target_lower}";
+                    var els = document.querySelectorAll('*');
+                    for (var i = 0; i < els.length; i++) {{
+                        var el = els[i];
+                        var r = el.getBoundingClientRect();
+                        if (r.width === 0 && r.height === 0) continue;
+                        var aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                        var txt  = (el.textContent || '').trim().toLowerCase().slice(0, 200);
+                        if (aria.indexOf(t) >= 0 || txt.indexOf(t) >= 0) return true;
+                    }}
+                    return false;
+                """)
+                if found:
+                    return StepExecutionResult(success=True, message=f"Element '{target}' appeared")
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
         return StepExecutionResult(
             success=False, message=f"Element '{target}' did not appear within {timeout:.0f}s"
         )
@@ -913,6 +992,29 @@ class PlanRunner:
             element.send_keys(os.path.abspath(file_path))
             return StepExecutionResult(success=True, message=f"File uploaded: {file_path}")
         return StepExecutionResult(success=False, message="File upload input not found")
+
+    async def _action_hover(self, step: dict) -> StepExecutionResult:
+        target = step.get("target", step.get("label", step.get("text", "")))
+        result_tuple = self.healer.find_element(target)
+        element, strategy, attempts = result_tuple
+        if element is None:
+            return StepExecutionResult(
+                success=False,
+                message=f"Hover target '{target}' not found",
+                healing_used=True,
+                healing_attempts=[a.__dict__ for a in attempts],
+            )
+        try:
+            from selenium.webdriver.common.action_chains import ActionChains
+            ActionChains(self.browser.driver).move_to_element(element).perform()
+            await self._async_settle(0.5)
+            return StepExecutionResult(
+                success=True,
+                message=f"Hovered over '{target}'",
+                healing_used=strategy != "stored_selector",
+            )
+        except Exception as e:
+            return StepExecutionResult(success=False, message=f"Hover failed: {e}")
 
     async def _action_screenshot(self, step: dict) -> StepExecutionResult:
         path = self._take_step_screenshot("evidence")

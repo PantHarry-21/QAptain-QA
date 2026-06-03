@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import uuid as _uuid_mod
 from datetime import datetime
 from typing import Any
 
@@ -70,6 +71,42 @@ class ExecutionOrchestrator:
             await self._fail_run(run, "Missing plan or environment")
             return
 
+        # Refuse to execute a trivial fallback plan — it would produce a false PASSED result.
+        # Fallback plans have ≤5 steps (screenshot→navigate→wait→screenshot→screenshot).
+        # Instead, attempt to regenerate the plan from AI before falling back to failure.
+        _plan_reasoning = plan.plan_data.get("qa_reasoning", "")
+        _plan_steps = plan.plan_data.get("steps", [])
+        if _plan_reasoning.startswith("Fallback plan") or len(_plan_steps) <= 5:
+            if scenario:
+                try:
+                    from app.intelligence.scenario_planner import ScenarioPlanner
+                    _planner = ScenarioPlanner(self.db)
+                    log.info("Fallback plan detected — regenerating AI plan", run_id=run_id)
+                    _ai_plan = await asyncio.wait_for(
+                        _planner.generate_plan(scenario, plan.execution_mode),
+                        timeout=180.0,
+                    )
+                    _ai_reasoning = _ai_plan.plan_data.get("qa_reasoning", "")
+                    _ai_steps = _ai_plan.plan_data.get("steps", [])
+                    if not _ai_reasoning.startswith("Fallback plan") and len(_ai_steps) > 5:
+                        run.plan_id = _ai_plan.id
+                        plan = _ai_plan
+                        await self.db.commit()
+                        log.info("AI plan regenerated successfully", run_id=run_id,
+                                 steps=len(_ai_steps))
+                    else:
+                        await self._fail_run(run,
+                            "AI plan generation failed — could not generate a real test plan. "
+                            "Check Azure OpenAI availability and retry.")
+                        return
+                except Exception as _regen_err:
+                    await self._fail_run(run,
+                        f"AI plan generation failed: {str(_regen_err)[:200]}")
+                    return
+            else:
+                await self._fail_run(run, "No scenario attached to run — cannot generate plan")
+                return
+
         run.status = ExecutionStatus.RUNNING
         run.started_at = datetime.utcnow()
         await self.db.commit()
@@ -82,7 +119,7 @@ class ExecutionOrchestrator:
 
         browser = None
         try:
-            browser = BrowserManager.create()
+            browser = BrowserManager.create(window_size=(1920, 1080))
             validation_engine = ValidationEngine(browser)
             ui_engine        = UITransitionEngine(browser)
             state_machine    = WorkflowStateMachine()
@@ -131,7 +168,31 @@ class ExecutionOrchestrator:
             await self._log(run_id, "SUCCESS", "login", "Authentication completed successfully")
 
             plan_data = plan.plan_data
-            step_results = await runner.execute_plan(plan_data)
+
+            # Background cancellation monitor — polls DB every 3s and signals runner to stop
+            async def _watch_cancel():
+                while not runner._cancelled:
+                    await asyncio.sleep(3)
+                    try:
+                        fresh = await self._load_run(run_id)
+                        if fresh and fresh.status == ExecutionStatus.CANCELLED:
+                            runner._cancelled = True
+                    except Exception:
+                        pass
+
+            cancel_task = asyncio.create_task(_watch_cancel())
+            try:
+                step_results = await runner.execute_plan(plan_data)
+            finally:
+                cancel_task.cancel()
+
+            # If cancelled mid-run, mark accordingly and exit
+            if runner._cancelled:
+                run.status = ExecutionStatus.CANCELLED
+                run.completed_at = datetime.utcnow()
+                await self.db.commit()
+                await self._emit_event("run_cancelled", run_id, {"reason": "Cancelled by user"})
+                return
 
             # ── Post-execution business intelligence ──────────────────────────
             _intent_summary = await _orchestrator.post_execute(step_results, _exec_ctx)
@@ -238,8 +299,8 @@ class ExecutionOrchestrator:
             log.error("Credential decryption failed", error=str(e))
             return False
 
-        # Navigate
-        browser.navigate(env.base_url)
+        # Navigate (run in thread so we don't block the event loop during Chrome navigation)
+        await asyncio.to_thread(browser.navigate, env.base_url)
 
         # Wait up to 90s for Angular SPA to bootstrap and render login form
         # Emit progress logs every 15s so the UI shows something is happening
@@ -253,8 +314,23 @@ class ExecutionOrchestrator:
                 await self._log(run_id, "INFO", "login",
                     f"Still loading app… ({elapsed + 15}s elapsed, waiting up to 90s)")
         if not page_ready:
-            await self._log(run_id, "WARNING", "login",
-                "Login form did not appear within 90s — app may be unreachable or taking too long to load")
+            # Capture diagnostics before giving up
+            try:
+                current_url = browser.driver.current_url
+                page_len = len(browser.driver.page_source)
+                await self._log(run_id, "WARNING", "login",
+                    f"Login form did not appear within 90s — URL: {current_url}, "
+                    f"page size: {page_len} bytes. App may be unreachable or taking too long to load.")
+                # Take a diagnostic screenshot so the user can see what the browser showed
+                import os, time as _t
+                shot_path = os.path.join(
+                    settings.SCREENSHOTS_DIR,
+                    f"{run_id}_login_timeout_{int(_t.time())}.png",
+                )
+                browser.driver.save_screenshot(shot_path)
+                await self._log(run_id, "INFO", "login", f"Diagnostic screenshot saved: {shot_path}")
+            except Exception:
+                pass
             return False
 
         # Find username + password fields (Angular Material aware)
@@ -283,7 +359,13 @@ class ExecutionOrchestrator:
         # Fill using JS native setter (works with Angular Material's change detection)
         await asyncio.to_thread(self._fill_field, browser, username_el, username)
         await asyncio.to_thread(self._fill_field, browser, password_el, password)
-        await self._log(run_id, "INFO", "login", "Credentials entered — submitting")
+        await self._log(run_id, "INFO", "login", "Credentials entered")
+
+        # Handle any required <select> dropdowns on the login form (e.g. "Select Location")
+        # BEFORE clicking Sign In, so the form can submit successfully
+        await self._fill_login_selects(browser, app_id, run_id)
+
+        await self._log(run_id, "INFO", "login", "Submitting login form")
 
         # Click login button
         from selenium.webdriver.common.keys import Keys
@@ -494,11 +576,84 @@ class ExecutionOrchestrator:
             if not await asyncio.to_thread(self._is_on_login_page, browser, ""):
                 break
 
+    async def _fill_login_selects(
+        self,
+        browser: BrowserManager,
+        app_id: str | None,
+        run_id: str,
+    ) -> None:
+        """
+        Fill any required <select> dropdowns on the login form before clicking Sign In.
+        Common in apps like BharatLIMS where a location selector is part of the login form.
+        Uses the saved preference if available, otherwise picks the first non-placeholder option.
+        """
+        from selenium.webdriver.common.by import By
+
+        def _do_fill() -> list[str]:
+            filled = []
+            try:
+                selects = browser.driver.find_elements(By.TAG_NAME, "select")
+                for sel in selects:
+                    try:
+                        from selenium.webdriver.support.ui import Select as SeleniumSelect
+                        se = SeleniumSelect(sel)
+                        # Pick first non-placeholder option
+                        for opt in se.options:
+                            if opt.get_attribute("value") and opt.text.strip():
+                                se.select_by_visible_text(opt.text.strip())
+                                filled.append(opt.text.strip())
+                                break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return filled
+
+        pref = await self._get_login_preference(app_id, "login.location")
+        preferred = pref.get("value") if pref else None
+
+        def _do_fill_with_pref() -> list[str]:
+            filled = []
+            try:
+                selects = browser.driver.find_elements(By.TAG_NAME, "select")
+                for sel in selects:
+                    try:
+                        from selenium.webdriver.support.ui import Select as SeleniumSelect
+                        se = SeleniumSelect(sel)
+                        # Use saved preference first; fall back to first real option
+                        chosen = None
+                        if preferred:
+                            for opt in se.options:
+                                if preferred.lower() in opt.text.lower():
+                                    chosen = opt.text.strip()
+                                    break
+                        if not chosen:
+                            for opt in se.options:
+                                if opt.get_attribute("value") and opt.text.strip():
+                                    chosen = opt.text.strip()
+                                    break
+                        if chosen:
+                            se.select_by_visible_text(chosen)
+                            filled.append(chosen)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return filled
+
+        filled = await asyncio.to_thread(_do_fill_with_pref)
+        if filled:
+            await self._log(run_id, "INFO", "login",
+                f"Login form selects filled: {', '.join(filled)}")
+
     # ─── Login helper statics ─────────────────────────────────────────────────
 
     @staticmethod
     def _wait_for_any_input(browser: BrowserManager, timeout: int = 30) -> bool:
-        """Wait until at least one <input> appears in the DOM or iframes."""
+        """
+        Wait until at least one <input> appears in the DOM, iframes, or Shadow DOM.
+        Checks Shadow DOM so Angular Material / web-component inputs are found.
+        """
         from selenium.webdriver.common.by import By
         import time as _t
         deadline = _t.time() + timeout
@@ -508,6 +663,27 @@ class ExecutionOrchestrator:
                     return True
             except Exception:
                 pass
+
+            # Shadow DOM piercing — Angular Material / web components wrap inputs
+            try:
+                shadow_count = browser.execute_script("""
+                    function countShadowInputs(root) {
+                        let n = 0;
+                        try {
+                            if (root.tagName === 'INPUT') n++;
+                            if (root.shadowRoot) n += countShadowInputs(root.shadowRoot);
+                            for (const c of (root.children || [])) n += countShadowInputs(c);
+                        } catch(e) {}
+                        return n;
+                    }
+                    return countShadowInputs(document.body);
+                """)
+                if shadow_count and int(shadow_count) > 0:
+                    return True
+            except Exception:
+                pass
+
+            # Iframe scan every ~2s
             if int(_t.time() * 2) % 4 == 0:
                 try:
                     iframes = browser.driver.find_elements(By.TAG_NAME, "iframe")
@@ -517,6 +693,7 @@ class ExecutionOrchestrator:
                             if browser.driver.find_elements(By.TAG_NAME, "input"):
                                 browser.driver.switch_to.default_content()
                                 return True
+                            browser.driver.switch_to.default_content()
                         except Exception:
                             try:
                                 browser.driver.switch_to.default_content()
@@ -904,7 +1081,19 @@ class ExecutionOrchestrator:
         await self._emit_event("run_failed", run.id, {"reason": reason})
 
     async def _log(self, run_id: str, level: str, category: str, message: str, metadata: dict | None = None):
+        from datetime import timezone
+        log_id = str(_uuid_mod.uuid4())
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        # Emit WS first so the UI sees it immediately (before DB round-trip)
+        await self._emit_event("run_log", run_id, {
+            "id": log_id,
+            "level": level,
+            "category": category,
+            "message": message,
+            "timestamp": ts,
+        })
         entry = ExecutionLog(
+            id=log_id,
             run_id=run_id,
             level=level,
             category=category,
@@ -913,11 +1102,6 @@ class ExecutionOrchestrator:
         )
         self.db.add(entry)
         await self.db.commit()
-        await self._emit_event("run_log", run_id, {
-            "level": level,
-            "category": category,
-            "message": message,
-        })
 
     async def _emit_event(self, event: str, run_id: str, data: dict):
         msg = {"event": event, "run_id": run_id, **data}

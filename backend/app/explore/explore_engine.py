@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -176,24 +177,29 @@ class ExploreEngine:
         session.started_at = datetime.utcnow()
         await self.db.commit()
 
-        await self._log("MILESTONE", "system", "Starting application exploration [v2-click-nav]")
+        await self._log("MILESTONE", "system", "Starting application exploration")
         await self._emit_event("explore_started", {"session_id": session_id})
 
-        # Clean up stale data from previous runs before starting fresh
-        await self._cleanup_old_exploration_data(application_id)
-
         try:
-            # Launch browser — 90-second hard timeout prevents hung ChromeDriver from blocking forever
+            # Launch browser and clean up previous data concurrently — both can proceed in parallel.
+            await self._log("INFO", "system", "Launching browser…")
             try:
-                self._browser = await asyncio.wait_for(
-                    asyncio.to_thread(BrowserManager.create, settings.SELENIUM_HEADLESS),
-                    timeout=90.0,
+                browser_task = asyncio.create_task(
+                    asyncio.wait_for(
+                        asyncio.to_thread(BrowserManager.create, settings.SELENIUM_HEADLESS),
+                        timeout=90.0,
+                    )
                 )
+                cleanup_task = asyncio.create_task(
+                    self._cleanup_old_exploration_data(application_id)
+                )
+                self._browser, _ = await asyncio.gather(browser_task, cleanup_task)
             except asyncio.TimeoutError:
                 await self._fail_session(session,
                     "Browser failed to start within 90 seconds — "
                     "check Chrome / ChromeDriver installation and that no zombie Chrome processes are running")
                 return
+            await self._log("INFO", "system", "Browser ready")
             self._extractor = SemanticUIExtractor(self._browser.driver)
             self._healer = SelfHealingEngine(self._browser.driver)
 
@@ -302,10 +308,16 @@ class ExploreEngine:
             return False
 
         # Wait up to 90s for the page to render at least one input field.
-        # Angular SPAs with heavy scripts (YLIMS UAT) can take 60-90s to bootstrap,
-        # especially when the Selenium page load timeout fires first at 60s.
-        await self._log("INFO", "login", "Waiting for login form to render (up to 90s)")
-        page_ready = await asyncio.to_thread(self._wait_for_any_input, timeout=90)
+        # Angular SPAs with heavy scripts (YLIMS UAT) can take 60-90s to bootstrap.
+        # Poll in 15s chunks so the timeline shows live progress instead of 90s silence.
+        await self._log("INFO", "login", "Waiting for login form to render (Angular SPA may take up to 90s)…")
+        page_ready = False
+        for _chunk in range(6):
+            page_ready = await asyncio.to_thread(self._wait_for_any_input, timeout=15)
+            if page_ready:
+                break
+            elapsed = (_chunk + 1) * 15
+            await self._log("INFO", "login", f"Still loading… {elapsed}s elapsed — waiting for login form")
         if not page_ready:
             await self._log("WARNING", "login",
                 "No input fields appeared within 90 seconds — page may not be reachable or is still loading")
@@ -2996,7 +3008,7 @@ Group these into logical modules.""",
                     fast=True,
                     json_mode=True,
                 ),
-                timeout=30.0,
+                timeout=90.0,
             )
 
             try:
@@ -3081,7 +3093,7 @@ Group these into logical modules.""",
                     fast=True,
                     json_mode=True,
                 ),
-                timeout=30.0,
+                timeout=90.0,
             )
             module_data = response.json()
             for mod_info in module_data.get("modules", [])[:20]:
@@ -3447,6 +3459,40 @@ Group these into logical modules.""",
                 pass
         return False
 
+    def _snapshot_nav_texts(self) -> set[str]:
+        """Return lowercase text of all currently visible nav items (for before/after diff)."""
+        items = self._browser.execute_script("""
+        (function() {
+            const NOISE = new Set(['logout','log out','sign out','profile','account',
+                'notifications','help','about','home','settings']);
+            function isVisible(el) {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.display !== 'none'
+                    && s.visibility !== 'hidden' && s.opacity !== '0';
+            }
+            function getText(el) {
+                let t = '';
+                for (const n of el.childNodes) if (n.nodeType === 3) t += n.textContent;
+                return (t.trim() || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 80);
+            }
+            const seen = new Set();
+            const results = [];
+            for (const el of document.querySelectorAll(
+                'nav a, nav li, nav [role="menuitem"], nav [role="treeitem"], aside a, aside li, aside [role="menuitem"]'
+            )) {
+                if (!isVisible(el)) continue;
+                const t = getText(el);
+                if (!t || t.length < 2 || t.length > 80 || NOISE.has(t.toLowerCase())) continue;
+                if (seen.has(t.toLowerCase())) continue;
+                seen.add(t.toLowerCase());
+                results.push(t);
+            }
+            return results;
+        })()
+        """) or []
+        return {t.lower() for t in items}
+
     def _get_revealed_child_items(self, parent_text: str) -> list[str]:
         """After clicking a parent nav item, collect any newly visible child items."""
         return self._browser.execute_script("""
@@ -3658,9 +3704,7 @@ Group these into logical modules.""",
 
         await self._log("INFO", "exploration", f"Nav items to click: {len(items_to_click)}")
 
-        for item in items_to_click[:max_pages]:
-            if visited >= max_pages:
-                break
+        for item in items_to_click:
             text = item.get("text", "").strip()
             href = item.get("href", "").strip()
             if not text:
@@ -3669,7 +3713,9 @@ Group these into logical modules.""",
             try:
                 await self._log("INFO", "exploration", f"Navigating to: {text}")
 
-                # Return to dashboard before each top-level nav click
+                # Snapshot nav items BEFORE clicking so we can detect newly revealed sub-items
+                nav_before = await asyncio.to_thread(self._snapshot_nav_texts)
+
                 before_url = await asyncio.to_thread(self._get_full_url)
                 clicked = await asyncio.to_thread(self._click_nav_item, text)
                 if not clicked:
@@ -3698,15 +3744,13 @@ Group these into logical modules.""",
 
                 page_title = await asyncio.to_thread(lambda: self._browser.driver.title)
 
-                if page_title in seen_titles and after_url == before_url:
-                    # Parent item that didn't navigate — try expanding children
+                if after_url == before_url:
+                    # Nav item opened a submenu without navigating (accordion pattern)
                     child_items = await asyncio.to_thread(self._get_revealed_child_items, text)
                     if child_items:
                         await self._log("INFO", "exploration",
                             f"{text} → expanded {len(child_items)} sub-items: {', '.join(child_items[:5])}")
                     for child_text in child_items:
-                        if visited >= max_pages:
-                            break
                         await self._log("INFO", "exploration", f"Navigating to: {text} → {child_text}")
                         child_clicked = await asyncio.to_thread(self._click_nav_item, child_text)
                         if not child_clicked:
@@ -3714,21 +3758,53 @@ Group these into logical modules.""",
                         await asyncio.sleep(1.0)
                         if not await asyncio.to_thread(self._is_login_page):
                             child_url = await asyncio.to_thread(self._get_full_url)
-                            mod_id = await self._find_module_for_url(child_url)
-                            await self._explore_single_page(child_url, mod_id, nav_hint=f"{text} → {child_text}", skip_navigate=True)
-                            self._discovered_urls.add(child_url)
-                            visited += 1
+                            if child_url not in self._phase3_analyzed:
+                                mod_id = await self._find_module_for_url(child_url)
+                                await self._explore_single_page(child_url, mod_id, nav_hint=f"{text} → {child_text}", skip_navigate=True)
+                                self._discovered_urls.add(child_url)
+                                visited += 1
                 else:
+                    # Nav item navigated — explore the parent page
                     seen_titles.add(page_title)
-                    mod_id = await self._find_module_for_url(after_url)
-                    await self._explore_single_page(after_url, mod_id, nav_hint=text, skip_navigate=True)
-                    self._discovered_urls.add(after_url)
-                    visited += 1
+                    if after_url not in self._phase3_analyzed:
+                        mod_id = await self._find_module_for_url(after_url)
+                        await self._explore_single_page(after_url, mod_id, nav_hint=text, skip_navigate=True)
+                        self._discovered_urls.add(after_url)
+                        visited += 1
 
-                if visited % 5 == 0:
+                    # Detect sub-items that NEWLY appeared in the sidebar after navigation.
+                    # Diff against the pre-click snapshot to avoid returning false positives.
+                    nav_after_texts = await asyncio.to_thread(self._snapshot_nav_texts)
+                    new_items_lower = nav_after_texts - nav_before
+                    # Retrieve original-case labels by re-scanning (reuse nav_after list)
+                    nav_after_list = await asyncio.to_thread(self._get_nav_items_for_clicking)
+                    child_items = [
+                        it.get("text", "") for it in nav_after_list
+                        if it.get("text", "").lower() in new_items_lower
+                    ]
+                    if child_items:
+                        await self._log("INFO", "exploration",
+                            f"{text} revealed {len(child_items)} sub-items: {', '.join(child_items[:5])}")
+                    for child_text in child_items:
+                        await self._log("INFO", "exploration", f"Navigating to: {text} → {child_text}")
+                        child_clicked = await asyncio.to_thread(self._click_nav_item, child_text)
+                        if not child_clicked:
+                            continue
+                        await asyncio.sleep(1.0)
+                        if not await asyncio.to_thread(self._is_login_page):
+                            child_url = await asyncio.to_thread(self._get_full_url)
+                            if child_url not in self._phase3_analyzed:
+                                mod_id = await self._find_module_for_url(child_url)
+                                await self._explore_single_page(child_url, mod_id, nav_hint=f"{text} → {child_text}", skip_navigate=True)
+                                self._discovered_urls.add(child_url)
+                                visited += 1
+                        # Sub-items stay visible within the same section — no need to
+                        # navigate back to parent between clicks; just continue the loop
+
+                if visited % 5 == 0 and visited > 0:
                     await self._log("INFO", "exploration", f"Click-explored {visited} pages so far")
 
-                # Return to dashboard for next nav click
+                # Return to dashboard for next top-level nav click
                 await asyncio.to_thread(self._browser.navigate, dashboard_url)
                 await asyncio.sleep(0.4)
 
@@ -4354,7 +4430,25 @@ Group these into logical modules.""",
         """Emit semantic log — not technical logs."""
         from datetime import timezone
         now = datetime.now(timezone.utc)
+        ts = now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+        # Pre-generate the id so WS and DB share the same key — frontend can
+        # deduplicate polling results against already-displayed WS events.
+        log_id = str(uuid.uuid4())
+
+        # Emit to WebSocket FIRST so the user sees it immediately (before DB round-trip).
+        await self._emit_event("explore_log", {
+            "id": log_id,
+            "session_id": self._session_id,
+            "level": level,
+            "category": category,
+            "message": message,
+            "timestamp": ts,
+        })
+
+        # Persist for page-refresh / polling recovery.
         entry = ExploreLog(
+            id=log_id,
             session_id=self._session_id,
             level=level,
             category=category,
@@ -4363,16 +4457,6 @@ Group these into logical modules.""",
         )
         self.db.add(entry)
         await self.db.commit()
-
-        # Include explicit UTC timestamp (ISO 8601 with Z suffix) so the frontend
-        # can correctly convert to local time regardless of server timezone.
-        await self._emit_event("explore_log", {
-            "session_id": self._session_id,
-            "level": level,
-            "category": category,
-            "message": message,
-            "timestamp": now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
-        })
 
     async def _emit_event(self, event: str, data: dict):
         await connection_manager.broadcast_json({"event": event, **data})

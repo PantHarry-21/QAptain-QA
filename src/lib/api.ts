@@ -83,6 +83,12 @@ export const workspaces = {
 
   get: (workspaceId: string) => request<Workspace>(`/workspaces/${workspaceId}`),
 
+  update: (workspaceId: string, data: { name?: string; description?: string }) =>
+    request<Workspace>(`/workspaces/${workspaceId}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+
   delete: (workspaceId: string) =>
     request<void>(`/workspaces/${workspaceId}`, { method: 'DELETE' }),
 
@@ -98,12 +104,77 @@ export const workspaces = {
 
 // ─── Applications ─────────────────────────────────────────────────────────────
 
+export interface RoleCredential {
+  id: string;
+  role_name: string;
+  username: string;
+}
+
+export interface BulkImportResult {
+  imported: number;
+  skipped: number;
+  total_in_file: number;
+  message: string;
+}
+
+export interface RbacRoleResult {
+  role_name: string;
+  username: string;
+  login_success: boolean;
+  error?: string;
+  nav_items: string[];
+  module_access: Record<string, 'accessible' | 'blocked' | 'no_url' | 'unknown'>;
+}
+
+export interface RbacScanResult {
+  id: string;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  started_at: string | null;
+  completed_at: string | null;
+  error_message: string | null;
+  results: {
+    modules?: string[];
+    roles?: RbacRoleResult[];
+    scanned_at?: string;
+    progress?: { completed: number; total: number; current_role?: string };
+  };
+}
+
 export const applications = {
   get: (id: string) => request<Application>(`/applications/${id}`),
 
   listEnvironments: (id: string) => request<Environment[]>(`/applications/${id}/environments`),
 
   listModules: (id: string) => request<Module[]>(`/applications/${id}/modules`),
+
+  listRoleCredentials: (id: string) =>
+    request<RoleCredential[]>(`/applications/${id}/role-credentials`),
+
+  addRoleCredential: (id: string, data: { role_name: string; username: string; password: string }) =>
+    request<RoleCredential>(`/applications/${id}/role-credentials`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  deleteRoleCredential: (appId: string, credId: string) =>
+    request<void>(`/applications/${appId}/role-credentials/${credId}`, { method: 'DELETE' }),
+
+  bulkImportRoleCredentials: (appId: string, file: File) => {
+    const form = new FormData();
+    form.append('file', file);
+    return request<BulkImportResult>(`/applications/${appId}/role-credentials/bulk`, {
+      method: 'POST',
+      body: form,
+    });
+  },
+
+  startRbacScan: (appId: string) =>
+    request<{ scan_id: string; status: string }>(`/applications/${appId}/rbac-scan`, {
+      method: 'POST',
+    }),
+
+  getLatestRbacScan: (appId: string) =>
+    request<RbacScanResult | null>(`/applications/${appId}/rbac-scan/latest`),
 };
 
 // ─── Explore ──────────────────────────────────────────────────────────────────
@@ -205,6 +276,12 @@ export const scenarios = {
 
   delete: (scenarioId: string) =>
     request<void>(`/scenarios/${scenarioId}`, { method: 'DELETE' }),
+
+  aiCopilot: (data: { description: string; application_id: string; output_type: 'scenarios' | 'user_stories' }) =>
+    request<{ output_type: string; items: AICopilotItem[]; application_id: string; context_used: boolean; matched_module: string | null }>(
+      '/scenarios/ai-copilot/generate',
+      { method: 'POST', body: JSON.stringify(data) },
+    ),
 
   deleteByModule: (applicationId: string, moduleId: string | null) =>
     request<{ deleted: number }>(
@@ -399,6 +476,15 @@ export interface BatchRun {
   run_id?: string;
   title: string;
   error?: string;
+}
+
+export interface AICopilotItem {
+  title: string;
+  description?: string;
+  acceptance_criteria?: string[];
+  priority?: string;
+  category?: string;
+  test_hints?: string[];
 }
 
 export interface ExecutionPlan {

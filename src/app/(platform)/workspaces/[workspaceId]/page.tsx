@@ -48,6 +48,15 @@ export default function WorkspacePage() {
   // Pre-loaded environment — avoids an extra API call on every "Run All" click
   const [cachedEnv, setCachedEnv] = useState<{ id: string } | null>(null);
 
+  // Add Application modal
+  const [showAddApp, setShowAddApp] = useState(false);
+  const [addAppName, setAddAppName] = useState('');
+  const [addAppUrl, setAddAppUrl] = useState('');
+  const [addAppDesc, setAddAppDesc] = useState('');
+  const [addAppUser, setAddAppUser] = useState('');
+  const [addAppPass, setAddAppPass] = useState('');
+  const [addingApp, setAddingApp] = useState(false);
+
   // Document upload modal
   const [docUploadOpen, setDocUploadOpen] = useState(false);
   const [docModuleName, setDocModuleName] = useState('');
@@ -155,6 +164,26 @@ export default function WorkspacePage() {
       const r = await reportsApi.listForApplication(appId, 10);
       setReports(r);
     } catch { setReports([]); }
+  };
+
+  const handleAddApplication = async () => {
+    if (!addAppName.trim() || !addAppUrl.trim() || !addAppDesc.trim() || !addAppUser.trim() || !addAppPass.trim()) return;
+    setAddingApp(true);
+    try {
+      const newApp = await workspaceApi.createApplication(workspaceId, {
+        workspace_id: workspaceId,
+        name: addAppName.trim(),
+        base_url: addAppUrl.trim(),
+        description: addAppDesc.trim(),
+        username: addAppUser.trim(),
+        password: addAppPass,
+      });
+      setApps((prev) => [...prev, newApp]);
+      setSelectedApp(newApp);
+      setShowAddApp(false);
+      setAddAppName(''); setAddAppUrl(''); setAddAppDesc(''); setAddAppUser(''); setAddAppPass('');
+    } catch (e) { console.error(e); }
+    finally { setAddingApp(false); }
   };
 
   const handleCreateScenario = async () => {
@@ -439,12 +468,12 @@ export default function WorkspacePage() {
                 <div className="text-xs text-zinc-600 truncate">{app.base_url}</div>
               </button>
             ))}
-            <Link
-              href="/workspaces/new"
-              className="flex items-center gap-1 mt-2 px-3 py-2 text-xs text-zinc-600 hover:text-zinc-400 transition-colors"
+            <button
+              onClick={() => setShowAddApp(true)}
+              className="flex items-center gap-1 mt-2 px-3 py-2 text-xs text-zinc-600 hover:text-zinc-400 transition-colors w-full text-left"
             >
               + Add Application
-            </Link>
+            </button>
           </div>
 
           {/* Navigation */}
@@ -453,7 +482,7 @@ export default function WorkspacePage() {
               [
                 { id: 'overview', label: 'Overview', icon: '📊' },
                 { id: 'explore', label: 'Explore', icon: '🔍' },
-                { id: 'scenarios', label: 'Scenarios', icon: '📋', badge: scenarios.length || undefined },
+                { id: 'scenarios', label: 'Test Data', icon: '📋', badge: scenarios.length || undefined },
                 { id: 'reports', label: 'Reports', icon: '📈' },
                 { id: 'settings', label: 'Settings', icon: '⚙️' },
               ] as const
@@ -709,6 +738,60 @@ export default function WorkspacePage() {
           )}
         </main>
       </div>
+
+      {/* ── Add Application Modal ── */}
+      {showAddApp && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="w-full max-w-lg bg-zinc-900 border border-zinc-700 rounded-2xl p-6 shadow-2xl">
+            <h2 className="text-lg font-semibold text-white mb-1">Add Application</h2>
+            <p className="text-sm text-zinc-500 mb-5">Add another application to this workspace.</p>
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-zinc-400 mb-1">Application Name *</label>
+                  <input type="text" value={addAppName} onChange={(e) => setAddAppName(e.target.value)}
+                    placeholder="My App" className="w-full bg-zinc-800 border border-zinc-700 text-white rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-zinc-400 mb-1">Base URL *</label>
+                  <input type="text" value={addAppUrl} onChange={(e) => setAddAppUrl(e.target.value)}
+                    placeholder="http://localhost:4200" className="w-full bg-zinc-800 border border-zinc-700 text-white rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                </div>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-zinc-400 mb-1">Description * <span className="text-zinc-600">(guides AI exploration)</span></label>
+                <textarea value={addAppDesc} onChange={(e) => setAddAppDesc(e.target.value)}
+                  rows={2} placeholder="Enterprise inventory management system with modules for Products, Price Lists, Orders..."
+                  className="w-full bg-zinc-800 border border-zinc-700 text-white rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none" />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-zinc-400 mb-1">Username *</label>
+                  <input type="text" value={addAppUser} onChange={(e) => setAddAppUser(e.target.value)}
+                    placeholder="admin" className="w-full bg-zinc-800 border border-zinc-700 text-white rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-zinc-400 mb-1">Password *</label>
+                  <input type="password" value={addAppPass} onChange={(e) => setAddAppPass(e.target.value)}
+                    placeholder="••••••••" className="w-full bg-zinc-800 border border-zinc-700 text-white rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                </div>
+              </div>
+            </div>
+            <div className="flex gap-3 mt-5">
+              <button onClick={() => setShowAddApp(false)}
+                className="flex-1 px-4 py-2 text-sm text-zinc-400 hover:text-white border border-zinc-700 rounded-lg transition-colors">
+                Cancel
+              </button>
+              <button onClick={handleAddApplication}
+                disabled={addingApp || !addAppName.trim() || !addAppUrl.trim() || !addAppDesc.trim() || !addAppUser.trim() || !addAppPass.trim()}
+                className="flex-1 px-4 py-2 text-sm bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition-colors disabled:opacity-50 flex items-center justify-center gap-2">
+                {addingApp && <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />}
+                {addingApp ? 'Adding…' : 'Add Application'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1041,6 +1124,7 @@ function ScenariosTab({
   runningId: string | null;
   runningModuleId: string | null;
 }) {
+  const [subTab, setSubTab] = useState<'scenarios' | 'user_stories'>('scenarios');
   const [search, setSearch] = useState('');
   const [viewScenario, setViewScenario] = useState<Scenario | null>(null);
   const [editScenario, setEditScenario] = useState<Scenario | null>(null);
@@ -1102,9 +1186,9 @@ function ScenariosTab({
       )}
 
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex items-center justify-between mb-4">
         <div>
-          <h1 className="text-2xl font-bold text-white">Test Scenarios</h1>
+          <h1 className="text-2xl font-bold text-white">Test Data</h1>
           <p className="text-sm text-zinc-500 mt-0.5">
             {scenarios.length} scenario{scenarios.length !== 1 ? 's' : ''} for {app.name}
           </p>
@@ -1119,6 +1203,27 @@ function ScenariosTab({
         </div>
       </div>
 
+      {/* Sub-tabs */}
+      <div className="flex gap-1 bg-zinc-900 border border-zinc-800 rounded-lg p-1 w-fit mb-6">
+        {([
+          { id: 'scenarios' as const, label: 'Scenarios', count: scenarios.length },
+          { id: 'user_stories' as const, label: 'User Stories', count: null },
+        ]).map((t) => (
+          <button key={t.id} onClick={() => setSubTab(t.id)}
+            className={`flex items-center gap-1.5 px-4 py-1.5 text-sm rounded-md transition-colors ${
+              subTab === t.id ? 'bg-zinc-700 text-white' : 'text-zinc-500 hover:text-zinc-300'
+            }`}>
+            {t.label}
+            {t.count !== null && <span className="text-xs text-zinc-500">({t.count})</span>}
+          </button>
+        ))}
+      </div>
+
+      {subTab === 'user_stories' && (
+        <UserStoriesPanel app={app} />
+      )}
+
+      {subTab === 'scenarios' && (<>
       {/* Search */}
       <div className="relative mb-5">
         <span className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500 text-sm">🔍</span>
@@ -1310,6 +1415,246 @@ function ScenariosTab({
                     </button>
                   </div>
                 ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      </>)}
+    </div>
+  );
+}
+
+// ─── User Stories Panel ───────────────────────────────────────────────────────
+
+function UserStoriesPanel({ app }: { app: Application }) {
+  const [description, setDescription] = useState('');
+  const [outputType, setOutputType] = useState<'user_stories' | 'scenarios'>('user_stories');
+  const [generating, setGenerating] = useState(false);
+  const [results, setResults] = useState<import('@/lib/api').AICopilotItem[]>([]);
+  const [savedIds, setSavedIds] = useState<Set<number>>(new Set());
+  const [savingIdx, setSavingIdx] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [contextMeta, setContextMeta] = useState<{ used: boolean; module: string | null } | null>(null);
+
+  const handleGenerate = async () => {
+    if (!description.trim()) return;
+    setGenerating(true);
+    setResults([]);
+    setError(null);
+    setContextMeta(null);
+    try {
+      const res = await scenariosApi.aiCopilot({
+        description: description.trim(),
+        application_id: app.id,
+        output_type: outputType,
+      });
+      setResults(res.items || []);
+      setContextMeta({ used: res.context_used ?? false, module: res.matched_module ?? null });
+      if (!res.items?.length) {
+        setError('AI returned no items. Try a more specific description.');
+      }
+    } catch (e: unknown) {
+      console.error('AI Copilot failed', e);
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || msg.includes('fetch')) {
+        setError('Cannot reach the backend. Make sure the server is running on port 8000.');
+      } else {
+        setError(msg || 'Generation failed. Please try again.');
+      }
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const handleSave = async (item: import('@/lib/api').AICopilotItem, idx: number) => {
+    setSavingIdx(idx);
+    setSaveError(null);
+    try {
+      await scenariosApi.create({
+        application_id: app.id,
+        title: item.title,
+        description: [
+          item.description,
+          item.acceptance_criteria?.length
+            ? 'Acceptance Criteria:\n' + item.acceptance_criteria.map((c, i) => `${i + 1}. ${c}`).join('\n')
+            : null,
+          item.test_hints?.length
+            ? 'Test Hints:\n' + item.test_hints.map((h) => `- ${h}`).join('\n')
+            : null,
+        ].filter(Boolean).join('\n\n'),
+        priority: (item.priority?.toUpperCase() as Scenario['priority']) || 'MEDIUM',
+      });
+      setSavedIds((prev) => new Set([...prev, idx]));
+    } catch (e: unknown) {
+      console.error('Failed to save item', e);
+      setSaveError(e instanceof Error ? e.message : 'Failed to save. Please try again.');
+    } finally {
+      setSavingIdx(null);
+    }
+  };
+
+  return (
+    <div>
+      <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 mb-6">
+        <div className="flex items-center gap-2 mb-1">
+          <span className="text-lg">✨</span>
+          <h3 className="text-sm font-semibold text-white">AI Copilot</h3>
+        </div>
+        <p className="text-xs text-zinc-500 mb-4">
+          Describe a feature or workflow in plain language. AI will generate structured{' '}
+          {outputType === 'user_stories' ? 'user stories' : 'test scenarios'} using the application knowledge.
+        </p>
+
+        <div className="flex gap-1 bg-zinc-800 rounded-lg p-1 w-fit mb-4">
+          {(['user_stories', 'scenarios'] as const).map((t) => (
+            <button
+              key={t}
+              onClick={() => setOutputType(t)}
+              className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+                outputType === t ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              {t === 'user_stories' ? 'User Stories' : 'Test Scenarios'}
+            </button>
+          ))}
+        </div>
+
+        <textarea
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          rows={4}
+          placeholder={
+            outputType === 'user_stories'
+              ? 'e.g. "User should be able to create a price list, add items to it, and assign it to a customer group"'
+              : 'e.g. "Test the Add Price List feature — creation, editing, and deletion with various edge cases"'
+          }
+          className="w-full bg-zinc-800 border border-zinc-700 text-white rounded-xl px-4 py-3 text-sm placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-violet-500 resize-none mb-3"
+        />
+        <button
+          onClick={handleGenerate}
+          disabled={generating || !description.trim()}
+          className="flex items-center gap-2 px-5 py-2.5 bg-violet-600 hover:bg-violet-500 text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50"
+        >
+          {generating && (
+            <div className="animate-spin w-4 h-4 border-2 border-white/30 border-t-white rounded-full" />
+          )}
+          {generating ? 'Generating…' : `Generate ${outputType === 'user_stories' ? 'User Stories' : 'Scenarios'}`}
+        </button>
+
+        {error && (
+          <div className="mt-3 flex items-start gap-2 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2.5">
+            <span className="text-red-400 text-sm mt-0.5">⚠</span>
+            <p className="text-red-400 text-xs leading-relaxed">{error}</p>
+          </div>
+        )}
+        {saveError && (
+          <div className="mt-3 flex items-start gap-2 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2.5">
+            <span className="text-red-400 text-sm mt-0.5">⚠</span>
+            <p className="text-red-400 text-xs leading-relaxed">{saveError}</p>
+          </div>
+        )}
+      </div>
+
+      {results.length > 0 && (
+        <div className="space-y-3">
+          <div className="flex items-center justify-between mb-1">
+            <h3 className="text-sm font-medium text-zinc-300">{results.length} items generated</h3>
+            <span className="text-xs text-zinc-600">Click Save to add to your scenarios list</span>
+          </div>
+          {contextMeta && (
+            <div className={`flex items-center gap-2 px-3 py-2 rounded-lg text-xs mb-2 ${
+              contextMeta.used
+                ? 'bg-violet-500/10 border border-violet-500/20 text-violet-400'
+                : 'bg-zinc-800 border border-zinc-700 text-zinc-500'
+            }`}>
+              {contextMeta.used ? (
+                <>
+                  <span>⚡</span>
+                  <span>
+                    Generated using exploration data
+                    {contextMeta.module ? <> — matched module: <strong>{contextMeta.module}</strong></> : null}
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span>ℹ</span>
+                  <span>No exploration data found — generic scenarios generated. Run Explore first for precise results.</span>
+                </>
+              )}
+            </div>
+          )}
+          {results.map((item, idx) => (
+            <div
+              key={idx}
+              className={`bg-zinc-900 border rounded-xl p-4 transition-colors ${
+                savedIds.has(idx) ? 'border-green-500/30 bg-green-500/5' : 'border-zinc-800'
+              }`}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                    {item.priority && (
+                      <span className={`text-xs px-1.5 py-0.5 rounded-full ${
+                        item.priority.toUpperCase() === 'HIGH' ? 'bg-orange-500/20 text-orange-400' :
+                        item.priority.toUpperCase() === 'CRITICAL' ? 'bg-red-500/20 text-red-400' :
+                        item.priority.toUpperCase() === 'LOW' ? 'bg-zinc-800 text-zinc-500' :
+                        'bg-zinc-700 text-zinc-400'
+                      }`}>
+                        {item.priority}
+                      </span>
+                    )}
+                    {item.category && (
+                      <span className="text-xs bg-blue-500/15 text-blue-400 px-1.5 py-0.5 rounded-full">
+                        {item.category.replace(/_/g, ' ')}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-sm font-medium text-white mb-1">{item.title}</p>
+                  {item.description && (
+                    <p className="text-xs text-zinc-400 mb-2 leading-relaxed">{item.description}</p>
+                  )}
+                  {item.acceptance_criteria && item.acceptance_criteria.length > 0 && (
+                    <div className="mb-2">
+                      <p className="text-xs font-medium text-zinc-500 mb-1">Acceptance Criteria:</p>
+                      <ul className="space-y-0.5">
+                        {item.acceptance_criteria.map((c, ci) => (
+                          <li key={ci} className="text-xs text-zinc-400 flex gap-1.5">
+                            <span className="text-zinc-600 shrink-0">{ci + 1}.</span>
+                            {c}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {item.test_hints && item.test_hints.length > 0 && (
+                    <div>
+                      <p className="text-xs font-medium text-zinc-500 mb-1">Test Hints:</p>
+                      <div className="flex flex-wrap gap-1">
+                        {item.test_hints.map((h, hi) => (
+                          <span key={hi} className="text-xs bg-zinc-800 text-zinc-400 px-2 py-0.5 rounded-full">
+                            {h}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+                <button
+                  onClick={() => handleSave(item, idx)}
+                  disabled={savedIds.has(idx) || savingIdx === idx}
+                  className={`shrink-0 text-xs px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1.5 ${
+                    savedIds.has(idx)
+                      ? 'bg-green-500/20 text-green-400 border border-green-500/30'
+                      : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700'
+                  }`}
+                >
+                  {savingIdx === idx && (
+                    <div className="animate-spin w-3 h-3 border border-zinc-300 border-t-transparent rounded-full" />
+                  )}
+                  {savedIds.has(idx) ? '✓ Saved' : savingIdx === idx ? 'Saving…' : 'Save'}
+                </button>
               </div>
             </div>
           ))}
@@ -1622,8 +1967,8 @@ function SettingsTab({ app, desc, setDesc, username, setUsername, password, setP
       </div>
 
       <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-4">
-        <h3 className="text-sm font-medium text-zinc-300">Credentials</h3>
-        <p className="text-xs text-zinc-500">Leave password blank to keep the existing one.</p>
+        <h3 className="text-sm font-medium text-zinc-300">Admin Credentials</h3>
+        <p className="text-xs text-zinc-500">The primary account used for exploration and test execution. Leave password blank to keep existing.</p>
         <div>
           <label className="block text-xs text-zinc-500 mb-1">Username / Email</label>
           <input
@@ -1657,6 +2002,9 @@ function SettingsTab({ app, desc, setDesc, username, setUsername, password, setP
         {saved && <span className="text-sm text-green-400">✓ Saved successfully</span>}
       </div>
 
+      {/* Test Roles */}
+      <TestRolesPanel app={app} />
+
       {/* Danger Zone */}
       <div className="border border-red-500/30 rounded-xl overflow-hidden">
         <div className="px-5 py-3 bg-red-500/5 border-b border-red-500/20">
@@ -1678,6 +2026,443 @@ function SettingsTab({ app, desc, setDesc, username, setUsername, password, setP
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ─── Test Roles Panel ─────────────────────────────────────────────────────────
+
+function TestRolesPanel({ app }: { app: Application }) {
+  const [roles, setRoles] = useState<import('@/lib/api').RoleCredential[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  // Manual add form
+  const [addRole, setAddRole] = useState('');
+  const [addUser, setAddUser] = useState('');
+  const [addPass, setAddPass] = useState('');
+  const [adding, setAdding] = useState(false);
+
+  // Bulk import
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<string | null>(null);
+
+  // RBAC scan
+  const [scan, setScan] = useState<import('@/lib/api').RbacScanResult | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const load = async () => {
+    try {
+      const data = await appApi.listRoleCredentials(app.id);
+      setRoles(data);
+    } catch { setRoles([]); }
+    finally { setLoading(false); }
+  };
+
+  const loadScan = async () => {
+    try {
+      const s = await appApi.getLatestRbacScan(app.id);
+      if (s) {
+        setScan(s);
+        if (s.status === 'running' || s.status === 'pending') {
+          setScanning(true);
+        } else {
+          setScanning(false);
+          if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+        }
+      }
+    } catch { /* ignore */ }
+  };
+
+  useEffect(() => { load(); loadScan(); }, [app.id]);
+
+  useEffect(() => {
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+  }, []);
+
+  const [scanError, setScanError] = useState<string | null>(null);
+
+  const startScan = async () => {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+    setScanError(null);
+    setScanning(true);
+    try {
+      await appApi.startRbacScan(app.id);
+      await loadScan();
+      pollRef.current = setInterval(loadScan, 4000);
+    } catch (e) {
+      setScanning(false);
+      const msg = e instanceof Error ? e.message : 'Failed to start scan';
+      setScanError(msg);
+    }
+  };
+
+  const handleAdd = async () => {
+    if (!addRole.trim() || !addUser.trim() || !addPass.trim()) return;
+    setAdding(true);
+    try {
+      const created = await appApi.addRoleCredential(app.id, {
+        role_name: addRole.trim(),
+        username: addUser.trim(),
+        password: addPass,
+      });
+      setRoles((prev) => [...prev, created]);
+      setAddRole(''); setAddUser(''); setAddPass('');
+    } catch (e) { console.error(e); }
+    finally { setAdding(false); }
+  };
+
+  const handleDelete = async (id: string) => {
+    try {
+      await appApi.deleteRoleCredential(app.id, id);
+      setRoles((prev) => prev.filter((r) => r.id !== id));
+    } catch (e) { console.error(e); }
+  };
+
+  const handleFileUpload = async (file: File) => {
+    setImporting(true);
+    setImportResult(null);
+    try {
+      const result = await appApi.bulkImportRoleCredentials(app.id, file);
+      setImportResult(result.message);
+      await load();
+    } catch (e) {
+      setImportResult(e instanceof Error ? e.message : 'Import failed');
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const scanReady = scan?.status === 'completed' && scan.results?.roles && scan.results.roles.length > 0;
+  const progress = scan?.results?.progress;
+
+  return (
+    <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-800">
+        <div>
+          <h3 className="text-sm font-semibold text-white">Test Role Credentials</h3>
+          <p className="text-xs text-zinc-500 mt-0.5">
+            One test account per role — used for RBAC permission verification.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          {/* Scan permissions button */}
+          <button
+            onClick={startScan}
+            disabled={scanning || roles.length === 0}
+            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg border transition-colors ${
+              scanning || roles.length === 0
+                ? 'border-zinc-700 text-zinc-600 cursor-not-allowed'
+                : 'border-violet-500/50 text-violet-300 hover:bg-violet-500/10 hover:border-violet-500'
+            }`}
+            title={roles.length === 0 ? 'Add role credentials first' : 'Login as each role and check accessible modules'}
+          >
+            {scanning
+              ? <><div className="w-3 h-3 border border-violet-400 border-t-transparent rounded-full animate-spin" /> Scanning…</>
+              : <>🔍 Scan Permissions</>
+            }
+          </button>
+
+          {/* Bulk import button */}
+          <label className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg border cursor-pointer transition-colors ${
+            importing
+              ? 'border-zinc-700 text-zinc-600 cursor-not-allowed'
+              : 'border-zinc-700 text-zinc-300 hover:bg-zinc-800'
+          }`}>
+            {importing
+              ? <><div className="w-3 h-3 border border-zinc-500 border-t-transparent rounded-full animate-spin" /> Importing…</>
+              : <>📥 Import File</>
+            }
+            <input
+              type="file"
+              className="hidden"
+              disabled={importing}
+              accept=".csv,.tsv,.txt,.json,.xlsx,.xls,.ods"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleFileUpload(f);
+                e.target.value = '';
+              }}
+            />
+          </label>
+        </div>
+      </div>
+
+      {/* Scan progress / status banner */}
+      {scanning && (
+        <div className="px-5 py-3 bg-violet-500/10 border-b border-violet-500/20 flex items-center gap-3">
+          <div className="w-3.5 h-3.5 border-2 border-violet-400/40 border-t-violet-400 rounded-full animate-spin shrink-0" />
+          <div className="flex-1">
+            {progress ? (
+              <>
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-xs text-violet-300 font-medium">
+                    {progress.current_role ? `Scanning: ${progress.current_role}` : 'Preparing scan…'}
+                  </span>
+                  <span className="text-xs text-violet-400">{progress.completed}/{progress.total} roles</span>
+                </div>
+                <div className="h-1 bg-violet-900/40 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-violet-500 rounded-full transition-all duration-500"
+                    style={{ width: `${progress.total > 0 ? (progress.completed / progress.total) * 100 : 0}%` }}
+                  />
+                </div>
+              </>
+            ) : (
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-violet-300 font-medium">
+                  {scan?.status === 'running'
+                    ? 'Launching browser — logging in as first role…'
+                    : 'Queued — scan starting, please wait…'}
+                </span>
+                <span className="text-[10px] text-violet-500 font-mono uppercase tracking-wide">
+                  {scan?.status ?? 'pending'}
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Scan start error */}
+      {scanError && (
+        <div className="px-5 py-2.5 bg-red-500/10 border-b border-red-500/20 flex items-center justify-between">
+          <span className="text-xs text-red-300">Could not start scan: {scanError}</span>
+          <button onClick={() => setScanError(null)} className="text-zinc-500 hover:text-white text-xs">✕</button>
+        </div>
+      )}
+
+      {/* Scan backend error */}
+      {!scanning && scan?.status === 'failed' && (
+        <div className="px-5 py-2.5 bg-red-500/10 border-b border-red-500/20 flex items-center justify-between">
+          <span className="text-xs text-red-300">Scan failed: {scan.error_message || 'Unknown error'}</span>
+          <button onClick={() => setScan(null)} className="text-zinc-500 hover:text-white text-xs">✕</button>
+        </div>
+      )}
+
+      {/* Import result banner */}
+      {importResult && (
+        <div className="px-5 py-2.5 bg-blue-500/10 border-b border-blue-500/20 flex items-center justify-between">
+          <span className="text-xs text-blue-300">{importResult}</span>
+          <button onClick={() => setImportResult(null)} className="text-zinc-500 hover:text-white text-xs">✕</button>
+        </div>
+      )}
+
+      {/* File format hint */}
+      <div className="px-5 py-3 bg-zinc-800/40 border-b border-zinc-800">
+        <p className="text-xs text-zinc-500">
+          <span className="text-zinc-400 font-medium">Accepted formats:</span>{' '}
+          CSV, TSV, TXT, JSON, Excel (.xlsx/.xls) — any delimiter auto-detected.{' '}
+          <span className="text-zinc-500">Columns:</span>{' '}
+          <code className="text-zinc-400 bg-zinc-800 px-1 rounded">role_name</code>,{' '}
+          <code className="text-zinc-400 bg-zinc-800 px-1 rounded">username</code>,{' '}
+          <code className="text-zinc-400 bg-zinc-800 px-1 rounded">password</code>{' '}
+          (header row optional — positional order also works).
+        </p>
+      </div>
+
+      {/* Credentials table */}
+      {loading ? (
+        <div className="p-6 text-center text-zinc-600 text-sm animate-pulse">Loading…</div>
+      ) : roles.length === 0 ? (
+        <div className="p-8 text-center text-zinc-600 text-sm">
+          No role credentials yet. Add one manually or import a file.
+        </div>
+      ) : (
+        <div className="divide-y divide-zinc-800/60">
+          {/* Column headers */}
+          <div className="grid grid-cols-[1fr_1fr_auto] gap-4 px-5 py-2 text-xs font-medium text-zinc-500 uppercase tracking-wide">
+            <span>Role Name</span>
+            <span>Username</span>
+            <span></span>
+          </div>
+          {roles.map((r) => (
+            <div key={r.id} className="grid grid-cols-[1fr_1fr_auto] gap-4 items-center px-5 py-3 hover:bg-zinc-800/30 transition-colors group">
+              <span className="text-sm text-zinc-200 truncate font-medium">{r.role_name}</span>
+              <span className="text-sm text-zinc-400 truncate">{r.username}</span>
+              <button
+                onClick={() => handleDelete(r.id)}
+                className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-400 transition-colors text-xs px-1"
+                title="Remove this role credential"
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Add manually */}
+      <div className="border-t border-zinc-800 p-5">
+        <p className="text-xs font-medium text-zinc-500 mb-3 uppercase tracking-wide">Add Manually</p>
+        <div className="grid grid-cols-3 gap-2 mb-2">
+          <input
+            type="text"
+            value={addRole}
+            onChange={(e) => setAddRole(e.target.value)}
+            placeholder="Role name (e.g. Lab Manager)"
+            className="bg-zinc-800 border border-zinc-700 text-white rounded-lg px-3 py-2 text-sm placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+          <input
+            type="text"
+            value={addUser}
+            onChange={(e) => setAddUser(e.target.value)}
+            placeholder="Username / email"
+            className="bg-zinc-800 border border-zinc-700 text-white rounded-lg px-3 py-2 text-sm placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+          <input
+            type="password"
+            value={addPass}
+            onChange={(e) => setAddPass(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
+            placeholder="Password"
+            className="bg-zinc-800 border border-zinc-700 text-white rounded-lg px-3 py-2 text-sm placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+        </div>
+        <button
+          onClick={handleAdd}
+          disabled={adding || !addRole.trim() || !addUser.trim() || !addPass.trim()}
+          className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg transition-colors disabled:opacity-50 flex items-center gap-2"
+        >
+          {adding && <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />}
+          {adding ? 'Adding…' : '+ Add Role'}
+        </button>
+      </div>
+
+      {/* Permission matrix */}
+      {scanReady && scan.results.roles && scan.results.modules && (
+        <RbacPermissionMatrix
+          modules={scan.results.modules}
+          roles={scan.results.roles}
+          scannedAt={scan.results.scanned_at}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── RBAC Permission Matrix ────────────────────────────────────────────────────
+
+function RbacPermissionMatrix({
+  modules,
+  roles,
+  scannedAt,
+}: {
+  modules: string[];
+  roles: import('@/lib/api').RbacRoleResult[];
+  scannedAt?: string;
+}) {
+  const [view, setView] = useState<'matrix' | 'nav'>('matrix');
+
+  return (
+    <div className="border-t border-violet-500/20 bg-violet-500/5">
+      {/* Matrix header */}
+      <div className="flex items-center justify-between px-5 py-3 border-b border-violet-500/10">
+        <div>
+          <span className="text-xs font-semibold text-violet-300 uppercase tracking-wide">Permission Matrix</span>
+          {scannedAt && (
+            <span className="ml-2 text-xs text-zinc-500">
+              Scanned {new Date(scannedAt).toLocaleString()}
+            </span>
+          )}
+        </div>
+        <div className="flex gap-1">
+          <button
+            onClick={() => setView('matrix')}
+            className={`px-2.5 py-1 text-xs rounded transition-colors ${view === 'matrix' ? 'bg-violet-600 text-white' : 'text-zinc-400 hover:text-white'}`}
+          >
+            Module Access
+          </button>
+          <button
+            onClick={() => setView('nav')}
+            className={`px-2.5 py-1 text-xs rounded transition-colors ${view === 'nav' ? 'bg-violet-600 text-white' : 'text-zinc-400 hover:text-white'}`}
+          >
+            Nav Items
+          </button>
+        </div>
+      </div>
+
+      {view === 'matrix' ? (
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs border-collapse">
+            <thead>
+              <tr>
+                <th className="text-left px-4 py-2.5 text-zinc-500 font-medium bg-zinc-900/60 sticky left-0 z-10 min-w-[160px]">
+                  Module
+                </th>
+                {roles.map((r) => (
+                  <th key={r.role_name} className="px-3 py-2.5 text-center text-zinc-300 font-medium bg-zinc-900/60 min-w-[90px] whitespace-nowrap">
+                    <div className="truncate max-w-[90px]" title={r.role_name}>{r.role_name}</div>
+                    {!r.login_success && (
+                      <div className="text-red-400 font-normal text-[10px]">login failed</div>
+                    )}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-800/40">
+              {modules.map((mod, i) => (
+                <tr key={mod} className={i % 2 === 0 ? 'bg-zinc-900/20' : ''}>
+                  <td className="px-4 py-2 text-zinc-300 font-medium sticky left-0 bg-inherit">
+                    {mod}
+                  </td>
+                  {roles.map((r) => {
+                    const access = r.module_access?.[mod];
+                    return (
+                      <td key={r.role_name} className="px-3 py-2 text-center">
+                        {!r.login_success ? (
+                          <span className="text-zinc-600" title="Login failed">—</span>
+                        ) : access === 'accessible' ? (
+                          <span className="text-green-400 text-base" title="Accessible">✓</span>
+                        ) : access === 'blocked' ? (
+                          <span className="text-red-400 text-base" title="Blocked">✗</span>
+                        ) : (
+                          <span className="text-zinc-600" title="No URL to test">?</span>
+                        )}
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          {/* Legend */}
+          <div className="flex items-center gap-4 px-4 py-3 border-t border-zinc-800/40 text-[11px] text-zinc-500">
+            <span><span className="text-green-400 font-bold">✓</span> Accessible</span>
+            <span><span className="text-red-400 font-bold">✗</span> Blocked</span>
+            <span><span className="text-zinc-600">?</span> No URL</span>
+            <span><span className="text-zinc-600">—</span> Login failed</span>
+          </div>
+        </div>
+      ) : (
+        <div className="divide-y divide-zinc-800/40">
+          {roles.map((r) => (
+            <div key={r.role_name} className="px-5 py-3">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-sm font-medium text-zinc-200">{r.role_name}</span>
+                {r.login_success ? (
+                  <span className="text-[10px] px-1.5 py-0.5 bg-green-500/15 text-green-400 rounded">logged in</span>
+                ) : (
+                  <span className="text-[10px] px-1.5 py-0.5 bg-red-500/15 text-red-400 rounded">login failed</span>
+                )}
+              </div>
+              {r.nav_items.length > 0 ? (
+                <div className="flex flex-wrap gap-1.5">
+                  {r.nav_items.map((item) => (
+                    <span key={item} className="text-xs px-2 py-0.5 bg-zinc-800 text-zinc-300 rounded-full">
+                      {item}
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <span className="text-xs text-zinc-600">{r.login_success ? 'No nav items detected' : r.error || 'Login failed'}</span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

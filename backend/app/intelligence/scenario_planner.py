@@ -30,7 +30,7 @@ from config import settings
 log = structlog.get_logger()
 
 ALLOWED_ACTIONS = frozenset([
-    "navigate", "click", "fill", "clear", "select", "key_press",
+    "navigate", "click", "fill", "clear", "select", "key_press", "hover",
     "assert_visible", "assert_text", "assert_not_text", "assert_url", "assert_count",
     "wait_network", "wait_element", "wait_ms",
     "scroll", "upload", "screenshot", "assert_ai_semantic",
@@ -38,7 +38,7 @@ ALLOWED_ACTIONS = frozenset([
 
 MODE_CAPS = {
     "smoke":            {"max_steps": 12,  "depth": "minimal — happy path only"},
-    "functional":       {"max_steps": 35,  "depth": "standard — key flows + basic validation"},
+    "functional":       {"max_steps": 30,  "depth": "standard — key flows + basic validation"},
     "validation_heavy": {"max_steps": 55,  "depth": "thorough — including edge cases"},
     "regression":       {"max_steps": 80,  "depth": "comprehensive — all paths and validations"},
     "workflow_heavy":   {"max_steps": 100, "depth": "exhaustive — full workflow coverage"},
@@ -72,6 +72,9 @@ class ScenarioPlanner:
 
         plan_data = self._validate_and_cap(plan_data, caps["max_steps"])
 
+        # Detect fallback so the batch executor can identify and retry these plans
+        _is_fallback = plan_data.get("qa_reasoning", "").startswith("Fallback plan")
+
         plan = ExecutionPlan(
             scenario_id=scenario.id,
             execution_mode=execution_mode,
@@ -81,7 +84,7 @@ class ScenarioPlanner:
             workflow_stages=self._extract_workflow_stages(plan_data),
             risk_score=self._calculate_risk(plan_data, execution_mode),
             estimated_duration_seconds=len(plan_data.get("steps", [])) * 5,
-            created_by_model=settings.PRIMARY_MODEL,
+            created_by_model="fallback" if _is_fallback else settings.PRIMARY_MODEL,
         )
 
         latest = await self._latest_plan_version(scenario.id)
@@ -136,13 +139,16 @@ class ScenarioPlanner:
         ]
         steps = steps[:max_steps]
 
+        # Actions that should never abort a run on failure
+        SAFE_ACTIONS = {"screenshot", "wait_ms", "scroll", "wait_element", "wait_network", "hover"}
+
         for step in steps:
             step.setdefault("timeout_ms", 10000)
             step.setdefault("on_fail", "fail")
             step.setdefault("checkpoint", False)
             step.setdefault("business_intent", "")
             step.setdefault("phase", "")
-            if step.get("action") == "screenshot":
+            if step.get("action") in SAFE_ACTIONS:
                 step["on_fail"] = "skip"
             if "description" not in step:
                 step["description"] = f"{step.get('action', 'step').title()}"
@@ -199,7 +205,8 @@ class ScenarioPlanner:
         )
         return result.scalar_one_or_none()
 
-    def _fallback_plan(self, scenario: Scenario) -> dict:
+    def _fallback_plan(self, scenario: Scenario, module_url: str = "/") -> dict:
+        nav_url = module_url or "/"
         return {
             "workflow": "BASIC_NAVIGATE",
             "workflow_type": "NAVIGATION",
@@ -216,13 +223,15 @@ class ScenarioPlanner:
                 {"action": "screenshot", "description": "Capture initial state",
                  "timeout_ms": 5000, "on_fail": "skip", "checkpoint": False,
                  "business_intent": "Initial evidence", "phase": "SETUP"},
-                {"action": "navigate", "description": "Open application", "url": "/",
+                {"action": "navigate", "description": f"Open {scenario.title}", "url": nav_url,
                  "timeout_ms": 15000, "on_fail": "fail", "checkpoint": False,
-                 "business_intent": "Navigate to application", "phase": "NAVIGATE"},
-                {"action": "assert_visible", "description": "Verify page loaded",
-                 "target": "page content", "text": "", "timeout_ms": 10000, "on_fail": "fail",
-                 "checkpoint": True, "business_intent": "Application is accessible",
-                 "phase": "VERIFY_LOADED"},
+                 "business_intent": "Navigate to target module", "phase": "NAVIGATE"},
+                {"action": "wait_ms", "description": "Wait for Angular SPA to render", "ms": 2000,
+                 "timeout_ms": 5000, "on_fail": "skip", "checkpoint": False,
+                 "business_intent": "Allow SPA route change to complete", "phase": "NAVIGATE"},
+                {"action": "screenshot", "description": "Capture page after navigation",
+                 "timeout_ms": 5000, "on_fail": "skip", "checkpoint": True,
+                 "business_intent": "Evidence page loaded", "phase": "VERIFY_LOADED"},
                 {"action": "screenshot", "description": "Capture final state",
                  "timeout_ms": 5000, "on_fail": "skip", "checkpoint": False,
                  "business_intent": "Final evidence", "phase": "TEARDOWN"},

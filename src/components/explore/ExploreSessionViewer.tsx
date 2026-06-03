@@ -103,6 +103,36 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
     };
   }, [sessionId, socket]);
 
+  // Polling fallback — recovers any WS events that were missed (e.g. race on page load).
+  // Runs every 4s while session is active; stops once completed/failed/cancelled.
+  const lastLogIdRef = useRef<string | undefined>(lastLogId);
+  lastLogIdRef.current = lastLogId;
+  useEffect(() => {
+    const ACTIVE = ['PENDING', 'RUNNING', 'WAITING_HUMAN'];
+    if (!session || !ACTIVE.includes(session.status)) return;
+
+    const tick = async () => {
+      try {
+        const [updatedSession, newLogs] = await Promise.all([
+          exploreApi.getSession(sessionId),
+          exploreApi.getLogs(sessionId, lastLogIdRef.current),
+        ]);
+        setSession((s) => (s?.status !== updatedSession.status ? updatedSession : s));
+        if (newLogs.length > 0) {
+          setLogs((prev) => {
+            const existingIds = new Set(prev.map((l) => l.id));
+            const fresh = newLogs.filter((l) => !existingIds.has(l.id));
+            return fresh.length > 0 ? [...prev, ...fresh] : prev;
+          });
+          setLastLogId(newLogs[newLogs.length - 1].id);
+        }
+      } catch { /* ignore poll errors */ }
+    };
+
+    const id = setInterval(tick, 4000);
+    return () => clearInterval(id);
+  }, [sessionId, session?.status]);
+
   // Auto-scroll to bottom
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
