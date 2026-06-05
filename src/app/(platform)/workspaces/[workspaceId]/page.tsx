@@ -73,6 +73,7 @@ export default function WorkspacePage() {
   const [settingsDesc, setSettingsDesc] = useState('');
   const [settingsUsername, setSettingsUsername] = useState('');
   const [settingsPassword, setSettingsPassword] = useState('');
+  const [settingsHasPassword, setSettingsHasPassword] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
   const [settingsSaved, setSettingsSaved] = useState(false);
   const [deletingWorkspace, setDeletingWorkspace] = useState(false);
@@ -112,10 +113,23 @@ export default function WorkspacePage() {
   useEffect(() => {
     if (selectedApp) {
       setSettingsDesc(selectedApp.description || '');
-      setSettingsUsername('');
       setSettingsPassword('');
       setSettingsSaved(false);
       loadEnv(selectedApp.id);
+      // Load saved credentials so user doesn't need to re-enter them after restart
+      const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
+      fetch(`${apiBase}/applications/${selectedApp.id}/settings`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem('qaptain_token')}` },
+      })
+        .then((r) => r.json())
+        .then((data) => {
+          setSettingsUsername(data.username || '');
+          setSettingsHasPassword(!!data.has_password);
+        })
+        .catch(() => {
+          setSettingsUsername('');
+          setSettingsHasPassword(false);
+        });
     }
   }, [selectedApp?.id]);
 
@@ -391,6 +405,7 @@ export default function WorkspacePage() {
       });
       setSettingsSaved(true);
       setSettingsPassword('');
+      if (settingsPassword) setSettingsHasPassword(true);
       setTimeout(() => setSettingsSaved(false), 3000);
     } catch (e) {
       console.error('Failed to save settings', e);
@@ -727,6 +742,7 @@ export default function WorkspacePage() {
                   setUsername={setSettingsUsername}
                   password={settingsPassword}
                   setPassword={setSettingsPassword}
+                  hasPassword={settingsHasPassword}
                   onSave={handleSaveSettings}
                   saving={savingSettings}
                   saved={settingsSaved}
@@ -1923,7 +1939,7 @@ function ReportsTab({
 
 // ─── Settings Tab ─────────────────────────────────────────────────────────────
 
-function SettingsTab({ app, desc, setDesc, username, setUsername, password, setPassword, onSave, saving, saved, onDeleteWorkspace, deletingWorkspace }: {
+function SettingsTab({ app, desc, setDesc, username, setUsername, password, setPassword, hasPassword, onSave, saving, saved, onDeleteWorkspace, deletingWorkspace }: {
   app: Application;
   desc: string;
   setDesc: (v: string) => void;
@@ -1931,6 +1947,7 @@ function SettingsTab({ app, desc, setDesc, username, setUsername, password, setP
   setUsername: (v: string) => void;
   password: string;
   setPassword: (v: string) => void;
+  hasPassword: boolean;
   onSave: () => void;
   saving: boolean;
   saved: boolean;
@@ -1968,7 +1985,7 @@ function SettingsTab({ app, desc, setDesc, username, setUsername, password, setP
 
       <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-4">
         <h3 className="text-sm font-medium text-zinc-300">Admin Credentials</h3>
-        <p className="text-xs text-zinc-500">The primary account used for exploration and test execution. Leave password blank to keep existing.</p>
+        <p className="text-xs text-zinc-500">The primary account used for exploration and test execution. Password is stored encrypted and persists across restarts.</p>
         <div>
           <label className="block text-xs text-zinc-500 mb-1">Username / Email</label>
           <input
@@ -1980,13 +1997,18 @@ function SettingsTab({ app, desc, setDesc, username, setUsername, password, setP
           />
         </div>
         <div>
-          <label className="block text-xs text-zinc-500 mb-1">New Password</label>
+          <label className="block text-xs text-zinc-500 mb-1">
+            Password
+            {hasPassword && !password && (
+              <span className="ml-2 text-green-400 font-normal">✓ Password saved</span>
+            )}
+          </label>
           <input
             type="password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-blue-500"
-            placeholder="leave blank to keep existing"
+            placeholder={hasPassword ? 'Enter new password to change' : 'Enter password'}
           />
         </div>
       </div>

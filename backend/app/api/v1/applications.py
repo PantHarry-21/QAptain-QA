@@ -1,3 +1,4 @@
+from __future__ import annotations
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from typing import Optional
@@ -73,6 +74,29 @@ class ApplicationSettingsUpdate(BaseModel):
     description: Optional[str] = None
     username: Optional[str] = None
     password: Optional[str] = None
+
+
+@router.get("/{application_id}/settings")
+async def get_application_settings(
+    application_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Application).where(Application.id == application_id))
+    app = result.scalar_one_or_none()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    cred_result = await db.execute(
+        select(Credential).where(Credential.application_id == application_id, Credential.label == None).limit(1)
+    )
+    cred = cred_result.scalar_one_or_none()
+
+    return {
+        "description": app.description or "",
+        "username": cred.username if cred else "",
+        "has_password": bool(cred and cred.password_encrypted),
+    }
 
 
 @router.patch("/{application_id}/settings")
