@@ -1,3 +1,5 @@
+from __future__ import annotations
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -15,6 +17,9 @@ from app.schemas.explore import (
 from app.explore.explore_engine import ExploreEngine
 
 router = APIRouter()
+
+# Global registry of running explorer engines — allows cancel endpoint to signal them
+_running_explores: dict[str, ExploreEngine] = {}
 
 
 @router.post("/start", response_model=ExploreSessionResponse, status_code=201)
@@ -86,7 +91,7 @@ async def get_logs(
     return [ExploreLogResponse.model_validate(l) for l in result.scalars().all()]
 
 
-@router.get("/{session_id}/pending-decision", response_model=HumanDecisionResponse | None)
+@router.get("/{session_id}/pending-decision", response_model=Optional[HumanDecisionResponse])
 async def get_pending_decision(
     session_id: str,
     current_user: User = Depends(get_current_user),
@@ -144,7 +149,7 @@ async def resolve_decision(
     return HumanDecisionResponse.model_validate(decision)
 
 
-@router.get("/application/{application_id}/active", response_model=ExploreSessionResponse | None)
+@router.get("/application/{application_id}/active", response_model=Optional[ExploreSessionResponse])
 async def get_active_session(
     application_id: str,
     current_user: User = Depends(get_current_user),
@@ -179,13 +184,19 @@ async def cancel_session(
         raise HTTPException(status_code=404, detail="Session not found")
     if session.status in (ExploreStatus.COMPLETED, ExploreStatus.FAILED, ExploreStatus.CANCELLED):
         raise HTTPException(status_code=409, detail="Session already finished")
+
+    # Signal the running explorer engine to stop gracefully
+    if session_id in _running_explores:
+        engine = _running_explores[session_id]
+        engine.request_stop()
+
     session.status = ExploreStatus.CANCELLED
     session.completed_at = datetime.utcnow()
     await db.commit()
     return ExploreSessionResponse.model_validate(session)
 
 
-@router.get("/application/{application_id}/knowledge", response_model=KnowledgeGraphResponse | None)
+@router.get("/application/{application_id}/knowledge", response_model=Optional[KnowledgeGraphResponse])
 async def get_knowledge_graph(
     application_id: str,
     current_user: User = Depends(get_current_user),
@@ -207,4 +218,10 @@ async def _run_explore(session_id: str, application_id: str):
     from app.db.session import AsyncSessionFactory
     async with AsyncSessionFactory() as db:
         engine = ExploreEngine(db)
-        await engine.run(session_id, application_id)
+        # Register engine so cancel endpoint can signal it
+        _running_explores[session_id] = engine
+        try:
+            await engine.run(session_id, application_id)
+        finally:
+            # Unregister when done
+            _running_explores.pop(session_id, None)
