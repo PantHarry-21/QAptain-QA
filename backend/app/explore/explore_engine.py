@@ -3837,58 +3837,33 @@ class ExploreEngine:
         await self._log("INFO", "exploration",
             f"URL list: {len(urls_to_visit)} URLs, {len(self._raw_nav_items)} nav items available")
 
-        # Primary: click-based navigation when nav items are present.
-        # This is the only session-safe approach for SPAs with short-lived JWTs.
+        # Step 1: Click-based navigation (SPA-safe — keeps JWT alive)
+        # This covers every nav item AND their accordion children.
         if self._raw_nav_items:
             await self._explore_via_nav_clicks(max_pages)
 
-            # Secondary: visit any discovered URLs not yet reached via nav clicks
-            # (Phase 2b child URLs, deep links, etc.)
-            remaining = max_pages - len(self._phase3_analyzed)
-            if remaining > 0 and urls_to_visit:
-                await self._log("INFO", "exploration",
-                    f"Visiting up to {remaining} additional URLs not covered by nav clicks")
-                for url, module_id in urls_to_visit:
-                    # Check stop signal
-                    if self._should_stop:
-                        await self._log("INFO", "exploration", "Stop requested — halting URL-based exploration")
-                        return
+        # Step 2: After nav clicks, collect ALL discovered URLs (including
+        # anything found during step 1) and explore anything not yet analyzed.
+        all_urls = await self._collect_urls_to_visit()
+        unvisited = [(url, mid) for url, mid in all_urls if url not in self._phase3_analyzed]
 
-                    if remaining <= 0:
-                        break
-                    if url in self._phase3_analyzed:
-                        continue
-                    try:
-                        await self._explore_single_page(url, module_id)
-                        self._discovered_urls.add(url)
-                        remaining -= 1
-                        await asyncio.sleep(0.5)
-                    except Exception as e:
-                        log.warning("URL fallback exploration failed", url=url, error=str(e))
-
-            await self._log("SUCCESS", "exploration",
-                f"Page exploration complete — {len(self._phase3_analyzed)} pages analyzed")
-            return
-
-        # Fallback: URL-based navigation for non-SPA apps (no nav items detected)
-        if not urls_to_visit:
-            await self._explore_via_nav_clicks(max_pages)
-            return
-
-        for url, module_id in urls_to_visit:
-            if len(self._phase3_analyzed) >= max_pages:
-                break
-            if url in self._phase3_analyzed:
-                continue
-            try:
-                await self._explore_single_page(url, module_id)
-                self._discovered_urls.add(url)
-                if len(self._phase3_analyzed) % 5 == 0:
-                    await self._log("INFO", "exploration",
-                        f"Explored {len(self._phase3_analyzed)} pages so far")
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                log.warning("Page exploration failed", url=url, error=str(e))
+        if unvisited:
+            await self._log("INFO", "exploration",
+                f"Exploring {len(unvisited)} additional URLs not covered by nav clicks")
+            for url, module_id in unvisited:
+                if self._should_stop:
+                    await self._log("INFO", "exploration", "Stop requested — halting URL-based exploration")
+                    break
+                if len(self._phase3_analyzed) >= max_pages:
+                    break
+                if url in self._phase3_analyzed:
+                    continue
+                try:
+                    await self._explore_single_page(url, module_id)
+                    self._discovered_urls.add(url)
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    log.warning("URL fallback exploration failed", url=url, error=str(e))
 
         await self._log("SUCCESS", "exploration",
             f"Page exploration complete — {len(self._phase3_analyzed)} pages analyzed")
@@ -4023,9 +3998,14 @@ class ExploreEngine:
                 if visited % 5 == 0 and visited > 0:
                     await self._log("INFO", "exploration", f"Click-explored {visited} pages so far")
 
-                # Return to dashboard for next top-level nav click
-                await asyncio.to_thread(self._browser.navigate, dashboard_url)
-                await asyncio.sleep(0.4)
+                # Only return to dashboard if the nav click navigated away AND
+                # we need to reach the next top-level item. If the click opened
+                # an accordion (URL unchanged), stay on the page so the sidebar
+                # remains expanded and child clicks work.
+                current_url = await asyncio.to_thread(self._get_full_url)
+                if current_url != dashboard_url and not on_login:
+                    await asyncio.to_thread(self._browser.navigate, dashboard_url)
+                    await asyncio.sleep(0.4)
 
             except Exception as e:
                 log.warning("Click-based exploration failed", nav_item=text, error=str(e))
