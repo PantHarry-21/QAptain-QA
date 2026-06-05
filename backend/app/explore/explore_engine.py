@@ -3026,6 +3026,12 @@ class ExploreEngine:
         # cause child detection to fail.
         all_nav_items = await asyncio.to_thread(self._scan_full_nav_structure)
 
+        # Diagnostic: log breakdown so we can see if accordion children were found
+        parents = [i for i in all_nav_items if not i.get("parent")]
+        children = [i for i in all_nav_items if i.get("parent")]
+        await self._log("INFO", "navigation",
+            f"Nav scan: {len(parents)} top-level items, {len(children)} accordion children = {len(all_nav_items)} total")
+
         if not all_nav_items:
             # Fallback to extractor if JS scan found nothing
             state = self._extractor.extract_page_state()
@@ -3079,19 +3085,21 @@ class ExploreEngine:
 
     def _scan_full_nav_structure(self) -> list[dict]:
         """
-        Scan the entire sidebar nav DOM in one pass — no clicking required.
+        Scan the sidebar nav DOM for ALL items including hidden accordion children.
 
-        Handles two patterns found in Angular/React SPAs:
-          1. Accordion parent  → <button> with a sibling <div class="grid ...">
-                                  containing <a> children (may be grid-rows-[0fr] = hidden)
-          2. Direct link       → <a href="..."> that is directly visible in the sidebar
+        Strategy:
+          1. Find the sidebar container by looking for the element that contains
+             most of the app's <a> links (most likely candidate = sidebar).
+          2. Walk every <button> in that container — if its next sibling has
+             any <a> descendants (accordion pattern), collect them as children.
+          3. Collect remaining direct <a> links that aren't inside accordion groups.
 
-        Returns a flat list of dicts:
-          {"text": "...", "href": "...", "parent": None | "Parent Text"}
+        Works without relying on container class names (avoids isInNav() failures).
         """
         return self._browser.execute_script("""
         (function() {
-            function getDirectText(el) {
+            function getText(el) {
+                // Prefer direct text nodes (avoids pulling in child icon text)
                 let t = '';
                 for (const n of el.childNodes) {
                     if (n.nodeType === 3) t += n.textContent;
@@ -3101,87 +3109,110 @@ class ExploreEngine:
                 return t.slice(0, 80);
             }
 
-            function isInNav(el) {
-                let p = el.parentElement;
-                while (p) {
-                    const tag = p.tagName && p.tagName.toLowerCase();
-                    const cls = (p.getAttribute('class') || '').toLowerCase();
-                    if (tag === 'nav' || tag === 'aside' ||
-                        p.getAttribute('role') === 'navigation' ||
-                        cls.includes('sidebar') || cls.includes('sidenav') ||
-                        cls.includes('menu') || cls.includes('drawer')) return true;
-                    p = p.parentElement;
-                }
-                return false;
+            function isVisible(el) {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
             }
 
             const NOISE = new Set([
-                'logout','log out','sign out','profile','account','notifications',
-                'help','about','settings','search','close','menu','toggle','collapse',
-                'expand','back','next','previous','home'
+                'logout','log out','sign out','notifications','help','about',
+                'search','close','toggle','collapse','expand','back','next','previous'
             ]);
 
+            // ── Step 1: Find the sidebar container ──────────────────────────
+            // Pick the container that owns the most internal <a href> links.
+            // Skip <header>, <footer>, <main> — those are content, not nav.
+            let sidebar = null;
+            let maxLinks = 0;
+            const SKIP_TAGS = new Set(['header','footer','main','form','table']);
+
+            for (const el of document.querySelectorAll('div, section, nav, aside, ul')) {
+                if (SKIP_TAGS.has(el.tagName.toLowerCase())) continue;
+                const r = el.getBoundingClientRect();
+                // Must be a narrow vertical strip (sidebar width < 320px) on the left
+                if (r.width < 50 || r.width > 350 || r.left > 400) continue;
+                if (!isVisible(el)) continue;
+                const linkCount = el.querySelectorAll('a[href]').length;
+                if (linkCount > maxLinks) {
+                    maxLinks = linkCount;
+                    sidebar = el;
+                }
+            }
+
+            // Fallback: no narrow sidebar found — try nav/aside anywhere
+            if (!sidebar || maxLinks < 3) {
+                for (const el of document.querySelectorAll('nav, aside, [role="navigation"]')) {
+                    if (!isVisible(el)) continue;
+                    const linkCount = el.querySelectorAll('a[href]').length;
+                    if (linkCount > maxLinks) {
+                        maxLinks = linkCount;
+                        sidebar = el;
+                    }
+                }
+            }
+
+            const root = sidebar || document.body;
             const results = [];
             const seen = new Set();
+            // Track which <a> elements are already claimed by an accordion parent
+            const claimedAnchors = new Set();
 
-            // ── Strategy 1: accordion buttons ──────────────────────────────
-            // Find all <button> elements inside the nav sidebar
-            for (const btn of document.querySelectorAll('button')) {
-                if (!isInNav(btn)) continue;
-                const text = getDirectText(btn);
+            // ── Step 2: Accordion buttons with hidden children ───────────────
+            // A button whose next sibling contains <a> links = accordion parent.
+            for (const btn of root.querySelectorAll('button')) {
+                const text = getText(btn);
                 if (!text || text.length < 2 || NOISE.has(text.toLowerCase())) continue;
                 if (seen.has(text.toLowerCase())) continue;
 
-                // Check if next sibling is a grid container (accordion children)
-                const sibling = btn.nextElementSibling;
-                const sibCls = sibling ? (sibling.getAttribute('class') || '') : '';
-                const hasGrid = sibling && (sibCls.includes('grid') || sibling.querySelectorAll('a').length > 0);
-
-                if (hasGrid) {
-                    // This is an accordion parent — collect all <a> children inside
-                    // (even if currently hidden by grid-rows-[0fr])
-                    const children = [];
-                    for (const a of sibling.querySelectorAll('a')) {
-                        const childText = getDirectText(a);
-                        if (!childText || childText.length < 2 || NOISE.has(childText.toLowerCase())) continue;
-                        const href = a.getAttribute('href') || '';
-                        children.push({ text: childText, href: href, parent: text });
-                    }
-
-                    if (children.length > 0) {
-                        // Add the parent itself first (if it also has a link)
-                        const btnHref = btn.getAttribute('href') || '';
-                        if (!seen.has(text.toLowerCase())) {
-                            seen.add(text.toLowerCase());
-                            results.push({ text: text, href: btnHref, parent: null, isAccordion: true });
-                        }
-                        // Then add all children
-                        for (const child of children) {
-                            const key = (text + '/' + child.text).toLowerCase();
-                            if (!seen.has(key)) {
-                                seen.add(key);
-                                results.push(child);
-                            }
-                        }
-                        continue;
+                // Find sibling container (next element sibling, or parent's next sibling)
+                let container = btn.nextElementSibling;
+                // Some frameworks wrap button+panel in a shared parent — look one level up too
+                if (!container || container.querySelectorAll('a').length === 0) {
+                    const parentNext = btn.parentElement && btn.parentElement.nextElementSibling;
+                    if (parentNext && parentNext.querySelectorAll('a').length > 0) {
+                        container = parentNext;
                     }
                 }
 
-                // No accordion children → treat as direct item
-                seen.add(text.toLowerCase());
-                const btnHref = btn.getAttribute('href') || '';
-                results.push({ text: text, href: btnHref, parent: null });
+                if (!container) continue;
+
+                // Collect ALL <a> descendants (even hidden in collapsed grid-rows-[0fr])
+                const anchors = Array.from(container.querySelectorAll('a'));
+                if (anchors.length === 0) continue;
+
+                const children = [];
+                for (const a of anchors) {
+                    const childText = getText(a);
+                    if (!childText || childText.length < 2 || NOISE.has(childText.toLowerCase())) continue;
+                    const href = a.getAttribute('href') || '';
+                    children.push({ text: childText, href: href, parent: text });
+                    claimedAnchors.add(a);
+                }
+
+                if (children.length > 0) {
+                    seen.add(text.toLowerCase());
+                    // Add parent (without href — it's an expander, not a link)
+                    results.push({ text: text, href: '', parent: null, isAccordion: true });
+                    // Add all children
+                    for (const child of children) {
+                        const key = child.text.toLowerCase();
+                        if (!seen.has(key)) {
+                            seen.add(key);
+                            results.push(child);
+                        }
+                    }
+                }
             }
 
-            // ── Strategy 2: direct <a> links in the nav ─────────────────────
-            // Catch any direct nav links NOT already found as accordion children
-            for (const a of document.querySelectorAll('a')) {
-                if (!isInNav(a)) continue;
-                const text = getDirectText(a);
+            // ── Step 3: Direct <a> links not part of any accordion ───────────
+            for (const a of root.querySelectorAll('a[href]')) {
+                if (claimedAnchors.has(a)) continue;
+                if (!isVisible(a)) continue;
+                const text = getText(a);
                 if (!text || text.length < 2 || NOISE.has(text.toLowerCase())) continue;
                 const href = a.getAttribute('href') || '';
                 if (!href || href === '#' || href.startsWith('javascript')) continue;
-                // Skip if already collected as an accordion child
                 if (seen.has(text.toLowerCase())) continue;
                 seen.add(text.toLowerCase());
                 results.push({ text: text, href: href, parent: null });
