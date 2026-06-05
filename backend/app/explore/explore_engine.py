@@ -3054,6 +3054,41 @@ class ExploreEngine:
 
                 await self._log("SUCCESS", "navigation", f"Module discovered: {text}")
 
+                # Check if this nav item is expandable (has children)
+                try:
+                    children = await asyncio.to_thread(
+                        self._get_revealed_child_items, item
+                    )
+                    if children:
+                        await self._log("INFO", "navigation",
+                            f"Found {len(children)} children for '{text}'")
+                        for child in children:
+                            child_text = child.get("text", "").strip()
+                            child_href = child.get("href", "").strip()
+
+                            if not child_text or len(child_text) > 100:
+                                continue
+
+                            child_module = ApplicationModule(
+                                application_id=self._app.id,
+                                name=f"{text} / {child_text}",  # Hierarchical name
+                                description="",
+                                url_pattern=child_href,
+                                icon="layout",
+                                semantic_tags=[],
+                                order_index=len(self._module_map),
+                            )
+                            self.db.add(child_module)
+                            await self.db.flush()
+                            if child_href:
+                                self._module_map[child_href] = child_module.id
+
+                            await self._log("SUCCESS", "navigation",
+                                f"Module discovered: {text} / {child_text}")
+                except Exception as e:
+                    # Child discovery failed for this item, continue to next
+                    log.warning("Child discovery failed for nav item", text=text, error=str(e))
+
             await self.db.commit()
         else:
             await self._log("WARNING", "navigation", "No navigation structure detected — trying page analysis")
