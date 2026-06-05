@@ -32,107 +32,14 @@ from app.intelligence.semantic_extractor import SemanticUIExtractor
 from app.intelligence.ai_client import get_ai_client
 from app.core.security import decrypt_credential
 from app.realtime.manager import connection_manager
+from app.explore.token_manager import TokenBudget, RateLimitManager
+from app.explore.page_analyzer_optimized import analyze_page_compact, FieldValidator, SYSTEM_PROMPT_EXPLORE_COMPACT
 from config import settings
 
 log = structlog.get_logger()
 
-
-SYSTEM_PROMPT_EXPLORE = """You are QAptain's Application Intelligence Engine. Extract comprehensive structured knowledge from a page for QA test generation.
-
-RESPOND WITH VALID JSON ONLY. No markdown, no explanation.
-
-{
-  "page_name": "Human-readable name",
-  "page_type": "dashboard|list|form|detail|modal|wizard|login|settings|report|calendar|upload",
-  "module": "Which application module this page belongs to",
-  "key_business_objects": ["Entity types this page manages, e.g. User, Sample, Order, Invoice"],
-
-  "forms": [
-    {
-      "name": "Form name",
-      "purpose": "Business action this form performs",
-      "entity": "Entity being created or edited, e.g. Sample, User",
-      "fields": [
-        {
-          "label": "Field label",
-          "type": "text|email|password|number|date|datetime|dropdown|multiselect|checkbox|radio|textarea|file|search|autocomplete",
-          "required": true,
-          "validation": "Specific rules: min/max length, format, uniqueness constraint, allowed range",
-          "options": ["Option 1", "Option 2"],
-          "depends_on": "Label of field this depends on, or null"
-        }
-      ],
-      "submit_action": "What happens on form submission",
-      "success_message": "Expected success indicator after submit",
-      "cancel_action": "What cancel or close does"
-    }
-  ],
-
-  "tables": [
-    {
-      "name": "Table name",
-      "entity": "Entity rows represent, e.g. Users, Samples",
-      "purpose": "What data this table shows",
-      "columns": [
-        {"name": "Column header", "type": "text|number|date|status|boolean|link|badge|action", "sortable": true}
-      ],
-      "row_actions": ["Edit", "Delete", "View", "Approve", "Export"],
-      "bulk_actions": ["Delete", "Export", "Assign"],
-      "has_search": true,
-      "has_filter": true,
-      "has_pagination": true,
-      "pagination_type": "page-numbers|load-more|infinite-scroll|none"
-    }
-  ],
-
-  "workflows": [
-    {
-      "name": "Workflow name",
-      "type": "crud_create|crud_read|crud_update|crud_delete|approval|search|export|import|navigation|login|upload",
-      "entity": "Entity this workflow operates on",
-      "entry_trigger": "Button, link or event that starts this workflow",
-      "preconditions": ["User must be logged in", "Record must exist", "Location must be selected"],
-      "steps": [
-        {"step": 1, "action": "User clicks Add button", "expected_result": "Create form opens"},
-        {"step": 2, "action": "User fills required fields", "expected_result": "Fields validate in real time"},
-        {"step": 3, "action": "User clicks Submit", "expected_result": "Record saved, success message shown"}
-      ],
-      "success_criteria": ["Record appears in list", "Confirmation toast shown", "Count increments"],
-      "error_paths": ["Required field missing shows inline error", "Duplicate entry rejected with message"]
-    }
-  ],
-
-  "crud_operations": {
-    "entity": "Primary entity managed on this page",
-    "can_create": true,
-    "can_read": true,
-    "can_update": true,
-    "can_delete": true,
-    "create_trigger": "Add / New button label or null",
-    "update_trigger": "Edit button label or null",
-    "delete_trigger": "Delete button label or null",
-    "requires_confirmation": true,
-    "soft_delete": false
-  },
-
-  "navigation_structure": {
-    "breadcrumbs": ["Home", "Module", "Page"],
-    "parent_module": "Module this page belongs to",
-    "child_pages": ["Sub-pages accessible from here"],
-    "related_pages": ["Functionally related pages a tester should also test"]
-  },
-
-  "dynamic_behaviors": [
-    {
-      "trigger": "button_click|field_change|page_load|hover|scroll",
-      "element": "Element label or description",
-      "behavior": "modal_opens|section_expands|field_appears|field_hides|data_loads|redirect|toast_appears|dialog_opens",
-      "description": "Specific observable change"
-    }
-  ],
-
-  "navigation_links": ["Link text that navigates to another page or module"]
-}"""
+# Reduced token system prompt
+SYSTEM_PROMPT_EXPLORE = SYSTEM_PROMPT_EXPLORE_COMPACT
 
 
 class ExploreEngine:
@@ -141,7 +48,12 @@ class ExploreEngine:
     Emits live semantic logs (not technical logs) throughout.
     """
 
-    MAX_PAGES = 200   # hard cap — use percentage logic in run()
+    MAX_PAGES = 10000   # increased from 200 — explore all discovered pages
+
+    def request_stop(self) -> None:
+        """Request graceful stop of exploration. Checked during long operations."""
+        self._should_stop = True
+        log.info("Exploration stop requested", session_id=self._session_id)
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -157,6 +69,12 @@ class ExploreEngine:
         self._raw_nav_items: list[dict] = []  # nav items from Phase 2 {text, href}
         self._login_url: str = ""       # full URL of the login page (set in Phase 1)
         self._dashboard_url: str = ""  # full URL after successful login
+        # Token and rate limit management
+        self._token_budget = TokenBudget(soft_limit=500000)
+        self._rate_limit = RateLimitManager(max_concurrent=2)
+        self._field_validator: FieldValidator | None = None
+        # Stop signal for graceful interruption
+        self._should_stop = False
 
     async def run(self, session_id: str, application_id: str) -> None:
         """Main explore entry point — runs the full exploration lifecycle."""
@@ -181,6 +99,13 @@ class ExploreEngine:
         await self._emit_event("explore_started", {"session_id": session_id})
 
         try:
+            # Check stop signal before starting
+            if self._should_stop:
+                await self._log("INFO", "system", "Stop requested before exploration started")
+                session.status = ExploreStatus.STOPPED
+                await self.db.commit()
+                return
+
             # Launch browser and clean up previous data concurrently — both can proceed in parallel.
             await self._log("INFO", "system", "Launching browser…")
             try:
@@ -202,26 +127,52 @@ class ExploreEngine:
             await self._log("INFO", "system", "Browser ready")
             self._extractor = SemanticUIExtractor(self._browser.driver)
             self._healer = SelfHealingEngine(self._browser.driver)
+            self._field_validator = FieldValidator(self._browser.driver)
 
             # Phase 1: Login
             login_ok = await self._phase_login(app)
             if not login_ok:
                 await self._fail_session(session, "Login failed during exploration")
                 return
+            if self._should_stop:
+                await self._log("INFO", "system", "Stop requested after login")
+                session.status = ExploreStatus.STOPPED
+                await self.db.commit()
+                return
 
             # Phase 2: Discover modules from navigation
             await self._phase_discover_modules()
+            if self._should_stop:
+                await self._log("INFO", "system", "Stop requested after module discovery")
+                session.status = ExploreStatus.STOPPED
+                await self.db.commit()
+                return
 
             # Phase 2b: Click each nav item to capture REAL URLs (handles SPA routing)
             await self._capture_real_module_urls()
+            if self._should_stop:
+                await self._log("INFO", "system", "Stop requested after URL capture")
+                session.status = ExploreStatus.STOPPED
+                await self.db.commit()
+                return
 
             # Phase 3: Deep exploration — AI analysis + element extraction
             if session.mode != ExploreMode.SKIP:
                 await self._log("INFO", "exploration",
                     "Exploration mode: SMART — exploring all discovered URLs")
                 await self._phase_explore_pages(self.MAX_PAGES)
+                if self._should_stop:
+                    await self._log("INFO", "system", "Stop requested during page exploration")
+                    session.status = ExploreStatus.STOPPED
+                    await self.db.commit()
+                    return
                 # Deep element scan — extracts detailed selectors, CRUD forms, and interactive elements
                 await self._phase_deep_scan_elements()
+                if self._should_stop:
+                    await self._log("INFO", "system", "Stop requested after element scan")
+                    session.status = ExploreStatus.STOPPED
+                    await self.db.commit()
+                    return
 
             # Phase 4: Build knowledge graph
             kg = await self._phase_build_knowledge_graph(application_id, session_id)
@@ -252,9 +203,15 @@ class ExploreEngine:
             }
             await self.db.commit()
 
+            # Log final token usage
+            final_budget = await self._token_budget.summary()
             await self._log("MILESTONE", "system",
                 f"Exploration complete — {modules_count} modules, {pages_count} pages, "
                 f"{workflows_count} workflows, {scenarios_count} scenarios generated")
+            await self._log("INFO", "system",
+                f"Token usage: {final_budget['spent']}/{final_budget['limit']} "
+                f"({int(final_budget['spent']/final_budget['limit']*100)}%) | "
+                f"API calls: {final_budget['api_calls']}")
             await self._emit_event("explore_completed", {
                 "session_id": session_id,
                 "modules": modules_count,
@@ -262,6 +219,8 @@ class ExploreEngine:
                 "workflows": workflows_count,
                 "scenarios_generated": scenarios_count,
                 "redirect_to": "scenarios",
+                "tokens_spent": final_budget["spent"],
+                "tokens_limit": final_budget["limit"],
             })
 
         except Exception as e:
@@ -1696,6 +1655,27 @@ class ExploreEngine:
 
     def _try_submit_after_selection(self):
         """After context selection, look for a submit/continue button and click it."""
+        # Fast path: JS search for button with any of these labels (instant, no timeout waits)
+        button = self._browser.execute_script("""
+            const labels = ["Submit", "Continue", "Proceed", "Sign In", "Login", "OK", "Confirm", "Next", "Go"];
+            const buttons = Array.from(document.querySelectorAll('button, a[role="button"], input[type="submit"]'));
+            for (const btn of buttons) {
+                const text = btn.textContent.trim().toLowerCase();
+                if (labels.some(l => text.includes(l.toLowerCase())) && btn.offsetHeight > 0) {
+                    return btn;
+                }
+            }
+            return null;
+        """)
+
+        if button:
+            try:
+                self._browser.execute_script("arguments[0].click();", button)
+                return
+            except Exception:
+                pass
+
+        # Fallback: use healer (slower but more reliable for complex elements)
         for lbl in ("Submit", "Continue", "Proceed", "Sign In", "Login", "OK", "Confirm", "Next", "Go"):
             result = self._healer.find_element(lbl)
             if result[0]:
@@ -1716,7 +1696,16 @@ class ExploreEngine:
           2. Categorise each as add/edit/delete/submit/nav/form_field
           3. Click CRUD buttons, capture resulting dialog/form structure
           4. Save SemanticElement records so the executor can look up selectors
+
+        OPTIMIZED: Skip if token budget is low, limit to 20 pages max.
         """
+        # Check token budget before deep scan
+        remaining = await self._token_budget.remaining()
+        if remaining < 20000:
+            await self._log("WARNING", "scan",
+                f"Token budget low ({remaining} remaining) — skipping deep element scan")
+            return
+
         await self._log("MILESTONE", "scan", "Deep-scanning pages for elements and selectors")
 
         # Query all pages saved so far for this application
@@ -1731,7 +1720,16 @@ class ExploreEngine:
             await self._log("WARNING", "scan", "No pages to deep-scan")
             return
 
-        for i, page in enumerate(pages[:self.MAX_PAGES]):
+        # Deep scan all discovered pages (budget checks in _deep_scan_page_elements prevent runaway)
+        max_scan_pages = len(pages)
+        await self._log("INFO", "scan", f"Deep-scanning {max_scan_pages}/{len(pages)} pages")
+
+        for i, page in enumerate(pages):
+            # Check stop signal
+            if self._should_stop:
+                await self._log("INFO", "scan", "Stop requested — halting element scan")
+                return
+
             try:
                 await self._log("INFO", "scan", f"Scanning [{i+1}/{len(pages)}] {page.title}")
                 await asyncio.to_thread(self._browser.navigate, page.url)
@@ -2102,10 +2100,20 @@ class ExploreEngine:
     async def _generate_test_scenarios(self, application_id: str, session_id: str) -> int:
         """
         Phase 6: Generate AI test scenarios from exploration data.
-        Uses batched generation (5 modules per call) to avoid token-limit truncation
-        and content-filter issues with large single-shot prompts.
+        Uses smaller batches (2 modules per call) to avoid token-limit issues.
+        Skips if token budget is critical.
         """
+        # Check if we have token budget for scenarios
+        remaining = await self._token_budget.remaining()
+        if remaining < 50000:
+            await self._log("WARNING", "scenarios",
+                f"Token budget low ({remaining} remaining) — skipping scenario generation")
+            return 0
+
         await self._log("MILESTONE", "scenarios", "Generating test scenarios from exploration data")
+        budget = await self._token_budget.summary()
+        await self._log("INFO", "scenarios",
+            f"Token budget available: {budget['remaining']}/{budget['limit']} tokens")
 
         # Delete old AI-generated scenarios so we regenerate fresh ones
         existing_result = await self.db.execute(
@@ -2207,12 +2215,19 @@ class ExploreEngine:
             f"URL: {self._app.base_url}\n\n"
         )
 
-        # ── Batch: 3 modules per AI call (smaller batches = more scenarios without truncation) ──
-        BATCH_SIZE = 3
+        # ── Batch: 2 modules per AI call (smaller = fewer tokens, fewer 429s) ──
+        BATCH_SIZE = 2
         all_scenario_infos: list[dict] = []
         batches = [modules[i:i+BATCH_SIZE] for i in range(0, len(modules), BATCH_SIZE)]
+        await self._log("INFO", "scenarios", f"Generating scenarios in {len(batches)} batches (size={BATCH_SIZE})")
 
         for batch_idx, batch in enumerate(batches):
+            # Check token budget before each batch
+            remaining = await self._token_budget.remaining()
+            if remaining < 30000:
+                await self._log("WARNING", "scenarios",
+                    f"Token budget critical ({remaining} remaining) — stopping scenario generation")
+                break
             batch_ctx = [_module_ctx(m) for m in batch]
             module_names_str = ", ".join(m.name for m in batch)
 
@@ -2246,9 +2261,14 @@ class ExploreEngine:
                             user=prompt,
                             fast=True,
                             json_mode=True,
-                            max_tokens=6000,
+                            max_tokens=3000,  # Reduced from 6000
                         ),
                         timeout=90.0,
+                    )
+                    # Track tokens for budget
+                    await self._token_budget.add(
+                        int(response.input_tokens * 0.7),
+                        int(response.output_tokens * 0.3)
                     )
                     content = response.content.strip()
                     if not content:
@@ -2582,6 +2602,23 @@ class ExploreEngine:
 
     def _click_submit_button_any(self) -> bool:
         """Try clicking login submit button via Selenium healer as a Selenium-level fallback."""
+        # Fast path: JS search (instant, no timeout waits)
+        clicked = self._browser.execute_script("""
+            const labels = ["Sign In", "Login", "Log In", "Submit", "SIGN IN", "LOG IN", "LOGIN", "Continue"];
+            const buttons = Array.from(document.querySelectorAll('button, a[role="button"], input[type="submit"]'));
+            for (const btn of buttons) {
+                const text = btn.textContent.trim().toLowerCase();
+                if (labels.some(l => text.includes(l.toLowerCase()) || text === l.toLowerCase()) && btn.offsetHeight > 0) {
+                    btn.click();
+                    return true;
+                }
+            }
+            return false;
+        """)
+        if clicked:
+            return True
+
+        # Fallback: use healer for complex elements
         for label in ("Sign In", "Login", "Log In", "Submit", "SIGN IN", "LOG IN", "LOGIN", "Continue"):
             result = self._healer.find_element(label)
             if result[0]:
@@ -2992,48 +3029,32 @@ class ExploreEngine:
         if nav_items:
             await self._log("INFO", "navigation", f"Navigation detected with {len(nav_items)} items")
 
-            # Use AI to categorize navigation items into modules
-            nav_text = "\n".join(f"- {item['text']} ({item.get('href', '')})" for item in nav_items)
+            # Create one module per nav item to preserve all navigation paths
+            # (Don't use AI to group them — that loses granularity and misses URLs)
+            for item in nav_items:
+                text = item.get("text", "").strip()
+                href = item.get("href", "").strip()
 
-            response = await asyncio.wait_for(
-                self.ai.complete(
-                    system="""Analyze navigation items and group them into logical application modules.
-Output JSON: {"modules": [{"name": "Module Name", "description": "what it does", "url_pattern": "/path", "icon": "lucide_icon_name", "tags": ["crud", "table"]}]}""",
-                    user=f"""Application description: {self._app.description or 'Business application'}
+                if not text or len(text) > 100:
+                    continue
 
-Navigation items:
-{nav_text}
+                module = ApplicationModule(
+                    application_id=self._app.id,
+                    name=text,
+                    description="",
+                    url_pattern=href,
+                    icon="layout",
+                    semantic_tags=[],
+                    order_index=len(self._module_map),
+                )
+                self.db.add(module)
+                await self.db.flush()
+                if href:
+                    self._module_map[href] = module.id
 
-Group these into logical modules.""",
-                    fast=True,
-                    json_mode=True,
-                ),
-                timeout=90.0,
-            )
+                await self._log("SUCCESS", "navigation", f"Module discovered: {text}")
 
-            try:
-                module_data = response.json()
-                for mod_info in module_data.get("modules", []):
-                    module = ApplicationModule(
-                        application_id=self._app.id,
-                        name=mod_info.get("name", "Unknown"),
-                        description=mod_info.get("description", ""),
-                        url_pattern=mod_info.get("url_pattern", ""),
-                        icon=mod_info.get("icon", "layout"),
-                        semantic_tags=mod_info.get("tags", []),
-                        order_index=len(self._module_map),
-                    )
-                    self.db.add(module)
-                    await self.db.flush()
-                    if mod_info.get("url_pattern"):
-                        self._module_map[mod_info["url_pattern"]] = module.id
-
-                    await self._log("SUCCESS", "navigation", f"Module discovered: {mod_info.get('name')}")
-
-                await self.db.commit()
-            except Exception as e:
-                log.warning("Module categorization failed", error=str(e))
-                await self._discover_modules_from_nav(nav_items)
+            await self.db.commit()
         else:
             await self._log("WARNING", "navigation", "No navigation structure detected — trying page analysis")
             await self._discover_modules_from_links()
@@ -3044,7 +3065,7 @@ Group these into logical modules.""",
 
     async def _discover_modules_from_nav(self, nav_items: list[dict]):
         """Fallback: create modules directly from nav items."""
-        for item in nav_items[:15]:
+        for item in nav_items:
             text = item.get("text", "").strip()
             if text and len(text) < 50:
                 module = ApplicationModule(
@@ -3175,20 +3196,19 @@ Group these into logical modules.""",
                 if not text or len(text) < 2:
                     continue
 
-                # If the nav item already has a usable href, record it directly
-                if href and href not in ("#", "/", "javascript:void(0)", "javascript:;"):
-                    real_url = href if href.startswith("http") else base_url + href
-                    url_map[text] = real_url
-                    self._discovered_urls.add(real_url)
-                    await self._log("INFO", "navigation", f"Nav href: {text!r} → {href}")
-                    continue
-
-                # Otherwise click and observe URL / title change
+                # Always click to discover children, even if href exists
+                # (expandable nav items may have href AND child items)
                 try:
                     before_url = await asyncio.to_thread(self._get_full_url)
                     before_title = await asyncio.to_thread(self._get_page_title)
                     clicked = await asyncio.to_thread(self._click_nav_item, text)
                     if not clicked:
+                        # Fallback: use href if available
+                        if href and href not in ("#", "/", "javascript:void(0)", "javascript:;"):
+                            real_url = href if href.startswith("http") else base_url + href
+                            url_map[text] = real_url
+                            self._discovered_urls.add(real_url)
+                            await self._log("INFO", "navigation", f"Nav href (no-click): {text!r} → {href}")
                         continue
                     await asyncio.sleep(1.5)
 
@@ -3494,11 +3514,24 @@ Group these into logical modules.""",
         return {t.lower() for t in items}
 
     def _get_revealed_child_items(self, parent_text: str) -> list[str]:
-        """After clicking a parent nav item, collect any newly visible child items."""
+        """After clicking a parent nav item, collect any newly visible child items.
+
+        Handles collapsible grid structure:
+          <button>Parent</button>
+          <div class="grid grid-rows-[1fr]">  ← expanded when clicked
+            <div class="overflow-hidden">
+              <div class="ml-6...">
+                <a>Child 1</a>
+                <a>Child 2</a>
+              </div>
+            </div>
+          </div>
+        """
         return self._browser.execute_script("""
         (function() {
-            const parent = arguments[0].toLowerCase();
+            const parent = arguments[0].toLowerCase().trim();
             function isVisible(el) {
+                if (!el) return false;
                 const r = el.getBoundingClientRect();
                 const s = getComputedStyle(el);
                 return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
@@ -3508,42 +3541,54 @@ Group these into logical modules.""",
                 for (const n of el.childNodes) { if (n.nodeType === 3) t += n.textContent; }
                 return (t.trim() || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 80);
             }
-            const NOISE = new Set(['logout','sign out','profile','help','about','home','settings']);
+            const NOISE = new Set(['logout','sign out','profile','help','about','home','settings','dashboard']);
 
-            // Find the parent element
-            let parentEl = null;
-            for (const el of document.querySelectorAll('*')) {
-                if (!isVisible(el)) continue;
-                const t = getDirectText(el).toLowerCase();
-                if (t === parent || t.startsWith(parent.slice(0,15))) {
-                    parentEl = el; break;
+            // Find the parent BUTTON element by text
+            let parentBtn = null;
+            for (const btn of document.querySelectorAll('button')) {
+                if (!isVisible(btn)) continue;
+                const t = getDirectText(btn).toLowerCase().trim();
+                if (t === parent || t.startsWith(parent.slice(0, 15))) {
+                    parentBtn = btn;
+                    break;
                 }
             }
-            if (!parentEl) return [];
+            if (!parentBtn) return [];
 
-            // Submenu is often the next sibling ul/div, or a child with aria-expanded
-            const expandedEl = parentEl.querySelector('[aria-expanded="true"]')
-                || (parentEl.hasAttribute('aria-expanded') ? parentEl : null)
-                || parentEl;
-            const submenu = expandedEl.nextElementSibling
-                || expandedEl.querySelector('ul, ol, [role="group"], [role="menu"]');
-
-            const searchRoot = submenu || expandedEl.parentElement || parentEl.parentElement;
-            if (!searchRoot) return [];
-
-            const seen = new Set([parent]);
-            const results = [];
-            for (const el of searchRoot.querySelectorAll(
-                'a, li, [role="menuitem"], [role="treeitem"]'
-            )) {
-                if (!isVisible(el)) continue;
-                const t = getDirectText(el);
-                if (!t || t.length < 2 || t.length > 80) continue;
-                if (NOISE.has(t.toLowerCase()) || seen.has(t.toLowerCase())) continue;
-                seen.add(t.toLowerCase());
-                results.push(t);
+            // Strategy 1: Next sibling is the grid container (collapsible menu)
+            let gridContainer = parentBtn.nextElementSibling;
+            if (gridContainer && (gridContainer.classList.contains('grid') || gridContainer.getAttribute('class')?.includes('grid'))) {
+                // Found it! Search inside for visible child items
+                const seen = new Set([parent]);
+                const results = [];
+                for (const el of gridContainer.querySelectorAll('a, li, [role="menuitem"], [role="treeitem"]')) {
+                    if (!isVisible(el)) continue;
+                    const t = getDirectText(el).toLowerCase().trim();
+                    if (!t || t.length < 2 || t.length > 80) continue;
+                    if (NOISE.has(t) || seen.has(t) || t === parent) continue;
+                    seen.add(t);
+                    results.push(getDirectText(el));  // Original case
+                }
+                if (results.length > 0) return results.slice(0, 50);
             }
-            return results.slice(0, 20);
+
+            // Strategy 2: Check parent's parent div for children
+            let searchRoot = parentBtn.parentElement;
+            if (searchRoot) {
+                const seen = new Set([parent]);
+                const results = [];
+                for (const el of searchRoot.querySelectorAll('a, li, [role="menuitem"], [role="treeitem"]')) {
+                    if (!isVisible(el)) continue;
+                    const t = getDirectText(el).toLowerCase().trim();
+                    if (!t || t.length < 2 || t.length > 80) continue;
+                    if (NOISE.has(t) || seen.has(t) || t === parent) continue;
+                    seen.add(t);
+                    results.push(getDirectText(el));
+                }
+                if (results.length > 0) return results.slice(0, 50);
+            }
+
+            return [];
         })()
         """, parent_text) or []
 
@@ -3621,8 +3666,13 @@ Group these into logical modules.""",
 
         Secondary strategy: direct URL navigation for any pages not reached via nav clicks
         (deep links, sub-routes discovered in Phase 2b that aren't top-level nav items).
+
+        TOKEN OPTIMIZATION: Check budget before each page, stop gracefully if approaching limit.
         """
         await self._log("MILESTONE", "exploration", f"Starting deep page exploration (max {max_pages} pages)")
+        budget_summary = await self._token_budget.summary()
+        await self._log("INFO", "exploration",
+            f"Token budget: {budget_summary['spent']}/{budget_summary['limit']} tokens used")
 
         urls_to_visit = await self._collect_urls_to_visit()
         await self._log("INFO", "exploration",
@@ -3640,6 +3690,11 @@ Group these into logical modules.""",
                 await self._log("INFO", "exploration",
                     f"Visiting up to {remaining} additional URLs not covered by nav clicks")
                 for url, module_id in urls_to_visit:
+                    # Check stop signal
+                    if self._should_stop:
+                        await self._log("INFO", "exploration", "Stop requested — halting URL-based exploration")
+                        return
+
                     if remaining <= 0:
                         break
                     if url in self._phase3_analyzed:
@@ -3705,6 +3760,11 @@ Group these into logical modules.""",
         await self._log("INFO", "exploration", f"Nav items to click: {len(items_to_click)}")
 
         for item in items_to_click:
+            # Check stop signal
+            if self._should_stop:
+                await self._log("INFO", "exploration", "Stop requested — halting click-based exploration")
+                return
+
             text = item.get("text", "").strip()
             href = item.get("href", "").strip()
             if not text:
@@ -3820,7 +3880,14 @@ Group these into logical modules.""",
             f"Click-based exploration complete — {visited} pages analyzed")
 
     async def _explore_single_page(self, url: str, module_id: str | None, nav_hint: str | None = None, skip_navigate: bool = False):
-        """Explore a single page and build its semantic map."""
+        """Explore a single page and build its semantic map with validation testing."""
+        # Check token budget before exploring
+        remaining = await self._token_budget.remaining()
+        if remaining < 15000:
+            await self._log("WARNING", "exploration",
+                f"Token budget critical ({remaining} remaining) — stopping exploration")
+            return
+
         try:
             self._phase3_analyzed.add(url)  # mark attempted — prevents duplicate analysis
             if not skip_navigate:
@@ -3868,6 +3935,10 @@ Group these into logical modules.""",
 
             # AI-powered page analysis with keepalive to prevent session expiry
             page_analysis = await self._analyze_with_keepalive(state, url)
+
+            # Test form validations (quick, token-free)
+            if page_analysis.get("forms") and self._field_validator:
+                await self._test_form_validations(page_analysis, state)
 
             # Find or create module
             if not module_id:
@@ -3950,6 +4021,41 @@ Group these into logical modules.""",
         except Exception as e:
             await self._log("WARNING", "exploration", f"Could not fully analyze page at {url}: {str(e)[:100]}")
 
+    async def _test_form_validations(self, page_analysis: dict, state: dict):
+        """Test form field validations without AI tokens (Phase 2 testing)."""
+        if not self._field_validator:
+            return
+
+        try:
+            # Test required fields
+            required_fields = await asyncio.to_thread(
+                self._field_validator.test_required_fields
+            )
+
+            if required_fields:
+                await self._log("INFO", "exploration",
+                    f"Detected {len(required_fields)} required fields")
+
+                # Enrich forms with required field info
+                for form in page_analysis.get("forms", []):
+                    for field in form.get("fields", []):
+                        field_name = field.get("label", "").lower()
+                        for req_field_name, req_info in required_fields.items():
+                            if field_name in req_field_name.lower() or req_field_name.lower() in field_name:
+                                field["required"] = True
+                                break
+
+            # Test field dependencies (quick check without interaction)
+            deps = await asyncio.to_thread(
+                self._field_validator.test_field_dependencies
+            )
+            if deps and deps.get("visible_count", 0) > 2:
+                await self._log("INFO", "exploration",
+                    f"Page has {deps['visible_count']} visible form fields")
+
+        except Exception as e:
+            log.debug("Form validation testing failed", error=str(e))
+
     async def _analyze_with_keepalive(self, state: dict, url: str) -> dict:
         """
         Run AI page analysis while pinging the server every 25s to keep the SPA session alive.
@@ -3960,14 +4066,14 @@ Group these into logical modules.""",
 
         async def _keepalive():
             while not stop.is_set():
-                await asyncio.sleep(25)
+                await asyncio.sleep(45)  # Reduced pings to save bandwidth
                 if stop.is_set():
                     break
                 try:
+                    # Lightweight no-op to keep session alive
                     await asyncio.to_thread(
                         self._browser.execute_script,
-                        f"fetch('{keepalive_url}', "
-                        f"{{method:'HEAD',credentials:'include',cache:'no-store'}}).catch(()=>{{}})"
+                        "void(0)"
                     )
                 except Exception:
                     pass
@@ -3980,35 +4086,49 @@ Group these into logical modules.""",
             await asyncio.gather(task, return_exceptions=True)
 
     async def _analyze_page_with_ai(self, state: dict, url: str) -> dict:
-        """Use AI to deeply understand a page's semantic structure."""
-        # Build compact representation — NOT raw HTML
-        compact_state = {
-            "url": url,
-            "page": state.get("page"),
-            "workflow_stage": state.get("workflow_stage"),
-            "visible_elements": state.get("visible_elements", [])[:30],
-            "page_text": state.get("page_text_summary", ""),
-            "navigation": state.get("navigation", {}),
-        }
-
-        app_context = (
-            f"Application: {self._app.name or 'Business application'}\n"
-            f"Description: {self._app.description or 'Web application'}\n"
-            f"Base URL: {self._app.base_url}"
-        )
+        """Use AI to deeply understand a page's semantic structure (optimized for tokens)."""
+        # Check token budget before analyzing
+        remaining = await self._token_budget.remaining()
+        if remaining < 10000:
+            await self._log("WARNING", "exploration",
+                f"Token budget critical ({remaining} remaining) — skipping page analysis")
+            return {
+                "page_name": state.get("page", "Unknown"),
+                "page_type": "unknown",
+                "forms": [],
+                "tables": [],
+                "workflows": [],
+                "dynamic_behaviors": [],
+                "navigation_links": [],
+            }
 
         try:
-            response = await asyncio.wait_for(
-                self.ai.complete(
-                    system=SYSTEM_PROMPT_EXPLORE,
-                    user=f"{app_context}\n\nPage semantic state:\n{compact_state}",
-                    fast=True,
-                    json_mode=True,
-                    max_tokens=3000,
+            # Use optimized compact analyzer
+            result = await asyncio.wait_for(
+                analyze_page_compact(
+                    self.ai,
+                    state,
+                    url,
+                    self._app.name or "Application"
                 ),
                 timeout=60.0,
             )
-            return response.json()
+
+            # Track token usage
+            tokens_used = result.pop("_tokens", 0)
+            error = result.pop("_error", None)
+            if tokens_used > 0:
+                within_budget = await self._token_budget.add(
+                    int(tokens_used * 0.6),  # Estimate input
+                    int(tokens_used * 0.4)   # Estimate output
+                )
+                if not within_budget:
+                    await self._log("WARNING", "exploration", "Token budget exceeded — stopping exploration")
+
+            if error:
+                log.warning("Page AI analysis failed", error=error)
+
+            return result
         except Exception as e:
             log.warning("Page AI analysis failed", error=str(e))
             return {
