@@ -3021,27 +3021,35 @@ class ExploreEngine:
                 "Browser is still on the login page — skipping module discovery")
             return
 
-        state = self._extractor.extract_page_state()
-        nav_items = state.get("navigation", {}).get("items", [])
+        # Use a deep JS scan to get ALL nav items (direct links + accordion children)
+        # without clicking anything. This avoids navigation side-effects that
+        # cause child detection to fail.
+        all_nav_items = await asyncio.to_thread(self._scan_full_nav_structure)
 
-        if nav_items:
-            await self._log("INFO", "navigation", f"Navigation detected with {len(nav_items)} items")
+        if not all_nav_items:
+            # Fallback to extractor if JS scan found nothing
+            state = self._extractor.extract_page_state()
+            raw = state.get("navigation", {}).get("items", [])
+            all_nav_items = [{"text": i.get("text",""), "href": i.get("href",""), "parent": None} for i in raw if i.get("text","").strip()]
 
-            # Collect ALL nav items including expanded children
-            all_nav_items = []
+        if all_nav_items:
+            await self._log("INFO", "navigation",
+                f"Navigation scan found {len(all_nav_items)} total items (including accordion children)")
 
-            # Create one module per nav item to preserve all navigation paths
-            # (Don't use AI to group them — that loses granularity and misses URLs)
-            for item in nav_items:
+            for item in all_nav_items:
                 text = item.get("text", "").strip()
                 href = item.get("href", "").strip()
+                parent = item.get("parent")
 
                 if not text or len(text) > 100:
                     continue
 
+                # Use hierarchical name for child items
+                display_name = f"{parent} / {text}" if parent else text
+
                 module = ApplicationModule(
                     application_id=self._app.id,
-                    name=text,
+                    name=display_name,
                     description="",
                     url_pattern=href,
                     icon="layout",
@@ -3053,72 +3061,9 @@ class ExploreEngine:
                 if href:
                     self._module_map[href] = module.id
 
-                await self._log("SUCCESS", "navigation", f"Module discovered: {text}")
+                await self._log("SUCCESS", "navigation", f"Module discovered: {display_name}")
 
-                # Add parent to comprehensive list
-                all_nav_items.append(item)
-
-                # Check if this nav item is expandable (has children)
-                try:
-                    # First, click the parent item to expand it
-                    clicked = await asyncio.to_thread(self._click_nav_item, text)
-                    if clicked:
-                        await asyncio.sleep(0.8)  # Wait for expansion animation
-
-                    # Then get the revealed children
-                    children = await asyncio.to_thread(
-                        self._get_revealed_child_items, text  # Pass text string, not dict
-                    )
-                    if children:
-                        await self._log("INFO", "navigation",
-                            f"Found {len(children)} children for '{text}'")
-                        for child_text in children:
-                            # child_text is a string returned from JS, not a dict
-                            child_text = child_text.strip() if isinstance(child_text, str) else str(child_text)
-
-                            if not child_text or len(child_text) > 100:
-                                continue
-
-                            # Create hierarchical name for module
-                            hierarchical_name = f"{text} / {child_text}"
-
-                            child_module = ApplicationModule(
-                                application_id=self._app.id,
-                                name=hierarchical_name,
-                                description="",
-                                url_pattern="",  # Will be populated in Phase 2b
-                                icon="layout",
-                                semantic_tags=[],
-                                order_index=len(self._module_map),
-                            )
-                            self.db.add(child_module)
-                            await self.db.flush()
-
-                            await self._log("SUCCESS", "navigation",
-                                f"Module discovered: {hierarchical_name}")
-
-                            # Add child to comprehensive list for Phase 2b
-                            # Phase 2b will click it to get the real URL
-                            all_nav_items.append({
-                                "text": child_text,
-                                "href": "",
-                                "parent": text,
-                                "is_child": True,
-                            })
-                except Exception as e:
-                    # Child discovery failed for this item, continue to next
-                    log.warning("Child discovery failed for nav item", text=text, error=str(e))
-
-                # Navigate back to dashboard before trying next parent
-                # (so nav menu returns to original state)
-                try:
-                    if hasattr(self, '_dashboard_url') and self._dashboard_url:
-                        await asyncio.to_thread(self._browser.navigate, self._dashboard_url)
-                        await asyncio.sleep(0.5)
-                except Exception:
-                    pass  # Navigation back failed, continue anyway
-
-            # Store complete list (parents + all children) for Phase 2b
+            # Store for Phase 2b
             self._raw_nav_items = all_nav_items
             await self._log("INFO", "navigation",
                 f"Complete nav item list: {len(all_nav_items)} items (parents + children)")
@@ -3131,6 +3076,120 @@ class ExploreEngine:
             modules_found = await self._count_modules(self._app.id)
             if modules_found == 0:
                 await self._discover_modules_from_visible_items()
+
+    def _scan_full_nav_structure(self) -> list[dict]:
+        """
+        Scan the entire sidebar nav DOM in one pass — no clicking required.
+
+        Handles two patterns found in Angular/React SPAs:
+          1. Accordion parent  → <button> with a sibling <div class="grid ...">
+                                  containing <a> children (may be grid-rows-[0fr] = hidden)
+          2. Direct link       → <a href="..."> that is directly visible in the sidebar
+
+        Returns a flat list of dicts:
+          {"text": "...", "href": "...", "parent": None | "Parent Text"}
+        """
+        return self._browser.execute_script("""
+        (function() {
+            function getDirectText(el) {
+                let t = '';
+                for (const n of el.childNodes) {
+                    if (n.nodeType === 3) t += n.textContent;
+                }
+                t = t.trim().replace(/\\s+/g, ' ');
+                if (!t) t = (el.getAttribute('aria-label') || el.textContent || '').trim().replace(/\\s+/g, ' ');
+                return t.slice(0, 80);
+            }
+
+            function isInNav(el) {
+                let p = el.parentElement;
+                while (p) {
+                    const tag = p.tagName && p.tagName.toLowerCase();
+                    const cls = (p.getAttribute('class') || '').toLowerCase();
+                    if (tag === 'nav' || tag === 'aside' ||
+                        p.getAttribute('role') === 'navigation' ||
+                        cls.includes('sidebar') || cls.includes('sidenav') ||
+                        cls.includes('menu') || cls.includes('drawer')) return true;
+                    p = p.parentElement;
+                }
+                return false;
+            }
+
+            const NOISE = new Set([
+                'logout','log out','sign out','profile','account','notifications',
+                'help','about','settings','search','close','menu','toggle','collapse',
+                'expand','back','next','previous','home'
+            ]);
+
+            const results = [];
+            const seen = new Set();
+
+            // ── Strategy 1: accordion buttons ──────────────────────────────
+            // Find all <button> elements inside the nav sidebar
+            for (const btn of document.querySelectorAll('button')) {
+                if (!isInNav(btn)) continue;
+                const text = getDirectText(btn);
+                if (!text || text.length < 2 || NOISE.has(text.toLowerCase())) continue;
+                if (seen.has(text.toLowerCase())) continue;
+
+                // Check if next sibling is a grid container (accordion children)
+                const sibling = btn.nextElementSibling;
+                const sibCls = sibling ? (sibling.getAttribute('class') || '') : '';
+                const hasGrid = sibling && (sibCls.includes('grid') || sibling.querySelectorAll('a').length > 0);
+
+                if (hasGrid) {
+                    // This is an accordion parent — collect all <a> children inside
+                    // (even if currently hidden by grid-rows-[0fr])
+                    const children = [];
+                    for (const a of sibling.querySelectorAll('a')) {
+                        const childText = getDirectText(a);
+                        if (!childText || childText.length < 2 || NOISE.has(childText.toLowerCase())) continue;
+                        const href = a.getAttribute('href') || '';
+                        children.push({ text: childText, href: href, parent: text });
+                    }
+
+                    if (children.length > 0) {
+                        // Add the parent itself first (if it also has a link)
+                        const btnHref = btn.getAttribute('href') || '';
+                        if (!seen.has(text.toLowerCase())) {
+                            seen.add(text.toLowerCase());
+                            results.push({ text: text, href: btnHref, parent: null, isAccordion: true });
+                        }
+                        // Then add all children
+                        for (const child of children) {
+                            const key = (text + '/' + child.text).toLowerCase();
+                            if (!seen.has(key)) {
+                                seen.add(key);
+                                results.push(child);
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                // No accordion children → treat as direct item
+                seen.add(text.toLowerCase());
+                const btnHref = btn.getAttribute('href') || '';
+                results.push({ text: text, href: btnHref, parent: null });
+            }
+
+            // ── Strategy 2: direct <a> links in the nav ─────────────────────
+            // Catch any direct nav links NOT already found as accordion children
+            for (const a of document.querySelectorAll('a')) {
+                if (!isInNav(a)) continue;
+                const text = getDirectText(a);
+                if (!text || text.length < 2 || NOISE.has(text.toLowerCase())) continue;
+                const href = a.getAttribute('href') || '';
+                if (!href || href === '#' || href.startsWith('javascript')) continue;
+                // Skip if already collected as an accordion child
+                if (seen.has(text.toLowerCase())) continue;
+                seen.add(text.toLowerCase());
+                results.push({ text: text, href: href, parent: null });
+            }
+
+            return results;
+        })()
+        """) or []
 
     async def _discover_modules_from_nav(self, nav_items: list[dict]):
         """Fallback: create modules directly from nav items."""
