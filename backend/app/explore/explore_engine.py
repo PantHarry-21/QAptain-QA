@@ -3060,46 +3060,63 @@ class ExploreEngine:
 
                 # Check if this nav item is expandable (has children)
                 try:
+                    # First, click the parent item to expand it
+                    clicked = await asyncio.to_thread(self._click_nav_item, text)
+                    if clicked:
+                        await asyncio.sleep(0.8)  # Wait for expansion animation
+
+                    # Then get the revealed children
                     children = await asyncio.to_thread(
-                        self._get_revealed_child_items, item
+                        self._get_revealed_child_items, text  # Pass text string, not dict
                     )
                     if children:
                         await self._log("INFO", "navigation",
                             f"Found {len(children)} children for '{text}'")
-                        for child in children:
-                            child_text = child.get("text", "").strip()
-                            child_href = child.get("href", "").strip()
+                        for child_text in children:
+                            # child_text is a string returned from JS, not a dict
+                            child_text = child_text.strip() if isinstance(child_text, str) else str(child_text)
 
                             if not child_text or len(child_text) > 100:
                                 continue
 
+                            # Create hierarchical name for module
+                            hierarchical_name = f"{text} / {child_text}"
+
                             child_module = ApplicationModule(
                                 application_id=self._app.id,
-                                name=f"{text} / {child_text}",  # Hierarchical name
+                                name=hierarchical_name,
                                 description="",
-                                url_pattern=child_href,
+                                url_pattern="",  # Will be populated in Phase 2b
                                 icon="layout",
                                 semantic_tags=[],
                                 order_index=len(self._module_map),
                             )
                             self.db.add(child_module)
                             await self.db.flush()
-                            if child_href:
-                                self._module_map[child_href] = child_module.id
 
                             await self._log("SUCCESS", "navigation",
-                                f"Module discovered: {text} / {child_text}")
+                                f"Module discovered: {hierarchical_name}")
 
                             # Add child to comprehensive list for Phase 2b
+                            # Phase 2b will click it to get the real URL
                             all_nav_items.append({
-                                "text": f"{text} / {child_text}",
-                                "href": child_href,
+                                "text": child_text,
+                                "href": "",
                                 "parent": text,
-                                "child": child_text,
+                                "is_child": True,
                             })
                 except Exception as e:
                     # Child discovery failed for this item, continue to next
                     log.warning("Child discovery failed for nav item", text=text, error=str(e))
+
+                # Navigate back to dashboard before trying next parent
+                # (so nav menu returns to original state)
+                try:
+                    if hasattr(self, '_dashboard_url') and self._dashboard_url:
+                        await asyncio.to_thread(self._browser.navigate, self._dashboard_url)
+                        await asyncio.sleep(0.5)
+                except Exception:
+                    pass  # Navigation back failed, continue anyway
 
             # Store complete list (parents + all children) for Phase 2b
             self._raw_nav_items = all_nav_items
