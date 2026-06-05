@@ -3023,11 +3023,12 @@ class ExploreEngine:
 
         state = self._extractor.extract_page_state()
         nav_items = state.get("navigation", {}).get("items", [])
-        # Store for Phase 2b so we don't re-detect with different selectors
-        self._raw_nav_items = nav_items or []
 
         if nav_items:
             await self._log("INFO", "navigation", f"Navigation detected with {len(nav_items)} items")
+
+            # Collect ALL nav items including expanded children
+            all_nav_items = []
 
             # Create one module per nav item to preserve all navigation paths
             # (Don't use AI to group them — that loses granularity and misses URLs)
@@ -3053,6 +3054,9 @@ class ExploreEngine:
                     self._module_map[href] = module.id
 
                 await self._log("SUCCESS", "navigation", f"Module discovered: {text}")
+
+                # Add parent to comprehensive list
+                all_nav_items.append(item)
 
                 # Check if this nav item is expandable (has children)
                 try:
@@ -3085,9 +3089,22 @@ class ExploreEngine:
 
                             await self._log("SUCCESS", "navigation",
                                 f"Module discovered: {text} / {child_text}")
+
+                            # Add child to comprehensive list for Phase 2b
+                            all_nav_items.append({
+                                "text": f"{text} / {child_text}",
+                                "href": child_href,
+                                "parent": text,
+                                "child": child_text,
+                            })
                 except Exception as e:
                     # Child discovery failed for this item, continue to next
                     log.warning("Child discovery failed for nav item", text=text, error=str(e))
+
+            # Store complete list (parents + all children) for Phase 2b
+            self._raw_nav_items = all_nav_items
+            await self._log("INFO", "navigation",
+                f"Complete nav item list: {len(all_nav_items)} items (parents + children)")
 
             await self.db.commit()
         else:
