@@ -132,31 +132,15 @@ Workspace → Discovery → Scenarios → Expansion → Execution Plan (JSON)
     → Playwright Execution → Recovery → Learning → Reporting
 ```
 
-## Ten engines (code map)
+## Code organization
 
-| Engine | Responsibility | Location |
-|--------|----------------|----------|
-| **Workspace** | Workspaces, envs, auth profiles, access | `src/app/api/v1/workspaces/*`, `src/lib/workspace-access.ts` |
-| **Discovery** | Light scan: modules, routes, fields, APIs, page meta | `src/server/jobs/discovery-job.ts`, `src/server/intelligence/*` |
-| **Scenario intelligence** | NLP expansion, module mapping, test types | `src/server/orchestration/scenario-expand-graph.ts`, `src/server/jobs/scenario-expand-job.ts` |
-| **Field intelligence** | Types, validations, semantics, priority | `src/server/intelligence/field-classifier.ts`, `persist-field-intelligence.ts` |
-| **Data generation** | Faker + profiles (positive/negative/BVA/security) | `src/server/data/smart-data-generator.ts` |
-| **Execution planning** | Sanitize AI output → JSON plan only | `src/server/execution/plan-builder.ts` |
-| **Execution** | Playwright, waits, asserts, API capture | `src/server/execution/run-execution.ts`, `stability.ts` |
-| **Recovery** | Selector memory, ranked fallbacks | `src/server/execution/recovery.ts` |
-| **AI memory** | Chunks, module embeddings (Supabase), graphs | `src/server/memory/*`, `AiMemoryChunk`, `ApplicationIntelGraph` |
-| **Reporting** | Runs, steps, logs, timelines, RCA | `ExecutionReport`, `src/server/intelligence/rca-engine.ts` |
+The repository is split between the frontend and backend.
 
-## Four runners (BullMQ)
+- `backend/` contains the FastAPI backend service, REST API routes, AI integrations, Selenium execution engine, memory store, and database schema definitions.
+- `src/` contains the Next.js frontend application with pages, components, hooks, and UI utilities.
+- `docker-compose.yml` provides local PostgreSQL, Redis, and ChromaDB.
 
-| Runner | Queue | Processor |
-|--------|-------|-----------|
-| Discovery | `qaptain-discovery` | `processDiscoveryJob` |
-| Scenario expansion | `qaptain-scenario-expand` | `processScenarioExpandJob` |
-| Execution | `qaptain-execution` | `runExecutionJob` |
-| Learning | `qaptain-learning` | `processLearningJob` |
-
-Without `REDIS_URL`, jobs run **inline** in the API process (dev fallback).
+Backend API routes are defined under `backend/app/api/v1/`. Database models use SQLAlchemy and Pydantic.
 
 ## Execution modes
 
@@ -164,32 +148,28 @@ Without `REDIS_URL`, jobs run **inline** in the API process (dev fallback).
 
 (`deep_validation` aliases to `workflow_heavy`.)
 
-Caps: `src/lib/execution-modes.ts`.
-
-## Structured plan actions (only)
+## Structured plan actions
 
 `navigate` | `click` | `fill` | `natural_language` | `assert_visible` | `wait_for_network` | `wait_ms`
 
-Defined in `src/server/execution/plan-builder.ts`.
+These are implemented in the backend execution planner and action runners.
 
-## Data model (Prisma)
+## Data model
 
-- `Workspace`, `Environment`, `AuthProfile`
-- `ApplicationModule`, `ApplicationRoute`, `DiscoveryRun`
-- `Scenario`, `ExecutionPlan`, `ExecutionRun`, `ExecutionStep`, `ExecutionLog`, `ExecutionReport`
-- `FieldDefinition`, `ValidationRule`, `SelectorMemory`
-- `AiMemoryChunk`, `ScenarioModuleMapping`
-- `ApplicationIntelGraph`, `WorkflowIntel`, `ApiEndpointIntel`
+The backend uses SQLAlchemy models and Pydantic schemas to represent the data model.
 
-## Frontend (App Router)
+- `Workspace`, `Application`, `Scenario`, `ExecutionRun`, `ExecutionStep`, `ExecutionLog`, `ExecutionReport`
+- `ExploreSession`, `ExploreLog`, `HumanDecision`
+- `AIMemoryChunk`, `SelectorMemory`, `ApplicationWorkflow`
 
-- Dashboard, workspaces, discovery, modules, fields, scenarios, runs, reports, intel tab
-- Live logs: Socket.IO (`server.ts` + `src/server/events/*`)
+## Frontend/App
+
+- Next.js App Router pages for login, workspaces, dashboards, executions, explore sessions, and settings.
+- The frontend consumes backend REST APIs and connects to the FastAPI WebSocket endpoint for realtime updates.
 
 ## Local infrastructure
 
 ```bash
-docker compose up -d   # Postgres, Redis, Chroma (optional; memory uses Supabase if configured)
-npm run dev            # Web + Socket.IO :3000
-npm run worker         # BullMQ (requires REDIS_URL)
+docker compose up -d   # Postgres, Redis, ChromaDB
+npm run dev            # Frontend + backend in development
 ```

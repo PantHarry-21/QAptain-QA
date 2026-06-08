@@ -16,6 +16,9 @@ from app.capabilities.pagination_engine import PaginationEngine
 from app.capabilities.sorting_engine import SortingEngine
 from app.capabilities.rbac_engine import RBACEngine
 from app.capabilities.notification_engine import NotificationEngine
+from app.capabilities.auth_engine import AuthEngine
+from app.capabilities.file_upload_engine import FileUploadEngine
+from app.capabilities.export_engine import ExportEngine
 from app.capabilities.assertion_engine import AssertionEngine, get_assertion_engine
 from app.capabilities.recovery_engine import RecoveryEngine, get_recovery_engine
 
@@ -50,6 +53,9 @@ class EngineRegistry:
             SortingEngine(),
             RBACEngine(),
             NotificationEngine(),
+            AuthEngine(),
+            FileUploadEngine(),
+            ExportEngine(),
         ]
         for engine in engines:
             self._engines[engine.engine_id] = engine
@@ -68,17 +74,17 @@ class EngineRegistry:
     def get_primary_engine(self, workflow_type: str) -> BaseCapabilityEngine | None:
         """Return the single best engine for this workflow type."""
         primary_map = {
-            "CRUD": "crud",
-            "SEARCH_FILTER": "search",
-            "PAGINATION": "pagination",
-            "SORTING": "sorting",
-            "FORM_VALIDATION": "form",
-            "ROLE_ACCESS": "rbac",
-            "FILE_UPLOAD": None,   # TODO: file engine
-            "EXPORT": None,        # TODO: export engine
-            "AUTH": None,          # handled by executor._execute_login
-            "NAVIGATION": None,    # minimal engine needed
-            "BUSINESS_WORKFLOW": None,  # AI-driven, no deterministic engine
+            "CRUD":             "crud",
+            "SEARCH_FILTER":    "search",
+            "PAGINATION":       "pagination",
+            "SORTING":          "sorting",
+            "FORM_VALIDATION":  "form",
+            "ROLE_ACCESS":      "rbac",
+            "AUTH":             "auth",        # AuthEngine: tests login feature itself
+            "FILE_UPLOAD":      "file_upload", # FileUploadEngine
+            "EXPORT":           "export",      # ExportEngine
+            "NAVIGATION":       None,          # simple — AI system prompt handles it
+            "BUSINESS_WORKFLOW": None,         # AI-driven, no deterministic engine
         }
         engine_id = primary_map.get(workflow_type)
         return self._engines.get(engine_id) if engine_id else None
@@ -117,6 +123,10 @@ class EngineRegistry:
         """
         Generate all capability steps for the given context.
         Returns a dict with categories: positive, negative, edge_case, security.
+
+        Primary engine handles the main workflow.
+        Secondary engines (TableEngine, NotificationEngine) contribute supplementary
+        steps for workflows that involve table interaction or user notifications.
         """
         engine = self.get_primary_engine(ctx.workflow_type)
         if not engine:
@@ -128,6 +138,31 @@ class EngineRegistry:
             "edge_case": engine.generate_edge_case_steps(ctx) if include_edge_cases else [],
             "security": engine.generate_security_steps(ctx) if include_security else [],
         }
+
+        # ── TableEngine secondary contributions ───────────────────────────────
+        # CRUD needs table verification in VERIFY phases.
+        # SEARCH/PAGINATION/SORTING are entirely table-centric — add table edge cases.
+        table_engine = self._engines.get("table")
+        if table_engine:
+            if ctx.workflow_type == "CRUD":
+                # Add empty-state edge case: what happens when there are no records?
+                if include_edge_cases:
+                    result["edge_case"].extend(table_engine.generate_edge_case_steps(ctx))
+            elif ctx.workflow_type in ("SEARCH_FILTER", "PAGINATION", "SORTING"):
+                # For table-centric workflows: prepend table-presence verification to positive steps
+                table_positive = table_engine.generate_positive_steps(ctx)
+                result["positive"] = table_positive + result["positive"]
+                if include_edge_cases:
+                    result["edge_case"].extend(table_engine.generate_edge_case_steps(ctx))
+
+        # ── NotificationEngine secondary contributions ─────────────────────────
+        # For FORM_VALIDATION the primary engine (FormEngine) doesn't check notifications —
+        # NotificationEngine adds the "error notification must appear" negative check.
+        notification_engine = self._engines.get("notification")
+        if notification_engine:
+            if ctx.workflow_type == "FORM_VALIDATION":
+                if include_negative:
+                    result["negative"].extend(notification_engine.generate_negative_steps(ctx))
 
         log.info("Capability steps generated",
             engine=engine.engine_id,
@@ -141,8 +176,26 @@ class EngineRegistry:
         return result
 
     def get_assertion_context(self, ctx: CapabilityContext) -> dict[str, Any]:
-        """Get assertion context for AI prompt enrichment."""
-        return self._assertion_engine.build_assertion_context(ctx.workflow_type, ctx)
+        """
+        Get assertion context for AI prompt enrichment.
+        Merges AssertionEngine critical assertions with NotificationEngine
+        per-operation toast patterns so the AI knows exactly what to assert
+        after each CRUD operation.
+        """
+        base = self._assertion_engine.build_assertion_context(ctx.workflow_type, ctx)
+
+        # For CRUD workflows: inject specific toast assertion targets per operation
+        if ctx.workflow_type == "CRUD":
+            notification_engine = self._engines.get("notification")
+            if notification_engine and hasattr(notification_engine, "get_toast_assertion_for_outcome"):
+                toast_hints = [
+                    notification_engine.get_toast_assertion_for_outcome("create").get("target", ""),
+                    notification_engine.get_toast_assertion_for_outcome("update").get("target", ""),
+                    notification_engine.get_toast_assertion_for_outcome("delete").get("target", ""),
+                ]
+                base.setdefault("toast_patterns", toast_hints)
+
+        return base
 
     def get_recovery_plan(
         self,
@@ -161,33 +214,63 @@ class EngineRegistry:
 
     @staticmethod
     def _infer_entity_name(scenario_title: str, module_name: str) -> str:
-        """Infer the primary entity name from scenario title or module name."""
+        """
+        Infer the primary entity name from module name or scenario title.
+
+        Priority:
+          1. Module name (most reliable — set by knowledge graph mapping)
+          2. Regex extraction from scenario title
+
+        Result is CamelCase with no spaces so it works in test data naming:
+          "Generic Master" → "GenericMaster"  →  "TestGenericMaster001"
+          "User Management" → "UserManagement" →  "TestUserManagement001"
+        """
         import re
 
-        # Patterns: "Test X CRUD", "CRUD for X", "Manage X", "X management"
-        patterns = [
+        _STOP = {"the", "a", "an", "for", "and", "test", "verify", "all", "of",
+                 "possible", "scenarios", "operations", "functionality", "module"}
+
+        def _to_camel(text: str) -> str:
+            """Convert any space/hyphen/underscore separated words to CamelCase."""
+            parts = [p for p in re.split(r"[\s\-_]+", text) if len(p) > 1 and p.lower() not in _STOP]
+            return "".join(p.capitalize() for p in parts) if parts else ""
+
+        # ── 1. Module name is always most reliable ────────────────────────────
+        if module_name:
+            result = _to_camel(module_name)
+            if result:
+                return result
+
+        # ── 2. Regex extraction from scenario title ───────────────────────────
+        title = scenario_title.strip()
+
+        # Multi-word patterns first (greedier)
+        multi_patterns = [
+            r"(?:test|verify|validate|check)\s+((?:\w+\s+){1,3}\w+)\s+(?:crud|operations|scenarios|functionality)",
+            r"(?:crud|operations|scenarios)\s+(?:for|of)\s+((?:\w+\s+){1,3}\w+)",
+            r"(?:add|create|manage)\s+((?:\w+\s+){1,2}\w+)",
+        ]
+        for pattern in multi_patterns:
+            match = re.search(pattern, title, re.IGNORECASE)
+            if match:
+                result = _to_camel(match.group(1))
+                if result:
+                    return result
+
+        # Single-word patterns
+        single_patterns = [
             r"Test\s+(\w+)\s+CRUD",
             r"CRUD\s+for\s+(\w+)",
             r"Manage\s+(\w+)",
             r"(\w+)\s+Management",
             r"(\w+)\s+Module",
-            r"Add.*?(\w+)",
-            r"Create.*?(\w+)",
         ]
-
-        title = scenario_title.strip()
-        for pattern in patterns:
+        for pattern in single_patterns:
             match = re.search(pattern, title, re.IGNORECASE)
             if match:
                 word = match.group(1).strip()
-                if len(word) > 2 and word.lower() not in {"the", "a", "an", "for", "and", "test", "verify"}:
+                if len(word) > 2 and word.lower() not in _STOP:
                     return word.capitalize()
-
-        # Fall back to module name
-        if module_name:
-            parts = module_name.replace("-", " ").replace("_", " ").split()
-            if parts:
-                return parts[0].capitalize()
 
         return "Record"
 

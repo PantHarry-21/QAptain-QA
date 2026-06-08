@@ -72,7 +72,80 @@ class FormEngine(BaseCapabilityEngine):
         return steps
 
     def generate_edge_case_steps(self, ctx: CapabilityContext) -> list[dict]:
-        return []
+        """
+        Use ValidationSpecEngine to generate field-type-specific edge cases
+        when the CapabilityContext carries known form fields (from knowledge graph).
+        Falls back to generic edge cases if no field type info is available.
+        """
+        e = self.engine_id
+        steps = []
+
+        # Field-type-specific edge cases from ValidationSpecEngine
+        if ctx.form_fields:
+            try:
+                from app.capabilities.validation_spec import ValidationSpecEngine
+                spec = ValidationSpecEngine()
+                # Infer field types from labels: email, number, date, phone, url, text
+                _type_hints = {
+                    "email": ["email", "e-mail", "mail"],
+                    "number": ["number", "quantity", "amount", "count", "price", "rate", "age", "qty"],
+                    "date": ["date", "dob", "from", "to", "start", "end", "expiry", "deadline"],
+                    "phone": ["phone", "mobile", "tel", "contact"],
+                    "url": ["url", "website", "link", "href"],
+                    "password": ["password", "pass", "secret", "pin"],
+                }
+
+                for field_label in ctx.form_fields[:4]:
+                    label_lower = field_label.lower()
+                    detected_type = "text"
+                    for ftype, keywords in _type_hints.items():
+                        if any(kw in label_lower for kw in keywords):
+                            detected_type = ftype
+                            break
+
+                    edge_cases = spec.get_test_cases(detected_type)
+                    edge_only = [c for c in edge_cases if c.test_category == "edge_case"]
+                    for case in edge_only[:2]:
+                        steps.append(
+                            self._step("fill", f"Edge case — {field_label}: {case.test_name}",
+                                      "FORM_EDGE_CASE",
+                                      f"{field_label} field: {case.expected_behavior}",
+                                      target=field_label,
+                                      value=case.input_value,
+                                      engine_id=e, test_category="edge_case", on_fail="skip")
+                        )
+                        steps.append(
+                            self._step("screenshot",
+                                      f"Capture {field_label} edge case result",
+                                      "FORM_EDGE_CASE", "Edge case evidence",
+                                      engine_id=e, on_fail="skip")
+                        )
+            except Exception:
+                pass
+
+        # Generic edge case if no field-specific ones were generated
+        if not steps:
+            steps.append(
+                self._step("fill", "Enter whitespace-only value in a required field",
+                          "FORM_EDGE_CASE",
+                          "Whitespace-only input must be treated as empty by the form",
+                          target="Name|Title|first input",
+                          value="   ", engine_id=e, test_category="edge_case", on_fail="skip")
+            )
+            steps.append(
+                self._step("click", "Submit whitespace-only value",
+                          "FORM_EDGE_CASE",
+                          "System must trim and reject whitespace-only required fields",
+                          target="Save|Submit|Create|Add",
+                          engine_id=e, test_category="edge_case", on_fail="skip")
+            )
+            steps.append(
+                self._step("screenshot", "Capture whitespace edge case result",
+                          "FORM_EDGE_CASE", "Whitespace handling evidence",
+                          engine_id=e, on_fail="skip")
+            )
+
+        return steps
 
     def get_recovery_steps(self, failed_action: str, error_context: dict) -> list[RecoveryStep]:
         return [

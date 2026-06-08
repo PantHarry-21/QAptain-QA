@@ -98,6 +98,10 @@ _ASSERTION_LIBRARY: dict[str, list[BusinessAssertion]] = {
             "Download started or file was generated",
             "Browser download triggered or success message indicates export",
             "export_downloaded", critical=True),
+        BusinessAssertion("export_complete", "business",
+            "Exported data matches the visible records",
+            "The downloaded file contains the same records shown in the table",
+            "export_downloaded", critical=False),
     ],
     "pagination_worked": [
         BusinessAssertion("pagination_worked", "ui",
@@ -108,6 +112,63 @@ _ASSERTION_LIBRARY: dict[str, list[BusinessAssertion]] = {
             "Table content changed after pagination",
             "The rows visible in the table are different from the previous page",
             "navigation_success", critical=True),
+    ],
+    # ── Auth outcomes ──────────────────────────────────────────────────────────
+    "login_success": [
+        BusinessAssertion("login_success", "ui",
+            "Dashboard or main navigation is visible after login",
+            "Application navigation (sidebar, top nav, or dashboard) appears after submission",
+            "login_success", critical=True),
+        BusinessAssertion("login_success", "workflow",
+            "User is no longer on the login page",
+            "URL changed away from login page and no login form is visible",
+            "login_success", critical=True),
+    ],
+    "login_failed": [
+        BusinessAssertion("login_failed", "ui",
+            "Error message appears for invalid credentials",
+            "Visible error text like 'Invalid credentials', 'Incorrect password', or 'User not found'",
+            "auth_error", critical=True),
+        BusinessAssertion("login_failed", "security",
+            "User remains on login page after failed attempt",
+            "URL has not changed — application did not grant access",
+            "auth_error", critical=True),
+        BusinessAssertion("login_failed", "data",
+            "No application data is exposed on failed login",
+            "No records, tables, or business data are visible after the failed attempt",
+            "auth_error", critical=False),
+    ],
+    # ── File upload outcomes ───────────────────────────────────────────────────
+    "upload_success": [
+        BusinessAssertion("upload_success", "ui",
+            "Upload success message or confirmation is visible",
+            "Green success toast or confirmation banner appears after upload",
+            "upload_complete", critical=False),
+        BusinessAssertion("upload_success", "business",
+            "Uploaded file or record appears in the listing",
+            "The uploaded file's name or data is visible in the table or file list",
+            "upload_complete", critical=True),
+    ],
+    "upload_failed": [
+        BusinessAssertion("upload_failed", "ui",
+            "Error message describes why upload was rejected",
+            "User sees specific error about file type, size, or format",
+            "upload_error", critical=True),
+        BusinessAssertion("upload_failed", "business",
+            "Invalid file was not added to the system",
+            "No new record or file entry appears in the listing after rejection",
+            "upload_error", critical=True),
+    ],
+    # ── Sort outcome ───────────────────────────────────────────────────────────
+    "sort_applied": [
+        BusinessAssertion("sort_applied", "ui",
+            "Sort direction indicator is visible on the sorted column",
+            "Arrow icon (↑ or ↓) or 'asc'/'desc' label appears on the clicked column header",
+            "sort_success", critical=True),
+        BusinessAssertion("sort_applied", "data",
+            "Table rows are reordered according to sort direction",
+            "The first visible row value for the sorted column matches ascending or descending order",
+            "sort_success", critical=True),
     ],
 }
 
@@ -124,13 +185,15 @@ class AssertionEngine:
     def get_assertions_for_workflow(self, workflow_type: str) -> list[BusinessAssertion]:
         """Map workflow type to relevant assertion outcomes."""
         outcome_map = {
-            "CRUD": ["record_created", "record_updated", "record_deleted", "form_validation"],
-            "SEARCH_FILTER": ["search_results"],
-            "FORM_VALIDATION": ["form_validation"],
-            "ROLE_ACCESS": ["access_denied"],
-            "EXPORT": ["export_complete"],
-            "PAGINATION": ["pagination_worked"],
-            "SORTING": ["pagination_worked"],
+            "CRUD":             ["record_created", "record_updated", "record_deleted", "form_validation"],
+            "SEARCH_FILTER":    ["search_results"],
+            "FORM_VALIDATION":  ["form_validation"],
+            "ROLE_ACCESS":      ["access_denied"],
+            "EXPORT":           ["export_complete"],
+            "PAGINATION":       ["pagination_worked"],
+            "SORTING":          ["sort_applied"],          # fixed: was pagination_worked
+            "AUTH":             ["login_success", "login_failed"],
+            "FILE_UPLOAD":      ["upload_success", "upload_failed"],
         }
         outcomes = outcome_map.get(workflow_type, [])
         all_assertions = []

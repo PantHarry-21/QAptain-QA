@@ -180,7 +180,10 @@ export const applications = {
 // ─── Explore ──────────────────────────────────────────────────────────────────
 
 export const explore = {
-  start: (data: { application_id: string; mode: ExploreMode }) =>
+  discover: (data: { application_id: string }) =>
+    request<ExploreSession>('/explore/discover', { method: 'POST', body: JSON.stringify(data) }),
+
+  start: (data: { application_id: string; mode: ExploreMode; selected_module_ids?: string[] }) =>
     request<ExploreSession>('/explore/start', { method: 'POST', body: JSON.stringify(data) }),
 
   getSession: (sessionId: string) =>

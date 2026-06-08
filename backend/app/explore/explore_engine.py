@@ -76,7 +76,7 @@ class ExploreEngine:
         # Stop signal for graceful interruption
         self._should_stop = False
 
-    async def run(self, session_id: str, application_id: str) -> None:
+    async def run(self, session_id: str, application_id: str, discover_only: bool = False, module_ids: list[str] = None) -> None:
         """Main explore entry point — runs the full exploration lifecycle."""
         self._session_id = session_id
 
@@ -115,10 +115,14 @@ class ExploreEngine:
                         timeout=90.0,
                     )
                 )
-                cleanup_task = asyncio.create_task(
-                    self._cleanup_old_exploration_data(application_id)
-                )
-                self._browser, _ = await asyncio.gather(browser_task, cleanup_task)
+                # Only clean up old data if we are doing a full run or discovery, NOT if we are exploring selected modules
+                if not module_ids:
+                    cleanup_task = asyncio.create_task(
+                        self._cleanup_old_exploration_data(application_id)
+                    )
+                    self._browser, _ = await asyncio.gather(browser_task, cleanup_task)
+                else:
+                    self._browser = await browser_task
             except asyncio.TimeoutError:
                 await self._fail_session(session,
                     "Browser failed to start within 90 seconds — "
@@ -140,39 +144,24 @@ class ExploreEngine:
                 await self.db.commit()
                 return
 
-            # Phase 2: Discover modules from navigation
-            await self._phase_discover_modules()
-            if self._should_stop:
-                await self._log("INFO", "system", "Stop requested after module discovery")
-                session.status = ExploreStatus.STOPPED
-                await self.db.commit()
-                return
-
-            # Phase 2b: Click each nav item to capture REAL URLs (handles SPA routing)
-            await self._capture_real_module_urls()
-            if self._should_stop:
-                await self._log("INFO", "system", "Stop requested after URL capture")
-                session.status = ExploreStatus.STOPPED
-                await self.db.commit()
-                return
-
-            # Phase 3: Deep exploration — AI analysis + element extraction
             if session.mode != ExploreMode.SKIP:
-                await self._log("INFO", "exploration",
-                    "Exploration mode: SMART — exploring all discovered URLs")
-                await self._phase_explore_pages(self.MAX_PAGES)
+                if module_ids:
+                    await self._explore_selected_modules(module_ids)
+                else:
+                    await self._hierarchical_explore(discover_only=discover_only)
+                    
                 if self._should_stop:
-                    await self._log("INFO", "system", "Stop requested during page exploration")
+                    await self._log("INFO", "system", "Stop requested during exploration")
                     session.status = ExploreStatus.STOPPED
                     await self.db.commit()
                     return
-                # Deep element scan — extracts detailed selectors, CRUD forms, and interactive elements
-                await self._phase_deep_scan_elements()
-                if self._should_stop:
-                    await self._log("INFO", "system", "Stop requested after element scan")
-                    session.status = ExploreStatus.STOPPED
-                    await self.db.commit()
-                    return
+
+            if discover_only:
+                session.status = ExploreStatus.COMPLETED
+                session.completed_at = datetime.utcnow()
+                await self.db.commit()
+                await self._log("MILESTONE", "system", "Module discovery complete. Waiting for selection.")
+                return
 
             # Phase 4: Build knowledge graph
             kg = await self._phase_build_knowledge_graph(application_id, session_id)
@@ -182,7 +171,7 @@ class ExploreEngine:
             await self.db.commit()
 
             # Phase 6: Generate AI test scenarios from exploration data
-            scenarios_count = await self._generate_test_scenarios(application_id, session_id)
+            scenarios_count = await self._generate_test_scenarios(application_id, session_id, module_ids)
 
             # Complete session
             modules_count = await self._count_modules(application_id)
@@ -1802,8 +1791,10 @@ class ExploreEngine:
                 if (!el) return false;
                 const r = el.getBoundingClientRect();
                 const s = getComputedStyle(el);
-                return r.width > 0 && r.height > 0
-                    && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+                if (r.width === 0 || r.height === 0 || s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+                const navSels = ['nav', '[role="navigation"]', 'aside', '[role="menubar"]', '[class*="sidebar" i]', '[class*="sider" i]', '[class*="menu-bar" i]'];
+                if (el.closest(navSels.join(', '))) return false;
+                return true;
             }
             function getSelectors(el) {
                 const s = [];
@@ -2097,7 +2088,7 @@ class ExploreEngine:
     # Phase: Test Scenario Generation
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def _generate_test_scenarios(self, application_id: str, session_id: str) -> int:
+    async def _generate_test_scenarios(self, application_id: str, session_id: str, module_ids: list[str] | None = None) -> int:
         """
         Phase 6: Generate AI test scenarios from exploration data.
         Uses smaller batches (2 modules per call) to avoid token-limit issues.
@@ -2115,41 +2106,52 @@ class ExploreEngine:
         await self._log("INFO", "scenarios",
             f"Token budget available: {budget['remaining']}/{budget['limit']} tokens")
 
-        # Delete old AI-generated scenarios so we regenerate fresh ones
-        existing_result = await self.db.execute(
-            select(Scenario).where(
-                Scenario.application_id == application_id,
-                Scenario.source == "ai_generated",
-            )
+        # Delete old AI-generated scenarios so we regenerate fresh ones (scoped by module_ids if provided)
+        del_stmt = select(Scenario).where(
+            Scenario.application_id == application_id,
+            Scenario.source == "ai_generated",
         )
+        if module_ids:
+            del_stmt = del_stmt.where(Scenario.module_id.in_(module_ids))
+            
+        existing_result = await self.db.execute(del_stmt)
         for old in existing_result.scalars().all():
             await self.db.delete(old)
         await self.db.commit()
 
         # Load modules, pages, workflows
-        mods_result = await self.db.execute(
-            select(ApplicationModule).where(ApplicationModule.application_id == application_id)
-        )
-        modules = list(mods_result.scalars().all())
+        mod_stmt = select(ApplicationModule).where(ApplicationModule.application_id == application_id)
+        if module_ids:
+            mod_stmt = mod_stmt.where(ApplicationModule.id.in_(module_ids))
+        mods_result = await self.db.execute(mod_stmt)
+        all_modules = list(mods_result.scalars().all())
 
-        pages_result = await self.db.execute(
-            select(ApplicationPage)
-            .join(ApplicationModule, ApplicationPage.module_id == ApplicationModule.id)
-            .where(ApplicationModule.application_id == application_id)
-            .limit(30)
-        )
+        page_stmt = select(ApplicationPage).join(ApplicationModule, ApplicationPage.module_id == ApplicationModule.id).where(ApplicationModule.application_id == application_id)
+        if module_ids:
+            page_stmt = page_stmt.where(ApplicationModule.id.in_(module_ids))
+        pages_result = await self.db.execute(page_stmt)
         pages = list(pages_result.scalars().all())
 
-        wf_result = await self.db.execute(
-            select(ApplicationWorkflow)
-            .join(ApplicationModule, ApplicationWorkflow.module_id == ApplicationModule.id)
-            .where(ApplicationModule.application_id == application_id)
-            .limit(20)
-        )
+        wf_stmt = select(ApplicationWorkflow).join(ApplicationModule, ApplicationWorkflow.module_id == ApplicationModule.id).where(ApplicationModule.application_id == application_id)
+        if module_ids:
+            wf_stmt = wf_stmt.where(ApplicationModule.id.in_(module_ids))
+        wf_result = await self.db.execute(wf_stmt)
         workflows = list(wf_result.scalars().all())
 
+        # Identify parent module IDs to skip empty accordions
+        parent_ids = {m.parent_id for m in all_modules if m.parent_id}
+        
+        modules = []
+        for m in all_modules:
+            # Skip empty accordion parent modules (modules that have children but no pages themselves)
+            m_pages = [p for p in pages if p.module_id == m.id]
+            if m.id in parent_ids and not m_pages:
+                await self._log("INFO", "scenarios", f"Skipping empty accordion parent module: {m.name}")
+                continue
+            modules.append(m)
+
         if not modules:
-            await self._log("WARNING", "scenarios", "No modules found — skipping scenario generation")
+            await self._log("WARNING", "scenarios", "No valid modules found — skipping scenario generation")
             return 0
 
         # Build per-module detail context (forms, tables, workflows)
@@ -4018,6 +4020,91 @@ class ExploreEngine:
         await self._log("SUCCESS", "exploration",
             f"Click-based exploration complete — {visited} pages analyzed")
 
+    async def _simulate_human_behaviors(self):
+        """Simulate human interactions to reveal hidden UI elements before extraction."""
+        try:
+            await self._log("INFO", "exploration", "Simulating human interaction (scrolling, filters, bulk actions)...")
+            
+            # 1. Multi-axis deep scrolling to force lazy loading
+            await asyncio.to_thread(self._browser.execute_script, """
+                window.scrollTo(0, document.body.scrollHeight);
+                setTimeout(() => window.scrollTo(document.body.scrollWidth, document.body.scrollHeight), 300);
+                setTimeout(() => window.scrollTo(0, 0), 600);
+            """)
+            await asyncio.sleep(1.0)
+            
+            # 2. Look for Filter buttons to reveal filter menus
+            await asyncio.to_thread(self._click_filter_buttons)
+            
+            # 3. Look for search bars and simulate typing
+            await asyncio.to_thread(self._simulate_search_input)
+
+            # 4. Look for table checkboxes to reveal bulk actions
+            await asyncio.to_thread(self._click_table_checkboxes)
+            
+            await asyncio.sleep(1.5)  # Wait for animations and network requests to settle
+        except Exception as e:
+            await self._log("WARNING", "exploration", f"Human simulation failed: {str(e)[:100]}")
+
+    def _click_filter_buttons(self):
+        """Find and click filter/search toggle buttons to reveal panels."""
+        try:
+            # Look for buttons that might toggle filters
+            btns = self._browser.driver.find_elements("css selector", "button, [role='button']")
+            for b in btns:
+                try:
+                    if not b.is_displayed():
+                        continue
+                    text = (b.text or "").lower()
+                    aria = (b.get_attribute("aria-label") or "").lower()
+                    if "filter" in text or "search" in text or "filter" in aria:
+                        b.click()
+                        time.sleep(0.5)
+                        break # Just click the first one we find
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _simulate_search_input(self):
+        """Find a search bar, type a value to trigger live search, then clear it."""
+        try:
+            inputs = self._browser.driver.find_elements("css selector", "input[type='text'], input[type='search']")
+            for inp in inputs:
+                try:
+                    if not inp.is_displayed():
+                        continue
+                    placeholder = (inp.get_attribute("placeholder") or "").lower()
+                    aria = (inp.get_attribute("aria-label") or "").lower()
+                    if "search" in placeholder or "search" in aria or inp.get_attribute("type") == "search":
+                        inp.clear()
+                        inp.send_keys("test search")
+                        time.sleep(1.0)
+                        inp.clear()
+                        # dispatch event for modern SPAs
+                        self._browser.execute_script("arguments[0].dispatchEvent(new Event('input', {bubbles:true}));", inp)
+                        break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _click_table_checkboxes(self):
+        """Click the first row checkbox in a table to trigger bulk action bars."""
+        try:
+            checkboxes = self._browser.driver.find_elements("css selector", "table input[type='checkbox'], .datatable input[type='checkbox'], mat-table input[type='checkbox']")
+            for cb in checkboxes:
+                try:
+                    if not cb.is_displayed() or cb.is_selected():
+                        continue
+                    cb.click()
+                    time.sleep(0.5)
+                    break # Click one to reveal bulk actions, then stop
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     async def _explore_single_page(self, url: str, module_id: str | None, nav_hint: str | None = None, skip_navigate: bool = False):
         """Explore a single page and build its semantic map with validation testing."""
         # Check token budget before exploring
@@ -4025,7 +4112,7 @@ class ExploreEngine:
         if remaining < 15000:
             await self._log("WARNING", "exploration",
                 f"Token budget critical ({remaining} remaining) — stopping exploration")
-            return
+            return None
 
         try:
             self._phase3_analyzed.add(url)  # mark attempted — prevents duplicate analysis
@@ -4037,7 +4124,7 @@ class ExploreEngine:
             page_title = await asyncio.to_thread(lambda: self._browser.driver.title)
             if any(code in page_title for code in ("502", "503", "504", "404", "403", "500")):
                 await self._log("WARNING", "exploration", f"Skipping error page: {page_title} ({url})")
-                return
+                return None
 
             # Also skip if the page source is tiny (proxy/server error)
             page_src_len = await asyncio.to_thread(
@@ -4045,7 +4132,7 @@ class ExploreEngine:
             )
             if page_src_len < 500:
                 await self._log("WARNING", "exploration", f"Skipping near-empty page: {url}")
-                return
+                return None
 
             # Skip login pages — SPA routing may redirect guessed URL paths to login.
             # On first redirect, try navigating via dashboard to recover the session context
@@ -4064,8 +4151,9 @@ class ExploreEngine:
                         pass
                 if not recovered:
                     await self._log("WARNING", "exploration", f"Login redirect — skipping: {url}")
-                    return
+                    return None
 
+            await self._simulate_human_behaviors()
             state = self._extractor.extract_page_state()
             page_name = state.get("page", "Unknown Page")
             display_name = nav_hint or page_name
@@ -4157,8 +4245,11 @@ class ExploreEngine:
                 wf_str = ", ".join(w.get("name", "workflow") for w in page_analysis["workflows"][:4])
                 await self._log("INFO", "exploration", f"  Workflows: {wf_str}")
 
+            return page
+
         except Exception as e:
             await self._log("WARNING", "exploration", f"Could not fully analyze page at {url}: {str(e)[:100]}")
+            return None
 
     async def _test_form_validations(self, page_analysis: dict, state: dict):
         """Test form field validations without AI tokens (Phase 2 testing)."""
@@ -4570,8 +4661,9 @@ class ExploreEngine:
         return urls
 
     async def _find_module_for_url(self, url: str) -> str | None:
-        for pattern, module_id in self._module_map.items():
-            if pattern in url:
+        # Sort patterns by length descending so more specific paths match first
+        for pattern, module_id in sorted(self._module_map.items(), key=lambda x: len(x[0]), reverse=True):
+            if pattern and pattern in url:
                 return module_id
         return None
 
@@ -4727,3 +4819,314 @@ class ExploreEngine:
     async def _load_application(self, application_id: str) -> Application | None:
         result = await self.db.execute(select(Application).where(Application.id == application_id))
         return result.scalar_one_or_none()
+
+    def _scan_parent_navs(self) -> list[dict]:
+        """Scan the sidebar/navigation DOM for parent/top-level nav items."""
+        return self._browser.execute_script("""
+        return (function() {
+            function isVisible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0
+                    && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+            }
+            function getDirectText(el) {
+                let t = '';
+                for (const n of el.childNodes) { if (n.nodeType === 3) t += n.textContent; }
+                t = t.trim().replace(/\\s+/g, ' ');
+                if (!t) t = (el.getAttribute('aria-label') || el.textContent || '').trim().replace(/\\s+/g, ' ');
+                return t.slice(0, 80);
+            }
+            const NOISE = new Set(['logout','log out','sign out','notifications','help','about','profile','account','settings']);
+            const NAV_SELS = ['nav', '[role="navigation"]', 'aside', '[role="menubar"]',
+                              '[class*="sidebar" i]', '[class*="sider" i]', '[class*="menu-bar" i]'];
+            let bestRoot = null;
+            let maxItems = 0;
+            for (const sel of NAV_SELS) {
+                for (const el of document.querySelectorAll(sel)) {
+                    if (isVisible(el)) {
+                        const items = el.querySelectorAll('a, button, li, [role="menuitem"], mat-list-item, .nav-item, .menu-item').length;
+                        if (items > maxItems && items >= 3) {
+                            maxItems = items;
+                            bestRoot = el;
+                        }
+                    }
+                }
+            }
+            let root = bestRoot || document.body;
+
+            const results = [];
+            const seen = new Set();
+
+            function isSubMenuItem(el) {
+                let p = el.parentElement;
+                while (p && p !== root) {
+                    const cls = (p.className || '').toLowerCase();
+                    const id = (p.id || '').toLowerCase();
+                    const role = (p.getAttribute('role') || '').toLowerCase();
+                    if (cls.includes('submenu') || cls.includes('sub-menu') || cls.includes('nested') ||
+                        cls.includes('dropdown-menu') || cls.includes('accordion-body') || 
+                        cls.includes('accordion-content') || id.includes('submenu') || 
+                        role === 'group' || role === 'menu') {
+                        return true;
+                    }
+                    p = p.parentElement;
+                }
+                return false;
+            }
+
+            for (const el of root.querySelectorAll('button, a, [role="button"], [role="menuitem"], [role="link"], [role="tab"], mat-list-item, .nav-item, .menu-item, div.text-sm')) {
+                if (!isVisible(el)) continue;
+                const text = getDirectText(el);
+                if (!text || text.length < 2 || NOISE.has(text.toLowerCase())) continue;
+                if (isSubMenuItem(el)) continue;
+                if (seen.has(text.toLowerCase())) continue;
+                seen.add(text.toLowerCase());
+
+                const hasExpander = el.hasAttribute('aria-expanded') ||
+                                    el.hasAttribute('aria-haspopup') ||
+                                    el.classList.contains('accordion-toggle') ||
+                                    !!el.querySelector('[aria-expanded]') ||
+                                    (el.nextElementSibling && el.nextElementSibling.querySelectorAll('a, button, li, [role="menuitem"], mat-list-item, .nav-item, .menu-item, div.text-sm').length > 0) ||
+                                    (el.parentElement && el.parentElement.nextElementSibling && el.parentElement.nextElementSibling.querySelectorAll('a, button, li, [role="menuitem"], mat-list-item, .nav-item, .menu-item, div.text-sm').length > 0);
+
+                results.push({
+                    text: text,
+                    is_accordion: !!hasExpander,
+                    tag: el.tagName.toLowerCase(),
+                    href: el.getAttribute('href') || ''
+                });
+            }
+            return results;
+        })()
+        """) or []
+
+    def _scan_child_navs(self, parent_text: str) -> list[dict]:
+        """Scan for sub-menu child navigation items revealed under the parent nav."""
+        return self._browser.execute_script("""
+        return (function(arg0) {
+            function isVisible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0
+                    && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+            }
+            function getDirectText(el) {
+                let t = '';
+                for (const n of el.childNodes) { if (n.nodeType === 3) t += n.textContent; }
+                t = t.trim().replace(/\\s+/g, ' ');
+                if (!t) t = (el.getAttribute('aria-label') || el.textContent || '').trim().replace(/\\s+/g, ' ');
+                return t.slice(0, 80);
+            }
+            const NOISE = new Set(['logout','log out','sign out','notifications','help','about','profile','account','settings','home','dashboard']);
+            const target = arg0.toLowerCase().trim();
+            const seen = new Set([target]);
+            const results = [];
+
+            let parentEl = null;
+            for (const el of document.querySelectorAll('button, a, [role="button"], [role="menuitem"], [role="link"], [role="tab"], mat-list-item, .nav-item, .menu-item, div.text-sm')) {
+                if (!isVisible(el)) continue;
+                const txt = getDirectText(el).toLowerCase().trim();
+                if (txt === target || txt.startsWith(target) || target.startsWith(txt)) {
+                    parentEl = el;
+                    break;
+                }
+            }
+            if (!parentEl) return [];
+
+            let sibling = parentEl.nextElementSibling;
+            if (!sibling && parentEl.parentElement) {
+                sibling = parentEl.parentElement.nextElementSibling;
+            }
+
+            for (let i = 0; i < 3 && sibling; i++) {
+                if (isVisible(sibling)) {
+                    for (const a of sibling.querySelectorAll('a, button, li, [role="menuitem"], [role="button"], [role="link"], [role="tab"], mat-list-item, .nav-item, .menu-item, div.text-sm')) {
+                        if (!isVisible(a)) continue;
+                        const txt = getDirectText(a);
+                        if (!txt || txt.length < 2 || NOISE.has(txt.toLowerCase())) continue;
+                        const key = txt.toLowerCase().trim();
+                        if (key !== target && !seen.has(key)) {
+                            seen.add(key);
+                            results.push({ text: txt, href: a.getAttribute('href') || '' });
+                        }
+                    }
+                }
+                sibling = sibling.nextElementSibling;
+            }
+
+            return results;
+        })(arguments[0])
+        """, parent_text) or []
+
+    async def _explore_selected_modules(self, module_ids: list[str]):
+        """Explore only a specific list of modules by their IDs."""
+        await self._log("MILESTONE", "exploration", f"Starting deep exploration for {len(module_ids)} selected modules")
+        
+        # Reset to dashboard URL
+        await asyncio.to_thread(self._browser.navigate, self._dashboard_url)
+        await asyncio.sleep(2.0)
+        
+        # Get the modules from the database
+        result = await self.db.execute(select(ApplicationModule).where(ApplicationModule.id.in_(module_ids)))
+        modules = result.scalars().all()
+        
+        for module in modules:
+            if self._should_stop: return
+            
+            # Construct full URL
+            base_url = self._app.base_url.rstrip("/")
+            rel_url = module.url_pattern if module.url_pattern.startswith("/") else "/" + module.url_pattern
+            full_url = base_url + rel_url
+            
+            await self._explore_and_scan_module_page(full_url, module.id, nav_hint=module.name)
+
+    async def _explore_and_scan_module_page(self, url: str, module_id: str, nav_hint: str):
+        """Map page structure with AI and deep scan interactive elements in one pass."""
+        page = await self._explore_single_page(url, module_id, nav_hint=nav_hint, skip_navigate=False)
+        if page:
+            await self._deep_scan_page_elements(page)
+
+    async def _hierarchical_explore(self, discover_only: bool = False):
+        """Perform exploration by clicking through navigation to discover all URLs."""
+        await self._log("MILESTONE", "exploration", "Starting UI-based URL discovery")
+        
+        # Reset to dashboard URL
+        await asyncio.to_thread(self._browser.navigate, self._dashboard_url)
+        
+        # Wait for Angular SPA to render the DOM (up to 45 seconds)
+        await self._log("INFO", "system", "Waiting for lazy-loaded sidebar to render...")
+        for _ in range(15):
+            has_sidebar = await asyncio.to_thread(self._browser.execute_script, """
+            return (function() {
+                function isVisible(el) {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 && getComputedStyle(el).display !== 'none';
+                }
+                const NAV_SELS = ['nav', '[role="navigation"]', 'aside', '[role="menubar"]',
+                                  '[class*="sidebar" i]', '[class*="sider" i]', '[class*="menu-bar" i]'];
+                for (const sel of NAV_SELS) {
+                    for (const el of document.querySelectorAll(sel)) {
+                        if (isVisible(el)) {
+                            const items = el.querySelectorAll('a, button, li, [role="menuitem"], mat-list-item, .nav-item, .menu-item, div.text-sm').length;
+                            if (items >= 3) return true;
+                        }
+                    }
+                }
+                return false;
+            })();
+            """)
+            if has_sidebar:
+                break
+            await asyncio.sleep(3.0)
+
+        # 1. Discover all parent nav items
+        parents = await asyncio.to_thread(self._scan_parent_navs)
+        if not parents:
+            try:
+                html_dump = await asyncio.to_thread(self._browser.execute_script, "return document.body.outerHTML;")
+                import os
+                # Dump to the absolute artifacts path of the AI workspace
+                dump_path = "/Users/harry/.gemini/antigravity-ide/brain/401b3f56-e33c-4de6-8011-6771115e18d4/artifacts/nav_debug.html"
+                with open(dump_path, "w", encoding="utf-8") as f:
+                    f.write(html_dump)
+                await self._log("WARNING", "navigation", "DUMPED DOM to artifacts/nav_debug.html for AI analysis!")
+            except Exception as e:
+                await self._log("ERROR", "navigation", f"Failed to dump DOM: {e}")
+
+        await self._log("INFO", "navigation", f"Navigation scan: {len(parents)} parent navigation item(s) found")
+
+        order_idx = 0
+        discovered_urls = set()
+
+        for p_item in parents:
+            if self._should_stop:
+                return
+
+            parent_text = p_item["text"]
+            is_accordion = p_item["is_accordion"]
+            
+            # Reset to dashboard to ensure stable UI context
+            await asyncio.to_thread(self._browser.navigate, self._dashboard_url)
+            await asyncio.sleep(1.5)
+
+            # Click the parent nav
+            clicked = await asyncio.to_thread(self._click_nav_item, parent_text)
+            if not clicked:
+                continue
+            await asyncio.sleep(1.5)
+
+            children = []
+            if is_accordion:
+                children = await asyncio.to_thread(self._scan_child_navs, parent_text)
+
+            if children:
+                for child in children:
+                    if self._should_stop: return
+                    child_text = child["text"]
+
+                    await asyncio.to_thread(self._browser.navigate, self._dashboard_url)
+                    await asyncio.sleep(1.5)
+                    await asyncio.to_thread(self._click_nav_item, parent_text)
+                    await asyncio.sleep(1.0)
+                    await asyncio.to_thread(self._click_nav_item, child_text)
+                    await asyncio.sleep(1.5)
+
+                    child_url = await asyncio.to_thread(self._get_full_url)
+                    if await asyncio.to_thread(self._is_login_page) or child_url in discovered_urls:
+                        continue
+
+                    discovered_urls.add(child_url)
+                    base_url = self._app.base_url.rstrip("/")
+                    rel_url = child_url[len(base_url):] if child_url.startswith(base_url) else child_url
+                    if not rel_url.startswith("/"): rel_url = "/" + rel_url
+
+                    # Create flat module for this URL
+                    module = ApplicationModule(
+                        application_id=self._app.id,
+                        name=f"{parent_text} - {child_text}",
+                        description=f"Module for {child_text}",
+                        url_pattern=rel_url,
+                        icon="layout",
+                        parent_id=None,
+                        order_index=order_idx,
+                    )
+                    self.db.add(module)
+                    await self.db.flush()
+                    self._module_map[rel_url] = module.id
+                    order_idx += 1
+
+                    if not discover_only:
+                        await self._explore_and_scan_module_page(child_url, module.id, nav_hint=f"{parent_text} - {child_text}")
+                await self.db.commit()
+            else:
+                # Standalone parent
+                parent_url = await asyncio.to_thread(self._get_full_url)
+                if await asyncio.to_thread(self._is_login_page) or parent_url in discovered_urls:
+                    continue
+
+                discovered_urls.add(parent_url)
+                base_url = self._app.base_url.rstrip("/")
+                rel_url = parent_url[len(base_url):] if parent_url.startswith(base_url) else parent_url
+                if not rel_url.startswith("/"): rel_url = "/" + rel_url
+
+                module = ApplicationModule(
+                    application_id=self._app.id,
+                    name=parent_text,
+                    description=f"Module for {parent_text}",
+                    url_pattern=rel_url,
+                    icon="layout",
+                    parent_id=None,
+                    order_index=order_idx,
+                )
+                self.db.add(module)
+                await self.db.flush()
+                self._module_map[rel_url] = module.id
+                order_idx += 1
+
+                if not discover_only:
+                    await self._explore_and_scan_module_page(parent_url, module.id, nav_hint=parent_text)
+                await self.db.commit()

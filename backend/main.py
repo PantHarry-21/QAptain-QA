@@ -1,6 +1,13 @@
+from __future__ import annotations
+
 import asyncio
 import logging
+import warnings
 from contextlib import asynccontextmanager
+
+# Suppress deprecation warnings from dependencies
+warnings.filterwarnings("ignore", category=FutureWarning, module="google.*")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="urllib3.*")
 
 import structlog
 from fastapi import FastAPI
@@ -29,8 +36,17 @@ log = structlog.get_logger()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("QAptain starting", version=settings.APP_VERSION, env=settings.ENVIRONMENT)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    # Neon serverless can take a moment to wake up — retry a few times on cold-start failures.
+    for _attempt in range(3):
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            break
+        except Exception as _db_err:
+            if _attempt == 2:
+                raise
+            log.warning("DB startup connection failed, retrying", attempt=_attempt + 1, error=str(_db_err)[:120])
+            await asyncio.sleep(3 * (_attempt + 1))
     import os
     os.makedirs(settings.SCREENSHOTS_DIR, exist_ok=True)
     os.makedirs(settings.VIDEOS_DIR, exist_ok=True)

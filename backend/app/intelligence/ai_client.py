@@ -77,7 +77,7 @@ class AIClient:
                 api_version=settings.AZURE_OPENAI_API_VERSION,
                 max_retries=0,
             )
-            # Initialize Anthropic as fallback for when Azure rate-limits are exhausted
+            # Anthropic fallback for when Azure rate-limits are fully exhausted
             if settings.ANTHROPIC_API_KEY:
                 try:
                     self._anthropic_fallback = anthropic.AsyncAnthropic(
@@ -189,7 +189,8 @@ class AIClient:
         if json_mode and self._provider != "azure_openai":
             kwargs["response_format"] = {"type": "json_object"}
 
-        # Retry on 429 Rate Limit with exponential backoff (Azure TPM/RPM limits)
+        # Retry on 429 Rate Limit with exponential backoff.
+        # With a 180s explore timeout, 3 retries fit comfortably (15+30+60 = 105s wait).
         last_exc: Exception | None = None
         for attempt in range(5):
             try:
@@ -197,10 +198,19 @@ class AIClient:
                 break
             except openai.RateLimitError as exc:
                 last_exc = exc
-                wait = min(20 * (2 ** attempt), 120)  # 20s, 40s, 80s, 120s, 120s
+                # Respect Azure's Retry-After header when present — it tells us
+                # exactly how long the quota window needs to reset.
+                retry_after = 0
+                try:
+                    resp_headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
+                    retry_after = int(resp_headers.get("retry-after") or resp_headers.get("Retry-After") or 0)
+                except Exception:
+                    pass
+                wait = retry_after if retry_after > 0 else min(15 * (2 ** attempt), 90)
                 log.warning("Azure 429 rate limit — backing off",
                             provider=self._provider, model=model,
-                            attempt=attempt + 1, wait_seconds=wait)
+                            attempt=attempt + 1, wait_seconds=wait,
+                            retry_after_header=retry_after or "not provided")
                 await asyncio.sleep(wait)
             except Exception as exc:
                 log.error("OpenAI API call failed", provider=self._provider, model=model,

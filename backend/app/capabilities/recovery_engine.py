@@ -75,6 +75,66 @@ _RECOVERY_LIBRARY: dict[str, dict[str, list[RecoveryStep]]] = {
             RecoveryStep(RecoveryAction.SCROLL_INTO_VIEW, "Scroll button into view", ["click"], 2),
         ],
     },
+    "AUTH": {
+        "fill": [
+            RecoveryStep(RecoveryAction.CLEAR_AND_RETYPE, "Clear credential field and retype", ["fill"], 1),
+            RecoveryStep(RecoveryAction.SCROLL_INTO_VIEW, "Scroll login field into view", ["fill"], 2),
+            RecoveryStep(RecoveryAction.WAIT_ANIMATION, "Wait for login form to finish rendering", ["fill"], 3),
+        ],
+        "click": [
+            RecoveryStep(RecoveryAction.WAIT_ANIMATION, "Wait for login button to become active", ["click"], 1),
+            RecoveryStep(RecoveryAction.SCROLL_INTO_VIEW, "Scroll login button into view", ["click"], 2),
+            RecoveryStep(RecoveryAction.WAIT_NETWORK, "Wait for previous auth request to finish", ["click"], 3),
+        ],
+        "assert_visible": [
+            RecoveryStep(RecoveryAction.WAIT_NETWORK, "Wait for auth response to load UI", ["assert_visible"], 1),
+            RecoveryStep(RecoveryAction.WAIT_ANIMATION, "Wait for redirect animation", ["assert_visible"], 2),
+        ],
+        "navigate": [
+            RecoveryStep(RecoveryAction.WAIT_NETWORK, "Wait for login page to load", ["navigate"], 1),
+            RecoveryStep(RecoveryAction.WAIT_ANIMATION, "Wait for SPA route to resolve", ["navigate"], 2),
+        ],
+    },
+    "ROLE_ACCESS": {
+        "navigate": [
+            RecoveryStep(RecoveryAction.WAIT_NETWORK, "Wait for page to load after navigation", ["navigate"], 1),
+            RecoveryStep(RecoveryAction.WAIT_ANIMATION, "Wait for redirect animation to complete", ["navigate"], 2),
+        ],
+        "assert_visible": [
+            RecoveryStep(RecoveryAction.WAIT_NETWORK, "Wait for access-denied response", ["assert_visible"], 1),
+            RecoveryStep(RecoveryAction.NAVIGATE_BACK, "Navigate back from restricted page", ["assert_visible"], 2),
+        ],
+        "click": [
+            RecoveryStep(RecoveryAction.SCROLL_INTO_VIEW, "Scroll navigation element into view", ["click"], 1),
+            RecoveryStep(RecoveryAction.WAIT_ANIMATION, "Wait for nav menu to render", ["click"], 2),
+        ],
+    },
+    "FILE_UPLOAD": {
+        "upload": [
+            RecoveryStep(RecoveryAction.SCROLL_INTO_VIEW, "Scroll file input into view", ["upload"], 1),
+            RecoveryStep(RecoveryAction.WAIT_ANIMATION, "Wait for upload dialog to stabilize", ["upload"], 2),
+        ],
+        "click": [
+            RecoveryStep(RecoveryAction.SCROLL_INTO_VIEW, "Scroll upload button into view", ["click"], 1),
+            RecoveryStep(RecoveryAction.WAIT_ANIMATION, "Wait for upload area to render", ["click"], 2),
+        ],
+        "assert_visible": [
+            RecoveryStep(RecoveryAction.WAIT_NETWORK, "Wait for upload to complete", ["assert_visible"], 1),
+            RecoveryStep(RecoveryAction.WAIT_ANIMATION, "Wait for success notification", ["assert_visible"], 2),
+            RecoveryStep(RecoveryAction.SCROLL_INTO_VIEW, "Scroll to see upload result", ["assert_visible"], 3),
+        ],
+    },
+    "EXPORT": {
+        "click": [
+            RecoveryStep(RecoveryAction.SCROLL_INTO_VIEW, "Scroll export button into view", ["click"], 1),
+            RecoveryStep(RecoveryAction.WAIT_ANIMATION, "Wait for export menu to open", ["click"], 2),
+            RecoveryStep(RecoveryAction.CLOSE_OVERLAY, "Close any overlapping dialog first", ["click"], 3),
+        ],
+        "assert_visible": [
+            RecoveryStep(RecoveryAction.WAIT_NETWORK, "Wait for export to generate", ["assert_visible"], 1),
+            RecoveryStep(RecoveryAction.WAIT_ANIMATION, "Wait for download notification", ["assert_visible"], 2),
+        ],
+    },
 }
 
 # Generic fallback recovery for any workflow type

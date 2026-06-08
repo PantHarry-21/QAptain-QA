@@ -1,3 +1,4 @@
+from __future__ import annotations
 from datetime import datetime
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Any
@@ -8,6 +9,10 @@ from app.db.models import ExploreMode, ExploreStatus
 class ExploreStart(BaseModel):
     application_id: str
     mode: ExploreMode = ExploreMode.SMART
+    selected_module_ids: list[str] | None = None
+
+class ExploreDiscover(BaseModel):
+    application_id: str
 
 
 class ExploreSessionResponse(BaseModel):

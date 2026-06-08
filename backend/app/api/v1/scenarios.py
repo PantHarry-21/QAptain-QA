@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import io
 import json
 
@@ -70,6 +71,126 @@ async def _load_modules_by_id(db: AsyncSession, scenarios: list[Scenario]) -> di
         select(ApplicationModule).where(ApplicationModule.id.in_(module_ids))
     )
     return {m.id: m for m in result.scalars().all()}
+
+
+# ─── Module Auto-Mapping ──────────────────────────────────────────────────────
+
+def _keyword_match_module(title: str, modules: list) -> str | None:
+    """
+    Match a scenario title to its best-fit module using keyword/substring scoring.
+    Returns module_id when confident (score ≥ 0.4), else None.
+
+    Examples that match:
+      "Test Add Generic Master"       → module named "Generic Master"   (substring match)
+      "Verify CRUD for User Mgmt"     → module named "User Management"  (word overlap)
+    """
+    title_lower = title.lower()
+    best_id: str | None = None
+    best_score = 0.0
+
+    for mod in modules:
+        mod_name = mod.name.lower()
+        # Substring: full module name found inside the scenario title
+        if mod_name in title_lower:
+            score = len(mod_name) / max(len(title_lower), 1) + 0.5
+        else:
+            title_words = {w for w in title_lower.split() if len(w) > 2}
+            mod_words = {w for w in mod_name.split() if len(w) > 2}
+            if not mod_words:
+                continue
+            overlap = len(title_words & mod_words)
+            score = overlap / len(mod_words)
+
+        if score > best_score:
+            best_score = score
+            best_id = mod.id
+
+    return best_id if best_score >= 0.4 else None
+
+
+async def _auto_map_scenarios(
+    db: AsyncSession,
+    application_id: str,
+    scenarios: list[Scenario],
+) -> int:
+    """
+    Assign module_id to unmapped scenarios using:
+      1. Fast keyword/substring matching against module names
+      2. AI bulk mapping for the remainder (one call, all unmapped at once)
+    Returns the count of scenarios successfully mapped.
+    """
+    mods_result = await db.execute(
+        select(ApplicationModule).where(ApplicationModule.application_id == application_id)
+    )
+    modules = mods_result.scalars().all()
+    if not modules:
+        return 0
+
+    unmapped: list[Scenario] = []
+    mapped = 0
+
+    for s in scenarios:
+        if s.module_id:
+            continue
+        mid = _keyword_match_module(s.title, modules)
+        if mid:
+            s.module_id = mid
+            mapped += 1
+        else:
+            unmapped.append(s)
+
+    # AI fallback — batch all remaining unmapped in a single call
+    if unmapped:
+        try:
+            ai = get_ai_client()
+            module_list = [
+                {"id": m.id, "name": m.name, "url": m.url_pattern or "",
+                 "description": (m.description or "")[:120]}
+                for m in modules
+            ]
+            scenario_list = [
+                {"id": s.id, "title": s.title,
+                 "description": (s.description or "")[:150]}
+                for s in unmapped[:50]
+            ]
+            resp = await asyncio.wait_for(
+                ai.complete(
+                    system=(
+                        "You are a QA test management assistant. "
+                        "Map each test scenario to the single most appropriate module. "
+                        'Return ONLY JSON: {"mappings": [{"scenario_id": "...", "module_id": "..."}]}. '
+                        "Omit scenarios where no module fits."
+                    ),
+                    user=(
+                        f"MODULES:\n{json.dumps(module_list)}\n\n"
+                        f"SCENARIOS TO MAP:\n{json.dumps(scenario_list)}\n\n"
+                        "For each scenario choose the module whose name / purpose best matches "
+                        "the scenario subject. If the scenario mentions 'Generic Master', map to "
+                        "the 'Generic Master' module, etc."
+                    ),
+                    json_mode=True,
+                    fast=True,
+                    max_tokens=2000,
+                ),
+                timeout=30.0,
+            )
+            valid_ids = {m.id for m in modules}
+            mapping: dict[str, str] = {
+                m["scenario_id"]: m["module_id"]
+                for m in resp.json().get("mappings", [])
+                if m.get("scenario_id") and m.get("module_id") in valid_ids
+            }
+            for s in unmapped:
+                mid = mapping.get(s.id)
+                if mid:
+                    s.module_id = mid
+                    mapped += 1
+        except Exception:
+            pass  # mapping is best-effort; don't fail the import
+
+    if mapped:
+        await db.commit()
+    return mapped
 
 
 def _extract_docx_text(content: bytes) -> str:
@@ -230,7 +351,7 @@ async def list_scenarios(
 
 # ─── Create ───────────────────────────────────────────────────────────────────
 
-@router.post("", response_model=ScenarioResponse, status_code=201)
+@router.post("", status_code=201)
 async def create_scenario(
     payload: ScenarioCreate,
     current_user: User = Depends(get_current_user),
@@ -248,7 +369,13 @@ async def create_scenario(
     )
     db.add(scenario)
     await db.commit()
-    return ScenarioResponse.model_validate(scenario)
+
+    # Auto-map to a knowledge graph module if no explicit module was provided
+    if not payload.module_id:
+        await _auto_map_scenarios(db, payload.application_id, [scenario])
+
+    modules_by_id = await _load_modules_by_id(db, [scenario])
+    return _enrich_scenario(scenario, modules_by_id)
 
 
 # ─── Update ───────────────────────────────────────────────────────────────────
@@ -258,6 +385,7 @@ class ScenarioUpdate(BaseModel):
     description: str | None = None
     priority: str | None = None
     tags: list[str] | None = None
+    module_id: str | None = None  # set to assign; omit to keep current
 
 # ─── Bulk delete by module (must be before /{scenario_id} to avoid route shadowing) ─
 
@@ -307,6 +435,9 @@ async def update_scenario(
         scenario.priority = _parse_priority(payload.priority)
     if payload.tags is not None:
         scenario.tags = payload.tags
+    # module_id: explicit value assigns; "module_id" key not in request → keep current
+    if "module_id" in payload.model_fields_set:
+        scenario.module_id = payload.module_id or None
     await db.commit()
     await db.refresh(scenario)
     modules_by_id = await _load_modules_by_id(db, [scenario])
@@ -329,6 +460,39 @@ async def delete_scenario(
     await db.commit()
 
 
+# ─── Auto-map to Knowledge Graph modules ─────────────────────────────────────
+
+@router.post("/auto-map-modules")
+async def auto_map_modules(
+    application_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Map all unlinked scenarios to their knowledge graph module using
+    keyword matching + AI fallback.  Call this after any bulk import or
+    whenever scenarios show 'No Module' in the UI.
+    """
+    result = await db.execute(
+        select(Scenario).where(
+            Scenario.application_id == application_id,
+            Scenario.is_active == True,
+            Scenario.module_id == None,  # noqa: E711
+        )
+    )
+    unmapped = result.scalars().all()
+    if not unmapped:
+        return {"mapped": 0, "total_unmapped": 0,
+                "message": "All scenarios already have modules assigned"}
+
+    mapped = await _auto_map_scenarios(db, application_id, list(unmapped))
+    return {
+        "mapped": mapped,
+        "total_unmapped": len(unmapped),
+        "message": f"Mapped {mapped} of {len(unmapped)} scenarios to knowledge graph modules",
+    }
+
+
 # ─── Import: Excel ────────────────────────────────────────────────────────────
 
 @router.post("/import/excel")
@@ -343,7 +507,7 @@ async def import_from_excel(
     if not test_cases:
         raise HTTPException(status_code=422, detail="No test cases found. Check that your file has Title/Description columns.")
 
-    created_titles: list[str] = []
+    created: list[Scenario] = []
     for tc in test_cases:
         title = tc.get("title", "").strip()
         if not title:
@@ -358,10 +522,18 @@ async def import_from_excel(
             created_by=current_user.id,
         )
         db.add(scenario)
-        created_titles.append(title)
+        created.append(scenario)
 
     await db.commit()
-    return {"imported": len(created_titles), "titles": created_titles[:20]}
+
+    # Auto-map every scenario to its knowledge graph module
+    mapped = await _auto_map_scenarios(db, application_id, created)
+
+    return {
+        "imported": len(created),
+        "mapped_to_modules": mapped,
+        "titles": [s.title for s in created[:20]],
+    }
 
 
 # ─── Import: CSV ──────────────────────────────────────────────────────────────
@@ -375,7 +547,7 @@ async def import_from_csv(
 ):
     content = await file.read()
     reader = csv.DictReader(io.StringIO(content.decode("utf-8-sig")))
-    created = []
+    created: list[Scenario] = []
     for row in reader:
         title = row.get("title") or row.get("scenario") or row.get("test_case")
         if not title:
@@ -390,10 +562,18 @@ async def import_from_csv(
             created_by=current_user.id,
         )
         db.add(scenario)
-        created.append(str(title).strip())
+        created.append(scenario)
 
     await db.commit()
-    return {"imported": len(created), "titles": created[:10]}
+
+    # Auto-map every scenario to its knowledge graph module
+    mapped = await _auto_map_scenarios(db, application_id, created)
+
+    return {
+        "imported": len(created),
+        "mapped_to_modules": mapped,
+        "titles": [s.title for s in created[:10]],
+    }
 
 
 # ─── Import: Document (DOCX / PDF) ────────────────────────────────────────────

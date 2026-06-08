@@ -118,7 +118,12 @@ class SemanticUIExtractor:
                 const rect = el.getBoundingClientRect();
                 if (rect.width === 0 || rect.height === 0) return false;
                 const style = window.getComputedStyle(el);
-                return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                
+                const navSels = ['nav', '[role="navigation"]', 'aside', '[role="menubar"]', '[class*="sidebar" i]', '[class*="sider" i]', '[class*="menu-bar" i]'];
+                if (el.closest(navSels.join(', '))) return false;
+                
+                return true;
             }
 
             const selectors = [

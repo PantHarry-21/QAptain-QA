@@ -17,10 +17,10 @@ QAPtain automatically discovers your web application's modules, generates intell
 | **AI Form Filling** | Context-aware fake data generation for form fields based on semantic classification |
 | **Field Validation Inference** | Automatically detects validation rules from HTML, API responses, and observed behavior |
 | **Workspace Collaboration** | Multi-workspace, multi-member model with owner/admin/member roles |
-| **Real-time Execution Logs** | Live test progress via Socket.IO with step-by-step screenshots and video recording |
+| **Real-time Execution Logs** | Live test progress via FastAPI WebSocket or polling with step-by-step screenshots and video recording |
 | **PDF Reports** | Auto-generated executive test reports with risk assessment and recommendations |
-| **Background Job Queue** | BullMQ-powered async processing for discovery, execution, and scenario expansion |
-| **Vector Memory** | Supabase-backed vector storage for AI memory chunks (module, workflow, selector, field context) |
+| **Background Job Queue** | In-process async task handling with optional Redis coordination |
+| **Vector Memory** | ChromaDB-backed vector storage for AI memory chunks (modules, workflows, selectors) |
 
 ---
 
@@ -28,19 +28,19 @@ QAPtain automatically discovers your web application's modules, generates intell
 
 | Layer | Technology |
 | --- | --- |
-| **Framework** | [Next.js 15](https://nextjs.org/) (App Router, React 19) |
-| **Language** | TypeScript |
-| **Styling** | Tailwind CSS 4, shadcn/ui (Radix primitives) |
-| **Database** | PostgreSQL (Neon / local Docker) |
-| **ORM** | Prisma 5 |
-| **Authentication** | NextAuth.js (credentials provider) |
-| **AI / LLM** | Azure OpenAI / OpenAI (GPT-5-mini), LangChain |
-| **Test Execution** | Playwright |
-| **Job Queue** | BullMQ + Redis (Upstash / local Docker) |
-| **Vector Store** | Supabase (replaces ChromaDB) |
-| **Real-time** | Socket.IO |
+| **Frontend** | Next.js 15 + React 19 + TypeScript + Tailwind CSS |
+| **Backend** | FastAPI + Python 3 + async SQLAlchemy |
+| **Styling** | Tailwind CSS 4, Radix UI primitives |
+| **Database** | PostgreSQL |
+| **ORM** | SQLAlchemy async |
+| **Authentication** | FastAPI auth with JWT and credential management |
+| **AI / LLM** | Anthropic / OpenAI / Azure OpenAI |
+| **Test Execution** | Selenium + Chrome DevTools Protocol |
+| **Job Handling** | In-process async jobs with optional Redis coordination |
+| **Vector Store** | ChromaDB |
+| **Real-time** | FastAPI WebSocket |
 | **PDF Generation** | jsPDF + jspdf-autotable |
-| **State Management** | Zustand, TanStack React Query |
+| **State Management** | TanStack React Query |
 | **Charts** | Recharts |
 | **Animations** | Framer Motion |
 
@@ -50,49 +50,19 @@ QAPtain automatically discovers your web application's modules, generates intell
 
 ```
 QAptain/
-├── prisma/
-│   └── schema.prisma          # Database schema (workspace-centric model)
-├── scripts/
-│   └── download-chromium.mjs  # Chromium binary downloader for Playwright
-├── src/
-│   ├── app/                   # Next.js App Router pages
-│   │   ├── (platform)/        # Authenticated pages (dashboard, workspaces, settings)
-│   │   ├── api/               # API routes (19 endpoint groups)
-│   │   ├── login/             # Login page
-│   │   ├── signup/            # Signup page
-│   │   ├── scenarios/         # Scenario management
-│   │   ├── test-execution/    # Test execution UI
-│   │   ├── results/           # Test results viewer
-│   │   ├── history/           # Execution history
-│   │   └── url-input/         # URL input for discovery
-│   ├── components/            # React components
-│   │   ├── ui/                # shadcn/ui primitives
-│   │   └── platform/          # Platform-specific components
-│   ├── hooks/                 # Custom React hooks
-│   ├── lib/                   # Shared utilities & services
-│   │   ├── auth.ts            # NextAuth configuration
-│   │   ├── openai.ts          # LLM client setup
-│   │   ├── prompts.ts         # AI prompt templates
-│   │   ├── test-executor.ts   # Core Playwright execution engine
-│   │   ├── prisma.ts          # Prisma client singleton
-│   │   ├── socket.ts          # Socket.IO event handlers
-│   │   ├── supabase.ts        # Supabase client
-│   │   └── pdf-generator.ts   # Report PDF generation
-│   └── server/                # Server-side modules
-│       ├── data/              # Data access layer
-│       ├── events/            # Socket.IO event bridge
-│       ├── execution/         # Test run execution engine
-│       ├── intelligence/      # App intelligence (field classification, graph building, workflow inference)
-│       ├── jobs/              # Background job processors (discovery, scenario expansion)
-│       ├── memory/            # Vector memory (Supabase)
-│       ├── orchestration/     # Execution orchestration
-│       └── queues/            # BullMQ queue definitions
-├── docker-compose.yml         # Local PostgreSQL + Redis
-├── server.ts                  # Custom Next.js + Socket.IO server
-├── worker.ts                  # BullMQ worker process
-├── schema.sql                 # Legacy SQL schema (reference)
-├── supabase-setup.sql         # Supabase vector store setup
-└── package.json
+├── backend/                   # FastAPI backend service
+│   ├── main.py                # FastAPI app and WebSocket entrypoint
+│   ├── config.py              # Pydantic settings
+│   ├── requirements.txt       # Python dependencies
+│   └── app/                   # Backend application modules
+├── src/                       # Next.js frontend application
+├── public/                    # Static assets
+├── docker-compose.yml         # Local Postgres / Redis / ChromaDB stack
+├── README.md
+├── ARCHITECTURE.md
+├── package.json
+├── tsconfig.json
+└── .env.example
 ```
 
 ---
@@ -115,11 +85,18 @@ cd QAptain
 
 ### 2. Install Dependencies
 
+Frontend dependencies:
 ```bash
 npm install
 ```
 
-> This automatically downloads a Chromium binary for Playwright and generates the Prisma client (`postinstall` hook).
+Backend dependencies:
+```bash
+cd backend
+python -m pip install -r requirements.txt
+```
+
+> This repository uses a separate FastAPI backend and a Next.js frontend.
 
 ### 3. Configure Environment Variables
 
@@ -132,17 +109,19 @@ Edit `.env` and fill in the required values:
 | Variable | Required | Description |
 | --- | --- | --- |
 | `DATABASE_URL` | ✅ | PostgreSQL connection string |
-| `NEXTAUTH_SECRET` | ✅ | Random secret for session encryption |
-| `NEXTAUTH_URL` | ✅ | App URL (default: `http://localhost:3000`) |
-| `REDIS_URL` | Recommended | Redis connection string (BullMQ workers) |
-| `NEXT_PUBLIC_SUPABASE_URL` | Optional | Supabase project URL (vector memory) |
-| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Optional | Supabase anon/public key |
-| `LLM_PROVIDER` | ✅ | `azure` or `openai` |
-| `AZURE_OPENAI_API_KEY` | If Azure | Azure OpenAI API key |
-| `AZURE_OPENAI_ENDPOINT` | If Azure | Azure OpenAI endpoint URL |
-| `AZURE_OPENAI_DEPLOYMENT` | If Azure | Deployment/model name |
+| `AI_PROVIDER` | ✅ | `anthropic`, `openai`, or `azure_openai` |
+| `ANTHROPIC_API_KEY` | Optional | Required when `AI_PROVIDER=anthropic` |
+| `OPENAI_API_KEY` | Optional | Required when `AI_PROVIDER=openai` |
+| `AZURE_OPENAI_API_KEY` | Optional | Required when `AI_PROVIDER=azure_openai` |
+| `AZURE_OPENAI_ENDPOINT` | Optional | Required when `AI_PROVIDER=azure_openai` |
+| `AZURE_OPENAI_DEPLOYMENT` | Optional | Azure deployment/model name |
+| `REDIS_URL` | Optional | Redis URL for optional async coordination |
+| `CHROMA_HOST` | Optional | ChromaDB host |
+| `CHROMA_PORT` | Optional | ChromaDB port |
+| `SECRET_KEY` | ✅ | JWT and auth secret |
+| `ENCRYPTION_KEY` | Optional | Encryption key for stored credentials |
 
-### 4. Start Local Infrastructure (PostgreSQL + Redis)
+### 4. Start Local Infrastructure (PostgreSQL + Redis + ChromaDB)
 
 ```bash
 docker compose up -d
@@ -151,43 +130,30 @@ docker compose up -d
 This starts:
 - **PostgreSQL 16** on port `5432` (user: `qaptain`, password: `qaptain`, db: `qaptain`)
 - **Redis 7** on port `6379`
+- **ChromaDB** on port `8001`
 
-### 5. Push Database Schema
+### 5. Start the Backend
 
-```bash
-npx prisma db push
-```
-
-### 6. Generate Prisma Client (if not already done)
+In a new terminal:
 
 ```bash
-npx prisma generate
+cd backend
+python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
----
+### 6. Start the Frontend
 
-## 🖥️ Running the Application
+In another terminal:
 
-### Development Server (Web App)
+```bash
+npm run dev:fe
+```
+
+### 7. Start frontend and backend together
 
 ```bash
 npm run dev
 ```
-
-This starts the custom server (Next.js + Socket.IO) at **http://localhost:3000**.
-
-### Background Worker (Job Queue)
-
-Open a **second terminal** and run:
-
-```bash
-npm run worker
-```
-
-This starts BullMQ workers that process:
-- **Discovery jobs** — crawl and map your application
-- **Execution jobs** — run Playwright test scenarios
-- **Scenario expansion jobs** — AI-powered scenario generation
 
 ### Production Build
 
@@ -202,36 +168,22 @@ npm start
 
 | Command | Description |
 | --- | --- |
-| `npm run dev` | Start the development server (Next.js + Socket.IO on port 3000) |
-| `npm run build` | Generate Prisma client and build the Next.js production bundle |
-| `npm start` | Start the production server |
-| `npm run worker` | Start BullMQ background workers (discovery, execution, scenario-expand) |
+| `npm run dev` | Start the frontend and backend together in development |
+| `npm run dev:fe` | Start only the frontend development server |
+| `npm run dev:be` | Start only the backend FastAPI service |
+| `npm run build` | Build the Next.js frontend for production |
+| `npm start` | Start the production frontend server |
 | `npm run lint` | Run ESLint |
-| `npm run db:push` | Push Prisma schema changes to the database |
-| `npm run db:generate` | Regenerate the Prisma client |
-| `docker compose up -d` | Start local PostgreSQL + Redis containers |
+| `python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000` | Start the backend directly from `backend/` |
+| `docker compose up -d` | Start local PostgreSQL, Redis, and ChromaDB containers |
 | `docker compose down` | Stop local infrastructure containers |
 | `docker compose down -v` | Stop containers and remove volumes (⚠️ deletes data) |
 
 ---
 
-## 🔌 API Endpoints
+## 🔌 Backend API
 
-The application exposes the following API route groups under `/api/`:
-
-| Endpoint | Purpose |
-| --- | --- |
-| `/api/auth` | NextAuth.js authentication |
-| `/api/analyze-url` | URL analysis and page inspection |
-| `/api/generate-scenarios` | AI-powered scenario generation |
-| `/api/interpret-scenario` | Natural-language scenario interpretation |
-| `/api/translate-scenarios` | Scenario format translation |
-| `/api/ai-generate-steps` | AI step generation for scenarios |
-| `/api/ai-fill-form` | AI-powered form data generation |
-| `/api/ai-test-form-validations` | Form validation test generation |
-| `/api/execute-workflow` | Workflow execution trigger |
-| `/api/run-test` | Test execution trigger |
-| `/api/results` | Test results retrieval |
+Backend routes are defined under `backend/app/api/v1/`. The frontend communicates with the FastAPI service through REST and WebSocket endpoints.
 | `/api/history` | Execution history |
 | `/api/saved-scenarios` | Saved scenario CRUD |
 | `/api/import-excel` | Excel scenario import |

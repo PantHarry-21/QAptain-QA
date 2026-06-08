@@ -1,3 +1,5 @@
+from __future__ import annotations
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -150,7 +152,7 @@ async def get_logs(
     ]
 
 
-@router.get("/{run_id}/report", response_model=ReportResponse | None)
+@router.get("/{run_id}/report", response_model=Optional[ReportResponse])
 async def get_report(
     run_id: str,
     current_user: User = Depends(get_current_user),

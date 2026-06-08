@@ -1,3 +1,4 @@
+from __future__ import annotations
 import json
 from fastapi import WebSocket, WebSocketDisconnect
 import structlog

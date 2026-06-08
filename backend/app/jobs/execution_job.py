@@ -6,6 +6,7 @@ synchronous Selenium calls never block the FastAPI event loop.
 from __future__ import annotations
 import asyncio
 import concurrent.futures
+import os
 from datetime import datetime
 
 import structlog
@@ -41,8 +42,11 @@ def _run_execution_in_thread(run_id: str) -> None:
 async def _run_execution_async(run_id: str) -> None:
     """Async execution inside the worker thread's own event loop."""
     from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-    from app.execution.executor import ExecutionOrchestrator
     from config import settings
+
+    # Playwright MCP executor is the default; falls back to legacy Selenium executor
+    # when USE_PLAYWRIGHT_MCP=false is set in the environment.
+    use_playwright = os.environ.get("USE_PLAYWRIGHT_MCP", "true").lower() != "false"
 
     engine = create_async_engine(
         settings.DATABASE_URL,
@@ -53,7 +57,12 @@ async def _run_execution_async(run_id: str) -> None:
     try:
         SessionFactory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
         async with SessionFactory() as db:
-            orchestrator = ExecutionOrchestrator(db, main_loop=_main_loop)
+            if use_playwright:
+                from app.execution.playwright_mcp_executor import PlaywrightMCPExecutor
+                orchestrator = PlaywrightMCPExecutor(db, main_loop=_main_loop)
+            else:
+                from app.execution.executor import ExecutionOrchestrator
+                orchestrator = ExecutionOrchestrator(db, main_loop=_main_loop)
             await orchestrator.execute_run(run_id)
     except Exception as e:
         log.exception("Background execution failed", run_id=run_id, error=str(e))

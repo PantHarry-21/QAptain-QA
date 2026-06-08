@@ -1,4 +1,5 @@
 """
+from __future__ import annotations
 QAptain Database Models
 Complete entity schema for the AI-native automation platform.
 """

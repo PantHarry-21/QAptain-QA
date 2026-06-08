@@ -1,5 +1,6 @@
+from __future__ import annotations
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Optional
 
 import bcrypt
 from cryptography.fernet import Fernet
@@ -7,13 +8,24 @@ from jose import JWTError, jwt
 
 from config import settings
 
-_fernet: Fernet | None = None
+_fernet: Optional[Fernet] = None
 
+
+import os
 
 def _get_fernet() -> Fernet:
     global _fernet
     if _fernet is None:
-        key = settings.ENCRYPTION_KEY.encode() if settings.ENCRYPTION_KEY else Fernet.generate_key()
+        key_file = ".encryption_key"
+        if settings.ENCRYPTION_KEY:
+            key = settings.ENCRYPTION_KEY.encode()
+        elif os.path.exists(key_file):
+            with open(key_file, "rb") as f:
+                key = f.read()
+        else:
+            key = Fernet.generate_key()
+            with open(key_file, "wb") as f:
+                f.write(key)
         _fernet = Fernet(key)
     return _fernet
 
@@ -26,13 +38,13 @@ def verify_password(plain: str, hashed: str) -> bool:
     return bcrypt.checkpw(plain.encode(), hashed.encode())
 
 
-def create_access_token(subject: str | Any, expires_delta: timedelta | None = None) -> str:
+def create_access_token(subject: Optional[Any], expires_delta: Optional[timedelta] = None) -> str:
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
     payload = {"exp": expire, "sub": str(subject)}
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
-def decode_token(token: str) -> str | None:
+def decode_token(token: str) -> Optional[str]:
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         return payload.get("sub")

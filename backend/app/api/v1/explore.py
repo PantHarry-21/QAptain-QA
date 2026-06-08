@@ -12,7 +12,7 @@ from app.db.models import (
 from app.core.dependencies import get_current_user
 from app.schemas.explore import (
     ExploreStart, ExploreSessionResponse, ExploreLogResponse,
-    HumanDecisionRequest, HumanDecisionResponse, KnowledgeGraphResponse,
+    HumanDecisionRequest, HumanDecisionResponse, KnowledgeGraphResponse, ExploreDiscover
 )
 from app.explore.explore_engine import ExploreEngine
 
@@ -21,6 +21,41 @@ router = APIRouter()
 # Global registry of running explorer engines — allows cancel endpoint to signal them
 _running_explores: dict[str, ExploreEngine] = {}
 
+@router.post("/discover", response_model=ExploreSessionResponse, status_code=201)
+async def discover_modules(
+    payload: ExploreDiscover,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Application).where(Application.id == payload.application_id))
+    app = result.scalar_one_or_none()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    # Check for running session
+    running = await db.execute(
+        select(ExploreSession).where(
+            ExploreSession.application_id == payload.application_id,
+            ExploreSession.status == ExploreStatus.RUNNING,
+        )
+    )
+    if running.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Explore session already running for this application")
+
+    session = ExploreSession(
+        application_id=payload.application_id,
+        mode=ExploreMode.SMART,
+        status=ExploreStatus.PENDING,
+        triggered_by=current_user.id,
+    )
+    db.add(session)
+    await db.commit()
+
+    # Launch exploration in background for discovery only
+    background_tasks.add_task(_run_explore, session.id, app.id, discover_only=True)
+
+    return ExploreSessionResponse.model_validate(session)
 
 @router.post("/start", response_model=ExploreSessionResponse, status_code=201)
 async def start_explore(
@@ -54,7 +89,7 @@ async def start_explore(
     await db.commit()
 
     # Launch exploration in background
-    background_tasks.add_task(_run_explore, session.id, app.id)
+    background_tasks.add_task(_run_explore, session.id, app.id, discover_only=False, module_ids=payload.selected_module_ids)
 
     return ExploreSessionResponse.model_validate(session)
 
@@ -213,7 +248,7 @@ async def get_knowledge_graph(
     return KnowledgeGraphResponse.model_validate(kg)
 
 
-async def _run_explore(session_id: str, application_id: str):
+async def _run_explore(session_id: str, application_id: str, discover_only: bool = False, module_ids: list[str] = None):
     """Background task that runs the explore engine."""
     from app.db.session import AsyncSessionFactory
     async with AsyncSessionFactory() as db:
@@ -221,7 +256,7 @@ async def _run_explore(session_id: str, application_id: str):
         # Register engine so cancel endpoint can signal it
         _running_explores[session_id] = engine
         try:
-            await engine.run(session_id, application_id)
+            await engine.run(session_id, application_id, discover_only=discover_only, module_ids=module_ids)
         finally:
             # Unregister when done
             _running_explores.pop(session_id, None)

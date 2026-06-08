@@ -1,4 +1,5 @@
-﻿from fastapi import APIRouter, Depends, HTTPException, status
+from __future__ import annotations
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, delete as sql_delete, update as sql_update
 from slugify import slugify

@@ -246,20 +246,17 @@ class IntentOrchestrator:
         """Load the module name and URL from the scenario's associated module."""
         try:
             module_id = getattr(scenario, "module_id", None)
-            if module_id:
-                res = await self.db.execute(
-                    select(ApplicationModule)
-                    .where(ApplicationModule.id == module_id)
-                    .limit(1)
-                )
-                mod = res.scalar_one_or_none()
-                if mod:
-                    return (mod.name or ""), (mod.base_url or "")
-
-            # Fallback: attributes set on scenario during enrichment
-            name = getattr(scenario, "module_name", "") or ""
-            url  = getattr(scenario, "module_url",  "") or ""
-            return name, url
+            if not module_id:
+                return "", ""
+            res = await self.db.execute(
+                select(ApplicationModule)
+                .where(ApplicationModule.id == module_id)
+                .limit(1)
+            )
+            mod = res.scalar_one_or_none()
+            if mod:
+                return (mod.name or ""), (mod.url_pattern or "")
+            return "", ""
         except Exception:
             return "", ""
 

@@ -836,10 +836,14 @@ class QAReasoningEngine:
             )
             for el in el_result.scalars().all():
                 if el.semantic_label:
+                    _css = next(
+                        (s.get("value", "") for s in (el.selectors or []) if s.get("type") == "css"),
+                        "",
+                    )
                     known_elements.append({
                         "label": el.semantic_label,
                         "type": el.element_type,
-                        "css": el.css_selector or "",
+                        "css": _css,
                     })
 
         # Pages for the scenario module — with full form field details
@@ -935,36 +939,69 @@ class QAReasoningEngine:
 
     # ─── Prompt Construction ──────────────────────────────────────────────────
 
-    def _build_capability_context(self, scenario: Scenario, workflow_type: str, execution_mode: str) -> str:
+    def _build_capability_context(
+        self,
+        scenario: Scenario,
+        workflow_type: str,
+        execution_mode: str,
+        app_context: dict | None = None,
+    ) -> str:
         """
         Build capability engine context injected into the AI prompt.
 
-        This provides the AI with:
-        1. A concrete mandatory step checklist (phases + what to test) from the capability engine
+        Pulls module_name, module_url, and actual form field labels from the
+        already-loaded app_context so the capability engines produce entity-specific
+        step descriptions (e.g. "Fill 'Name' field" instead of "Fill Name|Title|Code").
+
+        Provides the AI with:
+        1. A mandatory step checklist (phases + what to test) from the capability engine
         2. Critical assertions — what business outcomes MUST be verified at checkpoints
-        3. Exact test data names to use (deterministic, not hallucinated)
+        3. Deterministic test data names consistent with EntityTracker convention
         """
         try:
             from app.capabilities.engine_registry import get_engine_registry
             registry = get_engine_registry()
-            ctx = registry.build_capability_context(
+
+            # Pull module context from the already-loaded app_context (avoids a second DB call)
+            module_name = ""
+            module_url = ""
+            form_fields: list[str] = []
+            if app_context:
+                sm = app_context.get("scenario_module") or {}
+                module_name = sm.get("name", "") or ""
+                module_url = sm.get("url", "") or ""
+                # Collect unique field labels from discovered forms — these become step hints
+                seen: set[str] = set()
+                for form in app_context.get("module_forms", [])[:4]:
+                    for fld in form.get("fields", [])[:10]:
+                        lbl = (fld.get("label") or "").strip()
+                        if lbl and lbl not in seen:
+                            seen.add(lbl)
+                            form_fields.append(lbl)
+
+            cap_ctx = registry.build_capability_context(
                 scenario_title=scenario.title,
                 scenario_description=scenario.description or "",
                 workflow_type=workflow_type,
-                module_name=getattr(scenario, "module_name", "") or "",
-                module_url=getattr(scenario, "module_url", "") or "",
+                module_name=module_name,
+                module_url=module_url,
                 execution_mode=execution_mode,
             )
-            assertion_ctx = registry.get_assertion_context(ctx)
-            entity = ctx.entity_name
+            # Inject real form fields — enables field-specific step hints in engines
+            cap_ctx.form_fields = form_fields
+
+            assertion_ctx = registry.get_assertion_context(cap_ctx)
+            entity = cap_ctx.entity_name
 
             lines = [
                 "\n════════════════════════════════════",
                 "CAPABILITY ENGINE — MANDATORY COVERAGE",
                 "════════════════════════════════════",
                 f"Primary Entity: {entity}",
+                f"Module: {module_name or 'N/A'}",
+                f"Module URL: {module_url or 'use the URL from MODULE context above'}",
                 f"Workflow: {workflow_type}",
-                f"Test Data: use '{entity}Test001' for creation, 'Updated{entity}001' for update",
+                f"Test Data: use 'Test{entity}001' for creation, 'Updated{entity}001' for update",
                 "",
             ]
 
@@ -1134,7 +1171,9 @@ Module Description: {m['description'] or 'N/A'}
         else:
             inferred_workflow = "BUSINESS_WORKFLOW"
 
-        capability_ctx = self._build_capability_context(scenario, inferred_workflow, execution_mode)
+        capability_ctx = self._build_capability_context(
+            scenario, inferred_workflow, execution_mode, app_context=ctx
+        )
 
         return f"""APPLICATION: {ctx['app_name']}
 Description: {ctx['app_description'] or 'Enterprise business application'}

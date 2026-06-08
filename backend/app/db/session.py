@@ -1,3 +1,4 @@
+from __future__ import annotations
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 
@@ -10,9 +11,12 @@ engine = create_async_engine(
     max_overflow=settings.DATABASE_MAX_OVERFLOW,
     echo=settings.DEBUG,
     future=True,
-    pool_pre_ping=True,       # test connections before use — catches stale/closed connections
-    pool_recycle=300,         # recycle connections every 5 min (Neon idles out around 5–10 min)
+    pool_pre_ping=True,
+    pool_recycle=300,
     pool_timeout=30,
+    # asyncpg + Neon direct endpoint: disable prepared-statement cache so
+    # connections work correctly without session-level state assumptions.
+    connect_args={"prepared_statement_cache_size": 0},
 )
 
 AsyncSessionFactory = async_sessionmaker(

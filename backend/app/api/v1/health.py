@@ -1,3 +1,4 @@
+from __future__ import annotations
 from fastapi import APIRouter
 from config import settings
 

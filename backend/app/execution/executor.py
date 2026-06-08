@@ -556,19 +556,45 @@ class ExecutionOrchestrator:
             if not selected:
                 break
 
-            # After every selection: look for Sign In / Submit and click it
+            # After every selection: click the submit/sign-in button.
+            # JS fast-scan first (instant, no Selenium timeouts) — avoids 42s×N waits
+            # from trying non-existent labels through the full healing strategy chain.
             await asyncio.sleep(0.8)
-            healer = SelfHealingEngine(browser.driver)
-            for btn_label in ("Sign In", "Login", "Continue", "Submit", "Proceed", "OK", "Next"):
-                btn_result = healer.find_element(btn_label)
-                if btn_result[0]:
-                    try:
-                        btn_result[0].click()
-                        await self._log(run_id, "INFO", "login",
-                            f"Clicked '{btn_label}' after context selection")
-                        break
-                    except Exception:
-                        pass
+            _submit_labels = ("Sign In", "Login", "OK", "Submit", "Continue",
+                              "Confirm", "Proceed", "Next", "Go", "Log In")
+            _clicked = browser.execute_script("""
+                var labs = arguments;
+                function vis(el){
+                    var r=el.getBoundingClientRect(),s=getComputedStyle(el);
+                    return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';
+                }
+                for(var i=0;i<labs.length;i++){
+                    var t=labs[i].toLowerCase();
+                    var els=document.querySelectorAll('button,[role="button"],input[type="submit"],a');
+                    for(var j=0;j<els.length;j++){
+                        var el=els[j];if(!vis(el))continue;
+                        var txt=(el.textContent||el.value||el.getAttribute('aria-label')||'').trim().toLowerCase();
+                        if(txt===t||txt.includes(t)){el.click();return labs[i];}
+                    }
+                }
+                return false;
+            """, *_submit_labels)
+            if _clicked:
+                await self._log(run_id, "INFO", "login",
+                    f"Clicked '{_clicked}' after context selection (JS fast-scan)")
+            else:
+                # Fallback: healer for top-2 most-likely labels only
+                healer = SelfHealingEngine(browser.driver)
+                for btn_label in ("Sign In", "Login"):
+                    btn_result = healer.find_element(btn_label)
+                    if btn_result[0]:
+                        try:
+                            btn_result[0].click()
+                            await self._log(run_id, "INFO", "login",
+                                f"Clicked '{btn_label}' after context selection (healer)")
+                            break
+                        except Exception:
+                            pass
 
             await asyncio.sleep(2)
 

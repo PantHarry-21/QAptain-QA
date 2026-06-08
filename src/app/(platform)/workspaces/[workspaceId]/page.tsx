@@ -68,6 +68,9 @@ export default function WorkspacePage() {
   // Explore
   const [startingExplore, setStartingExplore] = useState(false);
   const [exploreMode, setExploreMode] = useState<'SMART' | 'SKIP'>('SMART');
+  const [discoveryStatus, setDiscoveryStatus] = useState<'idle' | 'running' | 'completed'>('idle');
+  const [discoveredModules, setDiscoveredModules] = useState<Module[]>([]);
+  const [selectedModuleIds, setSelectedModuleIds] = useState<Set<string>>(new Set());
 
   // Settings
   const [settingsDesc, setSettingsDesc] = useState('');
@@ -348,9 +351,9 @@ export default function WorkspacePage() {
       // Reset form after success
       setDocModuleName('');
       setDocModuleUrl('');
-      setDocFile(null);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Upload failed');
+      console.error('Failed to import document', e);
+      setDocUploadResult({ imported: 0, module: 'Error' });
     } finally {
       setDocUploading(false);
     }
@@ -367,6 +370,7 @@ export default function WorkspacePage() {
       const session = await exploreApi.start({
         application_id: selectedApp.id,
         mode: exploreMode,
+        selected_module_ids: Array.from(selectedModuleIds),
       });
       router.push(`/workspaces/${workspaceId}/explore/${session.id}`);
     } catch (e) {
@@ -379,10 +383,40 @@ export default function WorkspacePage() {
           }
         } catch { /* fall through */ }
       }
-      console.error('Failed to start exploration', e);
-      toast.error(e instanceof Error ? e.message : 'Exploration failed to start');
+      toast.error(e instanceof Error ? e.message : 'Failed to start explore');
     } finally {
       setStartingExplore(false);
+    }
+  };
+
+  const handleStartDiscovery = async () => {
+    if (!selectedApp) return;
+    setDiscoveryStatus('running');
+    try {
+      const session = await exploreApi.discover({ application_id: selectedApp.id });
+      // Poll session status
+      const poll = setInterval(async () => {
+        try {
+          const s = await exploreApi.getSession(session.id);
+          if (s.status === 'COMPLETED' || s.status === 'STOPPED' || s.status === 'FAILED' || s.status === 'CANCELLED') {
+            clearInterval(poll);
+            if (s.status === 'COMPLETED') {
+              const modules = await applicationsApi.listModules(selectedApp.id);
+              setDiscoveredModules(modules);
+              setSelectedModuleIds(new Set(modules.map(m => m.id)));
+              setDiscoveryStatus('completed');
+            } else {
+              setDiscoveryStatus('idle');
+              toast.error(`Discovery ${s.status.toLowerCase()}`);
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }, 3000);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to start discovery');
+      setDiscoveryStatus('idle');
     }
   };
 
@@ -556,6 +590,11 @@ export default function WorkspacePage() {
                   setExploreMode={setExploreMode}
                   onStart={handleStartExplore}
                   loading={startingExplore}
+                  discoveryStatus={discoveryStatus}
+                  discoveredModules={discoveredModules}
+                  selectedModuleIds={selectedModuleIds}
+                  setSelectedModuleIds={setSelectedModuleIds}
+                  onStartDiscovery={handleStartDiscovery}
                 />
               )}
               {tab === 'scenarios' && (
@@ -912,17 +951,40 @@ function OverviewTab({ app, scenarios, reports, onRunScenario, onExploreClick, o
 
 // ─── Explore Tab ──────────────────────────────────────────────────────────────
 
-function ExploreTab({ app, exploreMode, setExploreMode, onStart, loading }: {
+function ExploreTab({
+  app, exploreMode, setExploreMode, onStart, loading,
+  discoveryStatus, discoveredModules, selectedModuleIds, setSelectedModuleIds, onStartDiscovery
+}: {
   app: Application;
   exploreMode: 'SMART' | 'SKIP';
   setExploreMode: (m: 'SMART' | 'SKIP') => void;
   onStart: () => void;
   loading: boolean;
+  discoveryStatus: 'idle' | 'running' | 'completed';
+  discoveredModules: Module[];
+  selectedModuleIds: Set<string>;
+  setSelectedModuleIds: (ids: Set<string>) => void;
+  onStartDiscovery: () => void;
 }) {
   const modes = [
     { id: 'SMART' as const, icon: '🔍', title: 'Smart Explore', desc: 'Complete application mapping — clicks every module, sub-module, and link. Builds full knowledge graph including forms, workflows, and test scenarios.', time: '15–45 min' },
     { id: 'SKIP' as const, icon: '🎯', title: 'Skip Explore', desc: 'Semantic runtime reasoning — no pre-exploration needed', time: 'Instant' },
   ];
+
+  const handleSelectAll = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.checked) {
+      setSelectedModuleIds(new Set(discoveredModules.map(m => m.id)));
+    } else {
+      setSelectedModuleIds(new Set());
+    }
+  };
+
+  const handleSelectModule = (id: string, checked: boolean) => {
+    const next = new Set(selectedModuleIds);
+    if (checked) next.add(id);
+    else next.delete(id);
+    setSelectedModuleIds(next);
+  };
 
   return (
     <div>
@@ -932,37 +994,105 @@ function ExploreTab({ app, exploreMode, setExploreMode, onStart, loading }: {
         After exploration finishes you will be taken directly to the Scenarios page.
       </p>
 
-      <div className="space-y-3 mb-6">
-        {modes.map((m) => (
-          <button
-            key={m.id}
-            onClick={() => setExploreMode(m.id)}
-            className={`w-full text-left p-4 rounded-xl border transition-all ${
-              exploreMode === m.id
-                ? 'border-blue-500 bg-blue-500/10 ring-1 ring-blue-500'
-                : 'border-zinc-800 bg-zinc-900 hover:border-zinc-700'
-            }`}
-          >
-            <div className="flex items-center justify-between mb-1">
-              <div className="flex items-center gap-2">
-                <span>{m.icon}</span>
-                <span className="font-medium text-white">{m.title}</span>
+      {discoveryStatus === 'idle' && (
+        <div className="space-y-3 mb-6">
+          {modes.map((m) => (
+            <button
+              key={m.id}
+              onClick={() => setExploreMode(m.id)}
+              className={`w-full text-left p-4 rounded-xl border transition-all ${
+                exploreMode === m.id
+                  ? 'border-blue-500 bg-blue-500/10 ring-1 ring-blue-500'
+                  : 'border-zinc-800 bg-zinc-900 hover:border-zinc-700'
+              }`}
+            >
+              <div className="flex items-center justify-between mb-1">
+                <div className="flex items-center gap-2">
+                  <span>{m.icon}</span>
+                  <span className="font-medium text-white">{m.title}</span>
+                </div>
+                <span className="text-xs text-zinc-500">{m.time}</span>
               </div>
-              <span className="text-xs text-zinc-500">{m.time}</span>
-            </div>
-            <p className="text-sm text-zinc-400 ml-6">{m.desc}</p>
-          </button>
-        ))}
-      </div>
+              <p className="text-sm text-zinc-400 ml-6">{m.desc}</p>
+            </button>
+          ))}
+        </div>
+      )}
 
-      <button
-        onClick={onStart}
-        disabled={loading}
-        className="px-6 py-2.5 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition-colors disabled:opacity-50 flex items-center gap-2"
-      >
-        {loading && <div className="animate-spin w-4 h-4 border-2 border-white/30 border-t-white rounded-full" />}
-        {exploreMode === 'SKIP' ? 'Go to Scenarios →' : 'Start Exploration'}
-      </button>
+      {exploreMode === 'SMART' && (
+        <>
+          {discoveryStatus === 'idle' && (
+            <button
+              onClick={onStartDiscovery}
+              className="px-6 py-2.5 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition-colors flex items-center gap-2"
+            >
+              Discover Modules
+            </button>
+          )}
+
+          {discoveryStatus === 'running' && (
+            <div className="flex flex-col items-center justify-center p-10 bg-zinc-900 border border-zinc-800 rounded-xl">
+              <div className="animate-spin w-8 h-8 border-4 border-blue-500/30 border-t-blue-500 rounded-full mb-4" />
+              <p className="text-white font-medium">Discovering URLs and modules...</p>
+              <p className="text-zinc-500 text-sm mt-1">This may take a minute as we map the application structure.</p>
+            </div>
+          )}
+
+          {discoveryStatus === 'completed' && (
+            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 mb-6">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-lg font-semibold text-white">Select Modules for Deep Exploration</h3>
+                <label className="flex items-center gap-2 text-sm text-zinc-400 cursor-pointer hover:text-white">
+                  <input
+                    type="checkbox"
+                    checked={selectedModuleIds.size === discoveredModules.length && discoveredModules.length > 0}
+                    onChange={handleSelectAll}
+                    className="rounded border-zinc-700 bg-zinc-800 text-blue-500 focus:ring-blue-500"
+                  />
+                  Select All
+                </label>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
+                {discoveredModules.map(m => (
+                  <label key={m.id} className="flex items-start gap-3 p-3 rounded-lg border border-zinc-800 bg-zinc-900/50 cursor-pointer hover:border-blue-500/50 hover:bg-zinc-800 transition-colors">
+                    <input
+                      type="checkbox"
+                      checked={selectedModuleIds.has(m.id)}
+                      onChange={(e) => handleSelectModule(m.id, e.target.checked)}
+                      className="mt-1 rounded border-zinc-700 bg-zinc-800 text-blue-500 focus:ring-blue-500"
+                    />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium text-white truncate">{m.name}</div>
+                      <div className="text-xs text-zinc-500 truncate">{m.url_pattern}</div>
+                    </div>
+                  </label>
+                ))}
+              </div>
+              <div className="mt-6 flex justify-end">
+                <button
+                  onClick={onStart}
+                  disabled={loading || selectedModuleIds.size === 0}
+                  className="px-6 py-2.5 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition-colors disabled:opacity-50 flex items-center gap-2"
+                >
+                  {loading && <div className="animate-spin w-4 h-4 border-2 border-white/30 border-t-white rounded-full" />}
+                  Start Deep Exploration ({selectedModuleIds.size})
+                </button>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {exploreMode === 'SKIP' && (
+        <button
+          onClick={onStart}
+          disabled={loading}
+          className="px-6 py-2.5 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition-colors disabled:opacity-50 flex items-center gap-2"
+        >
+          {loading && <div className="animate-spin w-4 h-4 border-2 border-white/30 border-t-white rounded-full" />}
+          Go to Scenarios →
+        </button>
+      )}
     </div>
   );
 }
