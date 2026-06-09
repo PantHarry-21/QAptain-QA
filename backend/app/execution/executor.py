@@ -21,6 +21,7 @@ from app.db.models import (
 )
 from app.execution.browser_manager import BrowserManager
 from app.execution.plan_runner import PlanRunner, StepExecutionResult
+from app.execution.guide_selector_cache import GuideSelectorCache
 from app.execution.self_healing import SelfHealingEngine
 from app.execution.validation_engine import ValidationEngine
 from app.execution.state_machine import WorkflowStateMachine
@@ -117,6 +118,34 @@ class ExecutionOrchestrator:
             "environment": env.name,
         })
 
+        # Load interaction guide selectors for fast element resolution during execution.
+        # Queries the AIMemoryChunk interaction guides for the scenario's module so
+        # PlanRunner can try guide-discovered selectors before falling back to self-healing.
+        guide_cache = GuideSelectorCache()
+        if scenario and scenario.module_id:
+            try:
+                from app.db.models import AIMemoryChunk, MemoryKind
+                guides_result = await self.db.execute(
+                    select(AIMemoryChunk).where(
+                        AIMemoryChunk.application_id == scenario.application_id,
+                        AIMemoryChunk.kind == MemoryKind.WORKFLOW,
+                    )
+                )
+                guide_texts = [
+                    chunk.content
+                    for chunk in guides_result.scalars().all()
+                    if (chunk.extra or {}).get("guide_type") == "interaction"
+                    and (chunk.extra or {}).get("module_id") == scenario.module_id
+                ]
+                if guide_texts:
+                    guide_cache = GuideSelectorCache.from_multiple(guide_texts)
+                    log.info("Guide selector cache loaded",
+                             run_id=run_id,
+                             selectors=len(guide_cache),
+                             module_id=scenario.module_id)
+            except Exception as _guide_err:
+                log.warning("Failed to load guide selectors", error=str(_guide_err)[:100])
+
         browser = None
         try:
             browser = BrowserManager.create(window_size=(1920, 1080))
@@ -140,6 +169,7 @@ class ExecutionOrchestrator:
                 test_data=test_data,
                 confidence=confidence,
                 observability=obs,
+                guide_selectors=guide_cache,
             )
 
             # ── IntentOrchestrator: build execution context ───────────────────
@@ -932,6 +962,8 @@ class ExecutionOrchestrator:
                 healing_triggered=result.healing_used,
                 healing_attempts=result.healing_attempts,
                 error_message=None if result.success else result.message,
+                # On failure: DOM summary + console errors + network state at moment of failure
+                state_after=result.failure_context if (not result.success and result.failure_context) else None,
             )
             self.db.add(db_step)
 
@@ -1041,6 +1073,18 @@ class ExecutionOrchestrator:
                 "workflow_type": plan_data.get("workflow_type", ""),
                 "test_strategy": plan_data.get("test_strategy", {}),
                 "checkpoint_validations": cp_results,
+                # Per-failure rich context: URL, DOM state, console errors, pending requests
+                "failure_contexts": [
+                    {
+                        "step": step.get("description", "")[:80],
+                        "action": step.get("action", ""),
+                        "phase": result.phase,
+                        "error": result.message[:200],
+                        "browser_state": result.failure_context,
+                    }
+                    for step, result in zip(plan_data.get("steps", []), results)
+                    if not result.success and result.failure_context
+                ],
             },
         )
         self.db.add(report)

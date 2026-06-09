@@ -7,14 +7,15 @@ from sqlalchemy import select
 from app.db.session import get_db
 from app.db.models import (
     User, Application, ExploreSession, ExploreLog, HumanDecision,
-    KnowledgeGraph, ExploreStatus,
+    KnowledgeGraph, ExploreStatus, ExploreMode, ApplicationModule,
 )
 from app.core.dependencies import get_current_user
 from app.schemas.explore import (
     ExploreStart, ExploreSessionResponse, ExploreLogResponse,
-    HumanDecisionRequest, HumanDecisionResponse, KnowledgeGraphResponse, ExploreDiscover
+    HumanDecisionRequest, HumanDecisionResponse, KnowledgeGraphResponse, ExploreDiscover, ExploreContinue
 )
 from app.explore.explore_engine import ExploreEngine
+from app.realtime.manager import connection_manager
 
 router = APIRouter()
 
@@ -48,6 +49,7 @@ async def discover_modules(
         mode=ExploreMode.SMART,
         status=ExploreStatus.PENDING,
         triggered_by=current_user.id,
+        discover_only=True,
     )
     db.add(session)
     await db.commit()
@@ -94,6 +96,34 @@ async def start_explore(
     return ExploreSessionResponse.model_validate(session)
 
 
+@router.post("/{session_id}/continue", response_model=ExploreSessionResponse)
+async def continue_session(
+    session_id: str,
+    payload: ExploreContinue,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Signal a WAITING_HUMAN discovery session to continue with user-selected modules."""
+    result = await db.execute(select(ExploreSession).where(ExploreSession.id == session_id))
+    session = result.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.status != ExploreStatus.WAITING_HUMAN:
+        raise HTTPException(status_code=409, detail="Session is not waiting for module selection")
+
+    session.selected_module_ids = payload.selected_module_ids
+    # Immediately mark as RUNNING so the frontend stops showing the module selection panel
+    # without waiting for the engine's 1-second polling cycle to detect the change.
+    session.status = ExploreStatus.RUNNING
+    await db.commit()
+    await connection_manager.broadcast_json({
+        "event": "explore_status_changed",
+        "session_id": session_id,
+        "status": "RUNNING",
+    })
+    return ExploreSessionResponse.model_validate(session)
+
+
 @router.get("/{session_id}", response_model=ExploreSessionResponse)
 async def get_session(
     session_id: str,
@@ -116,11 +146,9 @@ async def get_logs(
 ):
     query = select(ExploreLog).where(ExploreLog.session_id == session_id)
     if since_id:
-        # Return logs after the given id (for polling)
-        result_since = await db.execute(select(ExploreLog).where(ExploreLog.id == since_id))
-        since_log = result_since.scalar_one_or_none()
-        if since_log:
-            query = query.where(ExploreLog.timestamp > since_log.timestamp)
+        # Single-query cursor: use subquery to avoid a separate round trip
+        since_ts = select(ExploreLog.timestamp).where(ExploreLog.id == since_id).scalar_subquery()
+        query = query.where(ExploreLog.timestamp > since_ts)
     query = query.order_by(ExploreLog.timestamp)
     result = await db.execute(query)
     return [ExploreLogResponse.model_validate(l) for l in result.scalars().all()]
@@ -260,3 +288,87 @@ async def _run_explore(session_id: str, application_id: str, discover_only: bool
         finally:
             # Unregister when done
             _running_explores.pop(session_id, None)
+
+
+# ─── Change Detection & Feedback Loop ────────────────────────────────────────
+
+@router.get("/application/{application_id}/changes")
+async def detect_changes(
+    application_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Lightweight UI change detection: compare the current live application against
+    the stored interaction guides. Returns a ChangeReport describing what changed.
+    Does NOT require a running browser — performs structural diff of stored guides.
+    """
+    result = await db.execute(select(Application).where(Application.id == application_id))
+    app = result.scalar_one_or_none()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    from app.explore.change_detector import ChangeDetectionEngine
+    engine = ChangeDetectionEngine(db, browser=None)
+    report = await engine.scan_application(application_id)
+    return report.to_dict()
+
+
+@router.post("/application/{application_id}/refresh-module/{module_id}", response_model=ExploreSessionResponse, status_code=201)
+async def refresh_module(
+    application_id: str,
+    module_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Trigger a targeted re-exploration of a single module.
+    Useful after change detection identifies a module whose selectors have drifted.
+    Creates a new ExploreSession scoped to that module only.
+    """
+    app_result = await db.execute(select(Application).where(Application.id == application_id))
+    app = app_result.scalar_one_or_none()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    module_result = await db.execute(
+        select(ApplicationModule).where(
+            ApplicationModule.id == module_id,
+            ApplicationModule.application_id == application_id,
+        )
+    )
+    module = module_result.scalar_one_or_none()
+    if not module:
+        raise HTTPException(status_code=404, detail="Module not found")
+
+    # Check for running session
+    running = await db.execute(
+        select(ExploreSession).where(
+            ExploreSession.application_id == application_id,
+            ExploreSession.status == ExploreStatus.RUNNING,
+        )
+    )
+    if running.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Explore session already running for this application")
+
+    session = ExploreSession(
+        application_id=application_id,
+        mode=ExploreMode.SMART,
+        status=ExploreStatus.PENDING,
+        triggered_by=current_user.id,
+        discover_only=False,
+        selected_module_ids=[module_id],
+    )
+    db.add(session)
+    await db.commit()
+
+    background_tasks.add_task(
+        _run_explore,
+        session.id,
+        application_id,
+        discover_only=False,
+        module_ids=[module_id],
+    )
+
+    return ExploreSessionResponse.model_validate(session)

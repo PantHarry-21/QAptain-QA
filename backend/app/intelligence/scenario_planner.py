@@ -7,11 +7,12 @@ Architecture:
     → Classifies workflow type (CRUD, AUTH, ROLE_ACCESS, FORM_VALIDATION, SEARCH, NAVIGATION)
     → Auto-expands CRUD into 8 phases
     → Generates semantic validations + edge cases + checkpoint validations
-  - Fallback: deterministic plan when AI is unavailable
+  - Fallback: capability engine plan — deterministic, no AI, uses KG data
 
 AI is called ONCE per scenario — plan is cached and reused on re-runs.
 """
 from __future__ import annotations
+import time
 import json
 from typing import Any
 
@@ -28,6 +29,36 @@ from app.intelligence.qa_reasoning_engine import QAReasoningEngine
 from config import settings
 
 log = structlog.get_logger()
+
+
+def _detect_workflow_type(title: str, description: str = "") -> str:
+    """Detect workflow type from scenario title — mirrors QA engine classification."""
+    text = (title + " " + description).lower()
+    # AUTH is highest priority — very specific keywords
+    if any(w in text for w in ("login", "sign in", "logout", "auth", "credential", "session")):
+        return "AUTH"
+    # CRUD: if the scenario mentions create/edit/delete together, it's CRUD even if
+    # it also mentions export (e.g. "create edit export delete CRM record").
+    crud_signals = sum(1 for w in ("create", "edit", "delete", "add", "update") if w in text)
+    if crud_signals >= 2:
+        return "CRUD"
+    if any(w in text for w in ("search", "filter", "find record", "query")):
+        return "SEARCH_FILTER"
+    if any(w in text for w in ("pagination", "next page", "previous page", "paging")):
+        return "PAGINATION"
+    if any(w in text for w in ("sort", "ascending", "descending", "order by")):
+        return "SORTING"
+    if any(w in text for w in ("validation", "required field", "error message", "mandatory")):
+        return "FORM_VALIDATION"
+    if any(w in text for w in ("upload", "attach file", "import file")):
+        return "FILE_UPLOAD"
+    if any(w in text for w in ("export", "download", "csv", "excel", "pdf")):
+        return "EXPORT"
+    if any(w in text for w in ("access", "permission", "role", "restricted", "unauthorized")):
+        return "ROLE_ACCESS"
+    if any(w in text for w in ("navigate", "access module", "open page", "go to")):
+        return "NAVIGATION"
+    return "CRUD"  # safe default — covers most entity-management scenarios
 
 ALLOWED_ACTIONS = frozenset([
     "navigate", "click", "fill", "clear", "select", "key_press", "hover",
@@ -60,15 +91,31 @@ class ScenarioPlanner:
         Generate a comprehensive QA execution plan using the AI reasoning engine.
         The AI classifies the workflow type and generates an intelligent plan
         with phases, validations, edge cases, and checkpoint validations.
+
+        Falls back to the capability engine immediately when Azure is rate-limited
+        so the user is never blocked waiting on 429 retries.
         """
         caps = MODE_CAPS.get(execution_mode, MODE_CAPS["functional"])
+
+        # Pre-check Azure rate limiter — skip AI if we'd wait > 5 seconds.
+        if settings.AI_PROVIDER == "azure_openai":
+            from app.intelligence.azure_rate_limiter import get_azure_limiter
+            limiter = get_azure_limiter()
+            wait = limiter._next_allowed - time.monotonic()
+            if wait > 5.0:
+                log.warning(
+                    "Azure rate limiter active — using capability engine plan immediately",
+                    wait_seconds=round(wait, 1),
+                    scenario_id=scenario.id,
+                )
+                return await self.generate_fallback_plan(scenario, execution_mode)
 
         try:
             plan_data = await self._qa_engine.build_plan(scenario, execution_mode)
         except Exception as e:
-            log.error("QA reasoning engine failed — using fallback",
+            log.error("QA reasoning engine failed — using capability engine fallback",
                 error=str(e), scenario_id=scenario.id)
-            plan_data = self._fallback_plan(scenario)
+            return await self.generate_fallback_plan(scenario, execution_mode)
 
         plan_data = self._validate_and_cap(plan_data, caps["max_steps"])
 
@@ -105,28 +152,160 @@ class ScenarioPlanner:
     async def generate_fallback_plan(
         self, scenario: Scenario, execution_mode: str = "functional"
     ) -> ExecutionPlan:
-        """Fast plan generation — no AI call. Used for batch queuing."""
-        plan_data = self._fallback_plan(scenario)
+        """
+        Capability-engine plan — no AI call.
+        Uses KG data (module URL, form fields) + deterministic capability steps.
+        Produces a real, runnable test plan even when Azure is unavailable.
+        """
+        from app.capabilities.engine_registry import get_engine_registry
+
         caps = MODE_CAPS.get(execution_mode, MODE_CAPS["functional"])
+
+        # Load module context from DB
+        module_url = "/"
+        module_name = ""
+        form_fields: list[str] = []
+
+        if scenario.module_id:
+            mod_result = await self.db.execute(
+                select(ApplicationModule).where(ApplicationModule.id == scenario.module_id)
+            )
+            mod = mod_result.scalar_one_or_none()
+            if mod:
+                module_url = mod.url_pattern or "/"
+                module_name = mod.name or ""
+                # If url_pattern is empty, try the first page URL for this module
+                if module_url == "/":
+                    first_page = await self.db.execute(
+                        select(ApplicationPage)
+                        .where(ApplicationPage.module_id == scenario.module_id)
+                        .limit(1)
+                    )
+                    fp = first_page.scalar_one_or_none()
+                    if fp:
+                        module_url = fp.url or "/"
+
+            pages_result = await self.db.execute(
+                select(ApplicationPage)
+                .where(ApplicationPage.module_id == scenario.module_id)
+                .limit(4)
+            )
+            seen_fields: set[str] = set()
+            for page in pages_result.scalars().all():
+                for form in (page.forms or [])[:2]:
+                    for fld in form.get("fields", [])[:10]:
+                        lbl = (fld.get("label") or "").strip()
+                        if lbl and lbl not in seen_fields:
+                            seen_fields.add(lbl)
+                            form_fields.append(lbl)
+
+        # Detect workflow type + run capability engine
+        workflow_type = _detect_workflow_type(scenario.title, scenario.description or "")
+        registry = get_engine_registry()
+        cap_ctx = registry.build_capability_context(
+            scenario_title=scenario.title,
+            scenario_description=scenario.description or "",
+            workflow_type=workflow_type,
+            module_name=module_name,
+            module_url=module_url,
+            execution_mode=execution_mode,
+        )
+        cap_ctx.form_fields = form_fields
+
+        steps_by_cat = registry.generate_capability_steps(cap_ctx)
+
+        # Navigate to the module first if we have a URL
+        nav_steps: list[dict] = []
+        if module_url and module_url != "/":
+            nav_steps = [
+                {
+                    "action": "navigate",
+                    "target": "",
+                    "value": "",
+                    "url": module_url,
+                    "description": f"Navigate to {module_name or 'module'}",
+                    "phase": "SETUP",
+                    "business_intent": "Navigate to target module",
+                    "timeout_ms": 15000,
+                    "on_fail": "fail",
+                    "checkpoint": False,
+                },
+                {
+                    "action": "wait_ms",
+                    "target": "",
+                    "value": "",
+                    "url": "",
+                    "description": "Wait for SPA to render",
+                    "ms": 2000,
+                    "phase": "SETUP",
+                    "business_intent": "Allow route change to complete",
+                    "timeout_ms": 5000,
+                    "on_fail": "skip",
+                    "checkpoint": False,
+                },
+            ]
+
+        # Combine: positive happy-path steps + limited negative tests
+        positive = steps_by_cat.get("positive", [])
+        negative = steps_by_cat.get("negative", [])[:5]
+        remaining = caps["max_steps"] - len(nav_steps)
+        combined = (positive + negative)[:remaining]
+        all_steps = nav_steps + combined
+
+        plan_data = {
+            "workflow": workflow_type,
+            "workflow_type": workflow_type,
+            "goal": f"Verify {scenario.title} works as expected",
+            "qa_reasoning": (
+                f"Capability engine plan — AI unavailable (rate limited or error). "
+                f"Engine: {workflow_type}, steps: {len(all_steps)}, "
+                f"module: {module_name or 'unknown'}"
+            ),
+            "test_strategy": {
+                "phases": list(dict.fromkeys(
+                    s.get("phase", "") for s in all_steps if s.get("phase")
+                )),
+                "primary_operation": workflow_type.lower(),
+                "validations": ["Module loads", "Operations complete successfully"],
+                "negative_tests": [s.get("description", "") for s in negative[:3]],
+            },
+            "steps": all_steps,
+            "checkpoint_validations": [],
+            "semantic_intent": {
+                "module": module_name,
+                "operation": workflow_type.lower(),
+                "pass_criteria": "All steps complete without errors",
+                "fail_criteria": "Any critical step fails",
+            },
+        }
+
         plan_data = self._validate_and_cap(plan_data, caps["max_steps"])
 
         plan = ExecutionPlan(
             scenario_id=scenario.id,
             execution_mode=execution_mode,
             plan_data=plan_data,
-            ai_reasoning="Fallback plan — AI reasoning deferred to execution time",
-            semantic_intent={},
-            workflow_stages=[],
-            risk_score=5,
+            ai_reasoning=plan_data["qa_reasoning"],
+            semantic_intent=plan_data.get("semantic_intent", {}),
+            workflow_stages=self._extract_workflow_stages(plan_data),
+            risk_score=self._calculate_risk(plan_data, execution_mode),
             estimated_duration_seconds=len(plan_data.get("steps", [])) * 5,
-            created_by_model="fallback",
+            created_by_model="capability_engine",
         )
+
         latest = await self._latest_plan_version(scenario.id)
         if latest:
             plan.version = latest.version + 1
 
         self.db.add(plan)
         await self.db.commit()
+
+        log.info("Capability-engine fallback plan generated",
+            plan_id=plan.id,
+            workflow_type=workflow_type,
+            steps=len(plan_data.get("steps", [])),
+            module_url=module_url,
+        )
         return plan
 
     # ─── Helpers ──────────────────────────────────────────────────────────────

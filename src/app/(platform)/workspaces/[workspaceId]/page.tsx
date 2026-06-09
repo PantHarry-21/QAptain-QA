@@ -12,10 +12,9 @@ import {
   reports as reportsApi,
   executions as executionsApi,
   type Application,
+  type Module,
   type Scenario,
-  type ExploreSession,
   type ReportSummary,
-  type BatchRun,
   type BatchHistory,
 } from '@/lib/api';
 import { getSocket } from '@/lib/websocket';
@@ -69,7 +68,6 @@ export default function WorkspacePage() {
   const [startingExplore, setStartingExplore] = useState(false);
   const [exploreMode, setExploreMode] = useState<'SMART' | 'SKIP'>('SMART');
   const [discoveryStatus, setDiscoveryStatus] = useState<'idle' | 'running' | 'completed'>('idle');
-  const [discoveredModules, setDiscoveredModules] = useState<Module[]>([]);
   const [selectedModuleIds, setSelectedModuleIds] = useState<Set<string>>(new Set());
 
   // Settings
@@ -112,6 +110,15 @@ export default function WorkspacePage() {
       offExploreCompleted();
     };
   }, []);
+
+  // When user opens the Explore tab, redirect to any already-running session
+  useEffect(() => {
+    if (tab === 'explore' && selectedApp) {
+      exploreApi.getActiveSession(selectedApp.id).then((active) => {
+        if (active) router.push(`/workspaces/${workspaceId}/explore/${active.id}`);
+      }).catch(() => {});
+    }
+  }, [tab, selectedApp?.id]);
 
   useEffect(() => {
     if (selectedApp) {
@@ -394,27 +401,17 @@ export default function WorkspacePage() {
     setDiscoveryStatus('running');
     try {
       const session = await exploreApi.discover({ application_id: selectedApp.id });
-      // Poll session status
-      const poll = setInterval(async () => {
-        try {
-          const s = await exploreApi.getSession(session.id);
-          if (s.status === 'COMPLETED' || s.status === 'STOPPED' || s.status === 'FAILED' || s.status === 'CANCELLED') {
-            clearInterval(poll);
-            if (s.status === 'COMPLETED') {
-              const modules = await applicationsApi.listModules(selectedApp.id);
-              setDiscoveredModules(modules);
-              setSelectedModuleIds(new Set(modules.map(m => m.id)));
-              setDiscoveryStatus('completed');
-            } else {
-              setDiscoveryStatus('idle');
-              toast.error(`Discovery ${s.status.toLowerCase()}`);
-            }
-          }
-        } catch {
-          // ignore
-        }
-      }, 3000);
+      router.push(`/workspaces/${workspaceId}/explore/${session.id}`);
     } catch (e) {
+      if (e instanceof Error && e.message.includes('already running')) {
+        try {
+          const active = await exploreApi.getActiveSession(selectedApp.id);
+          if (active) {
+            router.push(`/workspaces/${workspaceId}/explore/${active.id}`);
+            return;
+          }
+        } catch { /* fall through */ }
+      }
       toast.error(e instanceof Error ? e.message : 'Failed to start discovery');
       setDiscoveryStatus('idle');
     }
@@ -504,8 +501,7 @@ export default function WorkspacePage() {
                 key={app.id}
                 onClick={() => {
                   setSelectedApp(app);
-                  loadScenarios(app.id);
-                  loadReports(app.id);
+                  Promise.all([loadScenarios(app.id), loadReports(app.id), loadEnv(app.id)]);
                 }}
                 className={`w-full text-left px-3 py-2 rounded-lg text-sm transition-colors ${
                   selectedApp?.id === app.id
@@ -591,9 +587,6 @@ export default function WorkspacePage() {
                   onStart={handleStartExplore}
                   loading={startingExplore}
                   discoveryStatus={discoveryStatus}
-                  discoveredModules={discoveredModules}
-                  selectedModuleIds={selectedModuleIds}
-                  setSelectedModuleIds={setSelectedModuleIds}
                   onStartDiscovery={handleStartDiscovery}
                 />
               )}
@@ -953,7 +946,7 @@ function OverviewTab({ app, scenarios, reports, onRunScenario, onExploreClick, o
 
 function ExploreTab({
   app, exploreMode, setExploreMode, onStart, loading,
-  discoveryStatus, discoveredModules, selectedModuleIds, setSelectedModuleIds, onStartDiscovery
+  discoveryStatus, onStartDiscovery
 }: {
   app: Application;
   exploreMode: 'SMART' | 'SKIP';
@@ -961,30 +954,12 @@ function ExploreTab({
   onStart: () => void;
   loading: boolean;
   discoveryStatus: 'idle' | 'running' | 'completed';
-  discoveredModules: Module[];
-  selectedModuleIds: Set<string>;
-  setSelectedModuleIds: (ids: Set<string>) => void;
   onStartDiscovery: () => void;
 }) {
   const modes = [
     { id: 'SMART' as const, icon: '🔍', title: 'Smart Explore', desc: 'Complete application mapping — clicks every module, sub-module, and link. Builds full knowledge graph including forms, workflows, and test scenarios.', time: '15–45 min' },
     { id: 'SKIP' as const, icon: '🎯', title: 'Skip Explore', desc: 'Semantic runtime reasoning — no pre-exploration needed', time: 'Instant' },
   ];
-
-  const handleSelectAll = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.checked) {
-      setSelectedModuleIds(new Set(discoveredModules.map(m => m.id)));
-    } else {
-      setSelectedModuleIds(new Set());
-    }
-  };
-
-  const handleSelectModule = (id: string, checked: boolean) => {
-    const next = new Set(selectedModuleIds);
-    if (checked) next.add(id);
-    else next.delete(id);
-    setSelectedModuleIds(next);
-  };
 
   return (
     <div>
@@ -1034,50 +1009,7 @@ function ExploreTab({
             <div className="flex flex-col items-center justify-center p-10 bg-zinc-900 border border-zinc-800 rounded-xl">
               <div className="animate-spin w-8 h-8 border-4 border-blue-500/30 border-t-blue-500 rounded-full mb-4" />
               <p className="text-white font-medium">Discovering URLs and modules...</p>
-              <p className="text-zinc-500 text-sm mt-1">This may take a minute as we map the application structure.</p>
-            </div>
-          )}
-
-          {discoveryStatus === 'completed' && (
-            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 mb-6">
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="text-lg font-semibold text-white">Select Modules for Deep Exploration</h3>
-                <label className="flex items-center gap-2 text-sm text-zinc-400 cursor-pointer hover:text-white">
-                  <input
-                    type="checkbox"
-                    checked={selectedModuleIds.size === discoveredModules.length && discoveredModules.length > 0}
-                    onChange={handleSelectAll}
-                    className="rounded border-zinc-700 bg-zinc-800 text-blue-500 focus:ring-blue-500"
-                  />
-                  Select All
-                </label>
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
-                {discoveredModules.map(m => (
-                  <label key={m.id} className="flex items-start gap-3 p-3 rounded-lg border border-zinc-800 bg-zinc-900/50 cursor-pointer hover:border-blue-500/50 hover:bg-zinc-800 transition-colors">
-                    <input
-                      type="checkbox"
-                      checked={selectedModuleIds.has(m.id)}
-                      onChange={(e) => handleSelectModule(m.id, e.target.checked)}
-                      className="mt-1 rounded border-zinc-700 bg-zinc-800 text-blue-500 focus:ring-blue-500"
-                    />
-                    <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium text-white truncate">{m.name}</div>
-                      <div className="text-xs text-zinc-500 truncate">{m.url_pattern}</div>
-                    </div>
-                  </label>
-                ))}
-              </div>
-              <div className="mt-6 flex justify-end">
-                <button
-                  onClick={onStart}
-                  disabled={loading || selectedModuleIds.size === 0}
-                  className="px-6 py-2.5 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition-colors disabled:opacity-50 flex items-center gap-2"
-                >
-                  {loading && <div className="animate-spin w-4 h-4 border-2 border-white/30 border-t-white rounded-full" />}
-                  Start Deep Exploration ({selectedModuleIds.size})
-                </button>
-              </div>
+              <p className="text-zinc-500 text-sm mt-1">Redirecting to the exploration session where you can select modules.</p>
             </div>
           )}
         </>

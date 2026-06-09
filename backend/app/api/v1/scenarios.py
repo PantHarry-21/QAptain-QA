@@ -802,7 +802,10 @@ async def generate_execution_plan(
             .limit(1)
         )
         existing_plan = existing.scalar_one_or_none()
-        if existing_plan:
+        # Only reuse AI-generated plans. Capability-engine and fallback plans are
+        # always regenerated — the engines improve over time and cached plans may
+        # have stale entity names, bad selectors, etc.
+        if existing_plan and existing_plan.created_by_model not in ("fallback", "capability_engine"):
             return ExecutionPlanResponse.model_validate(existing_plan)
 
     planner = ScenarioPlanner(db)

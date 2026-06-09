@@ -237,6 +237,12 @@ class EngineRegistry:
 
         # ── 1. Module name is always most reliable ────────────────────────────
         if module_name:
+            # Prefer the first all-caps acronym in the module name (e.g. "CRM" from
+            # "CRM Working Standard") — it's the primary entity identifier and is
+            # short enough to appear verbatim in UI labels and test data names.
+            acronyms = re.findall(r'\b[A-Z]{2,}\b', module_name)
+            if acronyms:
+                return acronyms[0]   # "CRM", "PO", "HR", etc.
             result = _to_camel(module_name)
             if result:
                 return result

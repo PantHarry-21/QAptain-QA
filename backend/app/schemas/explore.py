@@ -1,6 +1,6 @@
 from __future__ import annotations
 from datetime import datetime
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from typing import Any
 
 from app.db.models import ExploreMode, ExploreStatus
@@ -14,13 +14,22 @@ class ExploreStart(BaseModel):
 class ExploreDiscover(BaseModel):
     application_id: str
 
+class ExploreContinue(BaseModel):
+    selected_module_ids: list[str]
+
 
 class ExploreSessionResponse(BaseModel):
     id: str
     application_id: str
     mode: str
     status: str
+    discover_only: bool = False
     started_at: datetime | None
+
+    @field_validator('discover_only', mode='before')
+    @classmethod
+    def _coerce_none_to_false(cls, v: object) -> bool:
+        return bool(v) if v is not None else False
     completed_at: datetime | None
     pages_discovered: int
     modules_discovered: int
@@ -82,9 +91,15 @@ class ModuleResponse(BaseModel):
     description: str | None
     url_pattern: str | None
     icon: str | None
+    is_accordion: bool = False
     semantic_tags: list[str]
     pages_count: int = 0
     workflows_count: int = 0
+
+    @field_validator('is_accordion', mode='before')
+    @classmethod
+    def _coerce_accordion(cls, v: object) -> bool:
+        return bool(v) if v is not None else False
 
     class Config:
         from_attributes = True

@@ -117,7 +117,7 @@ class BatchExecutionOrchestrator:
                 continue
 
             if pre_idx > 0:
-                await asyncio.sleep(20)   # rate-limit cooldown between scenarios (Azure 429 recovery needs ~20s)
+                await asyncio.sleep(35)   # rate-limit cooldown between scenarios (Azure TPM quota resets every ~60s)
 
             # Try to generate a real AI plan — up to 3 attempts with cooldown on retry
             MAX_ATTEMPTS = 3

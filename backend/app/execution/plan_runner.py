@@ -27,6 +27,7 @@ from selenium.common.exceptions import TimeoutException
 from app.execution.browser_manager import BrowserManager
 from app.execution.self_healing import SelfHealingEngine
 from app.execution.entity_tracker import EntityTracker
+from app.execution.guide_selector_cache import GuideSelectorCache
 from app.intelligence.semantic_extractor import SemanticUIExtractor
 
 log = structlog.get_logger()
@@ -44,6 +45,7 @@ class StepExecutionResult:
     checkpoint_result: dict | None = None  # AI validation result if step was a checkpoint
     phase: str = ""
     business_intent: str = ""
+    failure_context: dict | None = None   # DOM+console+network snapshot captured on failure
 
 
 class PlanRunner:
@@ -76,6 +78,7 @@ class PlanRunner:
         test_data=None,           # Optional[TestDataEngine]
         confidence=None,          # Optional[ConfidenceEngine]
         observability=None,       # Optional[ObservabilityLayer]
+        guide_selectors: GuideSelectorCache | None = None,
     ):
         self.browser = browser
         self.base_url = base_url
@@ -91,6 +94,7 @@ class PlanRunner:
         self.observability = observability
         self.healer = SelfHealingEngine(browser.driver)
         self.extractor = SemanticUIExtractor(browser.driver)
+        self.guide_selectors: GuideSelectorCache = guide_selectors or GuideSelectorCache()
         self.entity_tracker: EntityTracker | None = None   # set by IntentOrchestrator
         self._step_counter = 0
         self._current_phase = ""
@@ -358,6 +362,19 @@ class PlanRunner:
             )
 
         result.duration_ms = int((time.monotonic() - start) * 1000)
+
+        # On failure: capture rich browser context for diagnosis
+        if not result.success:
+            try:
+                result.failure_context = await asyncio.to_thread(
+                    self.browser.capture_failure_context
+                )
+                # Take a failure screenshot if not already taken
+                if not result.screenshot_path:
+                    result.screenshot_path = self._take_step_screenshot("failure")
+            except Exception:
+                pass
+
         return result
 
     async def _dispatch_action(self, action: str, step: dict) -> StepExecutionResult:
@@ -463,9 +480,30 @@ class PlanRunner:
         except Exception as e:
             return StepExecutionResult(success=False, message=f"Navigation failed: {e}")
 
+    def _try_guide_element(self, target: str):
+        """
+        Attempt to find a WebElement using the guide selector cache.
+        Returns (element, css_selector) or (None, None) if no match.
+        """
+        css = self.guide_selectors.lookup(target)
+        if not css:
+            return None, None
+        try:
+            element = WebDriverWait(self.browser.driver, 2).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, css))
+            )
+            return element, css
+        except Exception:
+            return None, None
+
     async def _action_click(self, step: dict) -> StepExecutionResult:
         target = step.get("target", step.get("label", step.get("text", "")))
         element_type = step.get("element_type")
+        # Detect submit-like clicks so we can wait for network idle afterward
+        _is_submit = step.get("is_submit", False) or any(
+            kw in (target or "").lower()
+            for kw in ("save", "submit", "create", "add", "confirm", "apply", "update", "delete", "ok", "yes")
+        )
 
         # Try stored selectors first
         for sel in step.get("selectors", []):
@@ -476,7 +514,7 @@ class PlanRunner:
                 )
                 success, method = self.healer.click_with_healing(element)
                 if success:
-                    await self._async_settle()
+                    await self._async_settle(wait_network=_is_submit)
                     return StepExecutionResult(
                         success=True,
                         message=f"Clicked '{target}' via stored selector",
@@ -484,6 +522,21 @@ class PlanRunner:
                     )
             except Exception:
                 continue
+
+        # Guide selector cache — uses selectors discovered during live exploration
+        guide_el, guide_css = self._try_guide_element(target)
+        if guide_el is not None:
+            try:
+                success, method = self.healer.click_with_healing(guide_el)
+                if success:
+                    await self._async_settle(wait_network=_is_submit)
+                    return StepExecutionResult(
+                        success=True,
+                        message=f"Clicked '{target}' via guide selector ({guide_css})",
+                        screenshot_path=self._take_step_screenshot(),
+                    )
+            except Exception:
+                pass  # fall through to self-healing
 
         # Semantic resolution via self-healer
         result_tuple = self.healer.find_element(target, element_type)
@@ -498,7 +551,7 @@ class PlanRunner:
             )
 
         success, method = self.healer.click_with_healing(element)
-        await self._async_settle()
+        await self._async_settle(wait_network=_is_submit and success)
         return StepExecutionResult(
             success=success,
             message=f"Clicked '{target}' via {strategy}/{method}",
@@ -511,8 +564,13 @@ class PlanRunner:
         target = step.get("target", step.get("field", ""))
         value = step.get("value", "")
 
-        result_tuple = self.healer.find_element(target, "textbox")
-        element, strategy, attempts = result_tuple
+        # Guide selector lookup before self-healing
+        guide_el, guide_css = self._try_guide_element(target)
+        if guide_el is not None:
+            element, strategy, attempts = guide_el, "guide_selector", []
+        else:
+            result_tuple = self.healer.find_element(target, "textbox")
+            element, strategy, attempts = result_tuple
 
         if element is None:
             return StepExecutionResult(
@@ -620,8 +678,13 @@ class PlanRunner:
         target = step.get("target", "")
         value = step.get("value", "")
 
-        result_tuple = self.healer.find_element(target, "dropdown")
-        element, strategy, attempts = result_tuple
+        # Guide selector lookup before self-healing
+        guide_el, guide_css = self._try_guide_element(target)
+        if guide_el is not None:
+            element, strategy, attempts = guide_el, "guide_selector", []
+        else:
+            result_tuple = self.healer.find_element(target, "dropdown")
+            element, strategy, attempts = result_tuple
 
         if element is None:
             return await self._handle_custom_dropdown(target, value, attempts)
@@ -888,23 +951,31 @@ class PlanRunner:
 
     async def _action_wait_network(self, step: dict) -> StepExecutionResult:
         url_substring = step.get("url_substring", "")
-        timeout = step.get("timeout_ms", 15000) / 1000
-        deadline = time.monotonic() + timeout
+        timeout = step.get("timeout_ms", 10000) / 1000
 
-        while time.monotonic() < deadline:
-            events = self.browser.get_network_events()
-            for event in events:
-                if not url_substring or url_substring.lower() in event.get("url", "").lower():
-                    return StepExecutionResult(
-                        success=True,
-                        message=f"Network activity detected" + (f" matching '{url_substring}'" if url_substring else "")
-                    )
-            await asyncio.sleep(0.5)
-
-        return StepExecutionResult(
-            success=False,
-            message=f"No network activity{f' matching {url_substring}' if url_substring else ''} within {timeout:.0f}s",
-        )
+        if url_substring:
+            # Wait for a specific URL pattern in performance log events
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                events = self.browser.get_network_events()
+                for event in events:
+                    if url_substring.lower() in event.get("url", "").lower():
+                        return StepExecutionResult(
+                            success=True,
+                            message=f"Network activity detected matching '{url_substring}'",
+                        )
+                await asyncio.sleep(0.5)
+            return StepExecutionResult(
+                success=False,
+                message=f"No network activity matching '{url_substring}' within {timeout:.0f}s",
+            )
+        else:
+            # Wait for all in-flight requests to complete (network idle)
+            idle = await asyncio.to_thread(self.browser.wait_network_idle, timeout)
+            return StepExecutionResult(
+                success=idle,
+                message="Network idle reached" if idle else f"Network did not idle within {timeout:.0f}s",
+            )
 
     async def _action_wait_element(self, step: dict) -> StepExecutionResult:
         target = step.get("target", "")
@@ -1041,8 +1112,11 @@ class PlanRunner:
         except Exception:
             pass
 
-    async def _async_settle(self, min_wait: float = 0.3):
-        """Async version of DOM settle — use inside async action handlers."""
+    async def _async_settle(self, min_wait: float = 0.3, wait_network: bool = False):
+        """
+        Async DOM settle — waits for DOM mutations to calm down.
+        When wait_network=True (e.g. after form submit), also waits for XHR/fetch idle.
+        """
         await asyncio.sleep(min_wait)
         try:
             before = await asyncio.to_thread(
@@ -1056,6 +1130,9 @@ class PlanRunner:
                 await asyncio.sleep(0.4)
         except Exception:
             pass
+        # Network-idle check — waits for any in-flight XHR/fetch to complete
+        if wait_network:
+            await asyncio.to_thread(self.browser.wait_network_idle, 6.0)
 
     def _emit(self, event: str, data: dict):
         try:

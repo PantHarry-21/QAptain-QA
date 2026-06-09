@@ -209,6 +209,12 @@ export const explore = {
   getActiveSession: (applicationId: string) =>
     request<ExploreSession | null>(`/explore/application/${applicationId}/active`),
 
+  continueSession: (sessionId: string, data: { selected_module_ids: string[] }) =>
+    request<ExploreSession>(`/explore/${sessionId}/continue`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
   cancelSession: (sessionId: string) =>
     request<ExploreSession>(`/explore/${sessionId}/cancel`, { method: 'POST' }),
 };
@@ -392,6 +398,8 @@ export interface Module {
   description?: string;
   url_pattern?: string;
   icon?: string;
+  is_accordion: boolean;
+  parent_id?: string | null;
   semantic_tags: string[];
 }
 
@@ -420,6 +428,7 @@ export interface ExploreSession {
   application_id: string;
   mode: ExploreMode;
   status: 'PENDING' | 'RUNNING' | 'PAUSED' | 'WAITING_HUMAN' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+  discover_only: boolean;
   started_at?: string;
   completed_at?: string;
   pages_discovered: number;

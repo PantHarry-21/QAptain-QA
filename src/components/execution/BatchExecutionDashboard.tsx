@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { executions as executionsApi, type ExecutionRun } from '@/lib/api';
 import { getSocket } from '@/lib/websocket';
 import { ExecutionDashboard } from './ExecutionDashboard';
@@ -32,6 +32,9 @@ export function BatchExecutionDashboard({ items }: BatchExecutionDashboardProps)
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [batchError, setBatchError] = useState<string | null>(null);
   const socket = getSocket();
+  // Stable ref so the polling closure always sees the latest runs without re-registering
+  const runsRef = useRef<Record<string, ExecutionRun>>({});
+  runsRef.current = runs;
 
   // Initial load
   useEffect(() => {
@@ -48,10 +51,10 @@ export function BatchExecutionDashboard({ items }: BatchExecutionDashboardProps)
     loadAll();
   }, []);
 
-  // Poll active runs every 3s
+  // Poll active runs every 3s — dep array excludes `runs` to avoid re-registering on each update
   useEffect(() => {
     const poll = async () => {
-      const activeIds = items.filter(i => isActive(runs[i.run_id]?.status)).map(i => i.run_id);
+      const activeIds = items.filter(i => isActive(runsRef.current[i.run_id]?.status)).map(i => i.run_id);
       if (activeIds.length === 0) return;
       const results = await Promise.allSettled(activeIds.map(id => executionsApi.get(id)));
       setRuns(prev => {
@@ -64,7 +67,7 @@ export function BatchExecutionDashboard({ items }: BatchExecutionDashboardProps)
     };
     const timer = setInterval(poll, 3000);
     return () => clearInterval(timer);
-  }, [runs, items]);
+  }, [items]);
 
   // WebSocket updates
   useEffect(() => {

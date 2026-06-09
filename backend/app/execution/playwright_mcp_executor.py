@@ -38,14 +38,16 @@ from app.db.models import (
     ExecutionRun, ExecutionStep, ExecutionLog, ExecutionPlan,
     Environment, Credential, Application, Scenario, ExecutionReport,
     ExecutionStatus, StepStatus, RiskLevel,
+    ApplicationModule, ApplicationPage, AIMemoryChunk, MemoryKind,
 )
 from app.core.security import decrypt_credential
 from app.realtime.manager import connection_manager
+from app.intelligence.azure_rate_limiter import get_azure_limiter
 from config import settings
 
 log = structlog.get_logger()
 
-MAX_ITERATIONS = 60          # Max AI turns per run
+MAX_ITERATIONS = 30          # Max AI turns per run
 STEP_TIMEOUT_MS = 10_000     # Per-action timeout for Playwright
 NAV_WAIT_MS = 2_000          # Extra wait after navigation for SPAs
 
@@ -289,6 +291,14 @@ class PlaywrightMCPExecutor:
         credential = await self._load_credential(run.credential_id, app_id)
         cred_data  = await self._decrypt_credential(credential)
 
+        # Load exploration-built KG context (interaction guide, module URL, form fields)
+        kg_context = await self._load_kg_context(scenario)
+        if kg_context.get("module_url"):
+            log.info("KG context loaded", run_id=run_id,
+                     module=kg_context.get("module_name"),
+                     guide_chars=len(kg_context.get("interaction_guide", "")),
+                     form_fields=len(kg_context.get("form_fields", [])))
+
         run.status     = ExecutionStatus.RUNNING
         run.started_at = datetime.utcnow()
         await self.db.commit()
@@ -319,7 +329,7 @@ class PlaywrightMCPExecutor:
                 page = await context.new_page()
 
                 passed, steps_taken = await self._run_agentic_loop(
-                    page, run, scenario, plan, env, cred_data
+                    page, run, scenario, plan, env, cred_data, kg_context
                 )
 
                 await browser.close()
@@ -357,12 +367,13 @@ class PlaywrightMCPExecutor:
         plan: ExecutionPlan | None,
         env: Environment,
         cred_data: dict,
+        kg_context: dict | None = None,
     ) -> tuple[bool, list[dict]]:
         """
         Main agentic loop. Returns (passed: bool, steps: list[dict]).
         Each iteration: AI response → tool calls → execute → feed results back.
         """
-        system_prompt = self._build_system_prompt(scenario, plan, env, cred_data)
+        system_prompt = self._build_system_prompt(scenario, plan, env, cred_data, kg_context or {})
         messages: list[dict] = [
             {
                 "role": "user",
@@ -384,6 +395,11 @@ class PlaywrightMCPExecutor:
         for iteration in range(MAX_ITERATIONS):
             if finished:
                 break
+
+            # Keep context window small — drop old middle messages but always
+            # retain the first user message (the task) and the last 12 turns.
+            if len(messages) > 25:
+                messages = [messages[0]] + messages[-24:]
 
             # ── Call AI ──────────────────────────────────────────────────────
             try:
@@ -498,10 +514,13 @@ class PlaywrightMCPExecutor:
                     "result": result_text[:200],
                 })
 
+                # Truncate large tool results (e.g. snapshots) to keep message history small.
+                # The AI already acted on the full result; future turns only need a summary.
+                stored_result = result_text if len(result_text) <= 1200 else result_text[:1200] + "\n...(truncated)"
                 tool_results.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
-                    "content": result_text,
+                    "content": stored_result,
                 })
 
                 if finished:
@@ -517,6 +536,11 @@ class PlaywrightMCPExecutor:
             await self._log_db(run, "WARN", "executor",
                                f"Test did not complete within {MAX_ITERATIONS} iterations")
             passed = False
+
+        try:
+            await ai_client.close()
+        except Exception:
+            pass
 
         return passed, steps_taken
 
@@ -552,15 +576,18 @@ class PlaywrightMCPExecutor:
 
         full_messages = [{"role": "system", "content": system}] + messages
 
+        limiter = get_azure_limiter() if settings.AI_PROVIDER == "azure_openai" else None
         last_exc: Exception | None = None
         for attempt in range(5):
+            if limiter:
+                await limiter.wait()
             try:
                 response = await client.chat.completions.create(
                     model=deployment,
                     messages=full_messages,
                     tools=_TOOLS_OPENAI,
                     tool_choice="auto",
-                    max_completion_tokens=2048,
+                    max_completion_tokens=800,
                 )
                 break
             except openai.RateLimitError as exc:
@@ -572,6 +599,8 @@ class PlaywrightMCPExecutor:
                 except Exception:
                     pass
                 wait = retry_after if retry_after > 0 else min(15 * (2 ** attempt), 90)
+                if limiter:
+                    limiter.record_retry_after(wait)
                 log.warning("AI 429 rate limit in MCP executor", attempt=attempt + 1, wait=wait)
                 await asyncio.sleep(wait)
             except Exception as exc:
@@ -593,6 +622,76 @@ class PlaywrightMCPExecutor:
 
         return tool_calls, text
 
+    # ─── KG context loading ───────────────────────────────────────────────────
+
+    async def _load_kg_context(self, scenario: Scenario) -> dict:
+        """
+        Load exploration-built knowledge for this scenario's module.
+        Returns a dict with: module_name, module_url, interaction_guide, form_fields.
+        All fields are optional — callers must handle empty values gracefully.
+        """
+        ctx: dict = {
+            "module_name": "",
+            "module_url": "",
+            "interaction_guide": "",
+            "form_fields": [],
+        }
+        if not scenario.module_id:
+            return ctx
+
+        try:
+            # Module info
+            mod_result = await self.db.execute(
+                select(ApplicationModule).where(ApplicationModule.id == scenario.module_id)
+            )
+            module = mod_result.scalar_one_or_none()
+            if module:
+                ctx["module_name"] = module.name or ""
+                ctx["module_url"]  = module.url_pattern or ""
+
+            # Interaction guide (exploration-built CSS selectors + workflow patterns)
+            guides_result = await self.db.execute(
+                select(AIMemoryChunk).where(
+                    AIMemoryChunk.application_id == scenario.application_id,
+                    AIMemoryChunk.kind == MemoryKind.WORKFLOW,
+                )
+            )
+            guide_texts = [
+                chunk.content
+                for chunk in guides_result.scalars().all()
+                if (chunk.extra or {}).get("guide_type") == "interaction"
+                and (chunk.extra or {}).get("module_id") == scenario.module_id
+            ]
+            if guide_texts:
+                ctx["interaction_guide"] = "\n\n---\n\n".join(guide_texts)
+
+            # Form fields from explored pages
+            pages_result = await self.db.execute(
+                select(ApplicationPage).where(
+                    ApplicationPage.module_id == scenario.module_id
+                ).limit(5)
+            )
+            fields: list[dict] = []
+            seen_labels: set[str] = set()
+            for page in pages_result.scalars().all():
+                for form in (page.forms or [])[:3]:
+                    for f in (form.get("fields") or [])[:20]:
+                        label = (f.get("label") or "").strip()
+                        if label and label not in seen_labels:
+                            seen_labels.add(label)
+                            fields.append({
+                                "label":    label,
+                                "type":     f.get("type", "text"),
+                                "required": bool(f.get("required", False)),
+                                "options":  (f.get("options") or [])[:5],
+                            })
+            ctx["form_fields"] = fields[:30]
+
+        except Exception as exc:
+            log.warning("Failed to load KG context for Playwright executor", error=str(exc)[:200])
+
+        return ctx
+
     # ─── System prompt ────────────────────────────────────────────────────────
 
     def _build_system_prompt(
@@ -601,18 +700,86 @@ class PlaywrightMCPExecutor:
         plan: ExecutionPlan | None,
         env: Environment,
         cred_data: dict,
+        kg_context: dict | None = None,
     ) -> str:
-        plan_context = ""
-        if plan and plan.plan_data:
-            steps = plan.plan_data.get("steps", [])
-            if steps:
-                plan_context = "\n## Suggested steps from AI plan\n"
-                for i, s in enumerate(steps[:20], 1):
-                    desc = s.get("description") or s.get("action") or str(s)[:120]
-                    plan_context += f"  {i}. {desc}\n"
-
+        kg = kg_context or {}
         username = cred_data.get("username", "")
         password = cred_data.get("password", "")
+
+        # ── Module section ────────────────────────────────────────────────────
+        module_section = ""
+        module_url = kg.get("module_url", "")
+        module_name = kg.get("module_name", "")
+        if module_name or module_url:
+            module_section = f"\n## Module Under Test\n"
+            if module_name:
+                module_section += f"Name: {module_name}\n"
+            if module_url:
+                module_section += f"URL: {module_url}\n"
+                module_section += "After login, navigate directly to this URL. Do NOT navigate to the base URL first — go straight to the module.\n"
+
+        # ── Form fields section ───────────────────────────────────────────────
+        fields_section = ""
+        form_fields = kg.get("form_fields", [])
+        if form_fields:
+            fields_section = "\n## Form Fields (exact labels from exploration)\n"
+            fields_section += "When filling forms, use EXACTLY these field labels to locate inputs:\n"
+            for f in form_fields:
+                req = " (required)" if f.get("required") else ""
+                opts = ""
+                if f.get("options"):
+                    opts = f" — options: {', '.join(str(o) for o in f['options'])}"
+                fields_section += f"  - \"{f['label']}\" ({f.get('type', 'text')}{req}){opts}\n"
+
+        # ── Interaction guide (exploration-built knowledge) ───────────────────
+        guide_section = ""
+        interaction_guide = kg.get("interaction_guide", "")
+        if interaction_guide:
+            # Cap at 4000 chars to avoid bloating the context window
+            truncated = interaction_guide[:4000]
+            if len(interaction_guide) > 4000:
+                truncated += "\n... (guide truncated)"
+            guide_section = f"\n## Exploration Guide (exact UI knowledge from prior exploration)\n"
+            guide_section += "This section describes the exact buttons, selectors, and workflows discovered during live exploration.\n"
+            guide_section += "Use these element labels to find elements via browser_snapshot ARIA names:\n"
+            guide_section += truncated + "\n"
+
+        # ── Plan steps section ────────────────────────────────────────────────
+        plan_section = ""
+        if plan and plan.plan_data:
+            steps = plan.plan_data.get("steps", [])
+            workflow_type = plan.plan_data.get("workflow_type", "")
+            goal = plan.plan_data.get("goal", "")
+            if steps:
+                plan_section = "\n## AI-Generated Test Plan\n"
+                if goal:
+                    plan_section += f"Goal: {goal}\n"
+                if workflow_type:
+                    plan_section += f"Workflow type: {workflow_type}\n"
+                plan_section += "Execute these steps in order. Each step shows: action | target element | value (if any) | why it matters.\n\n"
+                current_phase = ""
+                for i, s in enumerate(steps[:40], 1):
+                    phase = s.get("phase", "")
+                    action = s.get("action", "")
+                    desc = s.get("description", "")
+                    target = s.get("target", "")
+                    value = s.get("value", "")
+                    intent = s.get("business_intent", "")
+
+                    if phase and phase != current_phase:
+                        plan_section += f"\n[{phase}]\n"
+                        current_phase = phase
+
+                    line = f"  {i}. {action.upper()}"
+                    if target:
+                        line += f" → \"{target}\""
+                    if value:
+                        line += f" = \"{value}\""
+                    if desc and desc != target:
+                        line += f"  — {desc}"
+                    if intent:
+                        line += f"  ({intent})"
+                    plan_section += line + "\n"
 
         return f"""You are an AI QA engineer executing a test scenario in a real browser.
 You have access to browser control tools — use them to drive the browser step by step.
@@ -620,42 +787,44 @@ You have access to browser control tools — use them to drive the browser step 
 ## Test Scenario
 Title: {scenario.title}
 Description: {scenario.description or "(no description)"}
-{plan_context}
-
+{module_section}{fields_section}{guide_section}{plan_section}
 ## Environment
 Application URL: {env.base_url}
 Username: {username}
 Password: {password}
 
 ## Browser Tools at Your Disposal
-- browser_snapshot  → see the current page structure (ARIA tree with element refs)
+- browser_snapshot  → see the current page structure (ARIA tree with element refs) — call this after every navigation or UI change
 - browser_navigate  → go to a URL
-- browser_click     → click a button/link/element (use ref from snapshot when possible)
-- browser_type      → clear + type into an input field
+- browser_click     → click a button/link/element (prefer 'ref' from snapshot; fall back to 'text')
+- browser_type      → clear + type into an input field (use 'ref' from snapshot or 'selector')
 - browser_select_option → pick a dropdown value
 - browser_hover     → hover over an element
 - browser_press_key → keyboard shortcut (Enter, Tab, Escape, etc.)
 - browser_wait      → pause or wait for an element/text to appear
-- browser_assert_visible → assert that text or an element is visible on the page
-- browser_assert_not_visible → assert that text or an element is NOT visible on the page
+- browser_assert_visible → assert that text or an element is visible — USE THIS to verify outcomes
+- browser_assert_not_visible → assert that text or an element is NOT visible — USE THIS for delete verification
 - browser_scroll    → scroll the page
 - browser_screenshot → capture evidence screenshot
-- browser_evaluate  → run JavaScript (use sparingly)
+- browser_evaluate  → run JavaScript (use sparingly — prefer snapshot + click/type)
 - test_pass(summary) → call when the scenario succeeds ✓
 - test_fail(reason)  → call when the scenario cannot be completed ✗
 
 ## Execution Rules
-1. Start by navigating to the app URL and taking a browser_snapshot.
-2. Log in if the page shows a login form (use the credentials above).
-3. Navigate to the relevant module and execute each step.
-4. After every navigation or major UI change, call browser_snapshot to re-orient.
-5. Always prefer element refs from the last snapshot for reliable targeting.
-6. If an action fails, try an alternative approach before giving up.
-7. Use browser_assert_visible or browser_assert_not_visible to actively verify the outcome of your actions (e.g., verifying a record is added to a table). DO NOT just call test_pass without verifying the outcome with an assertion.
-8. After executing and verifying all steps, call test_pass() with a clear summary.
-9. Only call test_fail() when a step definitively cannot be completed after retrying.
-10. Do NOT call test_pass() until you have actually verified the expected outcome.
-11. For Angular/React SPAs: after navigation, wait 1-2 seconds before interacting.
+1. Start by navigating to the module URL (above) and taking a browser_snapshot.
+2. Log in if the page shows a login form — use the credentials above.
+3. After login, navigate to the module URL again if you were redirected to a dashboard.
+4. Follow the AI-Generated Test Plan steps in order.
+5. After EVERY navigation or form submission, call browser_snapshot to re-orient.
+6. Always prefer element refs from the LATEST snapshot for targeting.
+7. When filling forms: locate each field by its label name in the ARIA tree, then type into it.
+8. For Angular/React mat-select dropdowns: click to open, wait 500ms, then click the option text.
+9. After form submission: wait 1-2s then browser_assert_visible to confirm success toast/message.
+10. After delete: use browser_assert_not_visible to confirm the item is gone from the list.
+11. NEVER call test_pass() without first asserting the expected outcome is visible.
+12. If an action fails, try one alternative (e.g. text search instead of ref) before calling test_fail.
+13. For Angular SPAs: after any navigation, wait 1-2 seconds before interacting with elements.
+14. Use browser_evaluate sparingly — only for Angular value setter issues with mat-inputs.
 """
 
     # ─── Tool implementations ─────────────────────────────────────────────────
@@ -751,7 +920,13 @@ Password: {password}
                 output.extend(node_lines)
             else:
                 output.append("(No interactive elements found — page may still be loading)")
-            return "\n".join(output)
+            result = "\n".join(output)
+            # Cap snapshot size to control Azure input token costs.
+            # 3000 chars ≈ 750 tokens. Snapshots beyond this are mostly deep nested
+            # structural noise — the AI only needs the top interactive elements.
+            if len(result) > 3000:
+                result = result[:3000] + "\n... (snapshot truncated — use browser_scroll if needed)"
+            return result
         except Exception as exc:
             return f"Snapshot error: {exc}. URL: {page.url}"
 

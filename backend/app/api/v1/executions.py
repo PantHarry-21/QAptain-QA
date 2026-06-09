@@ -138,10 +138,8 @@ async def get_logs(
 ):
     query = select(ExecutionLog).where(ExecutionLog.run_id == run_id)
     if since_id:
-        since_result = await db.execute(select(ExecutionLog).where(ExecutionLog.id == since_id))
-        since_log = since_result.scalar_one_or_none()
-        if since_log:
-            query = query.where(ExecutionLog.timestamp > since_log.timestamp)
+        since_ts = select(ExecutionLog.timestamp).where(ExecutionLog.id == since_id).scalar_subquery()
+        query = query.where(ExecutionLog.timestamp > since_ts)
     query = query.order_by(ExecutionLog.timestamp)
     result = await db.execute(query)
     logs = result.scalars().all()

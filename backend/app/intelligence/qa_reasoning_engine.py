@@ -32,7 +32,7 @@ from sqlalchemy import select
 
 from app.db.models import (
     Application, ApplicationModule, ApplicationPage, ApplicationWorkflow,
-    SemanticElement, Scenario,
+    SemanticElement, Scenario, AIMemoryChunk, MemoryKind,
 )
 from app.intelligence.ai_client import get_ai_client
 
@@ -708,11 +708,11 @@ class QAReasoningEngine:
     # roughly 6,000-10,000 reasoning tokens internally, leaving the rest for the plan JSON.
     # A 20-step plan JSON is ~3,000-5,000 tokens, so 24k gives comfortable headroom.
     MODE_MAX_TOKENS = {
-        "smoke":            12000,
-        "functional":       16000,
-        "validation_heavy": 20000,
-        "regression":       24000,
-        "workflow_heavy":   28000,
+        "smoke":            3000,
+        "functional":       5000,
+        "validation_heavy": 6000,
+        "regression":       7000,
+        "workflow_heavy":   8000,
     }
 
     def __init__(self, db: AsyncSession):
@@ -748,43 +748,32 @@ class QAReasoningEngine:
         plan_data: dict | None = None
         last_error: str = ""
 
-        # Two attempts: json_mode first, raw second (Azure doesn't always support json_mode)
-        for attempt, use_json in enumerate([True, False], 1):
-            try:
-                extra = "" if attempt == 1 else (
-                    "\n\nIMPORTANT: Return ONLY the raw JSON object. "
-                    "No markdown fences, no code blocks, no explanation."
-                )
-                response = await asyncio.wait_for(
-                    self.ai.complete(
-                        system=QA_SYSTEM_PROMPT,
-                        user=user_prompt + extra,
-                        json_mode=use_json,
-                        max_tokens=max_tokens,
-                    ),
-                    timeout=120.0,
-                )
-                if response.content.strip():
-                    plan_data = response.json()
-                    break
-                else:
-                    last_error = f"AI returned empty content (attempt {attempt})"
-                    log.warning("QA reasoning empty response", attempt=attempt,
-                                finish_reason="empty", content_len=0)
-            except (Exception, asyncio.CancelledError) as e:
-                last_error = f"{type(e).__name__}: {str(e)[:200]}"
-                log.warning("QA reasoning attempt failed", attempt=attempt, error=last_error)
-                if attempt == 2:
-                    log.error("QA reasoning failed after 2 attempts — using fallback",
-                              module_url=_module_url, last_error=last_error)
-                    fb = self._fallback_plan(scenario, module_url=_module_url)
-                    fb["qa_reasoning"] = f"Fallback plan — AI error: {last_error}"
-                    return fb
+        # Single attempt with a tight timeout so rate-limit failures surface
+        # quickly and let the caller (ScenarioPlanner) use the capability-engine
+        # fallback instead of waiting 2+ minutes on Azure retries.
+        try:
+            response = await asyncio.wait_for(
+                self.ai.complete(
+                    system=QA_SYSTEM_PROMPT,
+                    user=user_prompt,
+                    json_mode=True,
+                    max_tokens=max_tokens,
+                ),
+                timeout=25.0,
+            )
+            if response.content.strip():
+                plan_data = response.json()
+            else:
+                last_error = "AI returned empty content"
+                log.warning("QA reasoning empty response", content_len=0)
+        except (Exception, asyncio.CancelledError) as e:
+            last_error = f"{type(e).__name__}: {str(e)[:200]}"
+            log.warning("QA reasoning AI call failed — raising for caller to use fallback",
+                        error=last_error, module_url=_module_url)
+            raise RuntimeError(f"QA reasoning failed: {last_error}") from e
 
         if not plan_data:
-            fb = self._fallback_plan(scenario, module_url=_module_url)
-            fb["qa_reasoning"] = f"Fallback plan — AI returned no data. {last_error}"
-            return fb
+            raise RuntimeError(f"QA reasoning returned no data: {last_error}")
 
         # Post-process: sanitize + cap + enforce screenshots
         plan_data = self._post_process(plan_data, max_steps)
@@ -918,6 +907,26 @@ class QAReasoningEngine:
                     "success_indicators": (wf.success_indicators or [])[:3],
                 })
 
+        # Load interaction guide built during exploration for this module
+        # This contains exact selectors, dialog fields, submit/cancel buttons — enables
+        # the AI to generate precise execution steps with real selectors.
+        interaction_guide: str = ""
+        if scenario.module_id:
+            guides_result = await self.db.execute(
+                select(AIMemoryChunk).where(
+                    AIMemoryChunk.application_id == scenario.application_id,
+                    AIMemoryChunk.kind == MemoryKind.WORKFLOW,
+                )
+            )
+            guide_chunks = [
+                chunk.content
+                for chunk in guides_result.scalars().all()
+                if (chunk.extra or {}).get("guide_type") == "interaction"
+                and (chunk.extra or {}).get("module_id") == scenario.module_id
+            ]
+            if guide_chunks:
+                interaction_guide = "\n\n---\n\n".join(guide_chunks)
+
         return {
             "app_name": app.name if app else "Application",
             "app_description": app.description if app else "",
@@ -933,8 +942,9 @@ class QAReasoningEngine:
             ],
             "known_elements": known_elements[:15],
             "module_pages": module_pages,
-            "module_forms": module_forms,        # NEW: full form field definitions
-            "module_workflows": module_workflows, # NEW: discovered workflow definitions
+            "module_forms": module_forms,
+            "module_workflows": module_workflows,
+            "interaction_guide": interaction_guide,  # Exploration-built interaction knowledge
         }
 
     # ─── Prompt Construction ──────────────────────────────────────────────────
@@ -1006,7 +1016,7 @@ class QAReasoningEngine:
             ]
 
             # ── Inject coverage checklist from capability engine steps ──────────
-            steps_by_cat = registry.generate_capability_steps(ctx)
+            steps_by_cat = registry.generate_capability_steps(cap_ctx)
             positive_steps = steps_by_cat.get("positive", [])
             negative_steps = steps_by_cat.get("negative", [])
             edge_steps     = steps_by_cat.get("edge_case", [])
@@ -1148,7 +1158,13 @@ Module Description: {m['description'] or 'N/A'}
         title_lower = scenario.title.lower()
         desc_lower = (scenario.description or "").lower()
         combined = title_lower + " " + desc_lower
-        if any(kw in combined for kw in ("search", "filter", "find", "query")):
+        # AUTH is highest priority — very specific keywords
+        if any(kw in combined for kw in ("login", "sign in", "auth", "credential", "logout")):
+            inferred_workflow = "AUTH"
+        # CRUD: if 2+ of create/edit/update/delete present, it's CRUD even if export is mentioned
+        elif sum(1 for kw in ("create", "edit", "update", "delete", "add", "manage") if kw in combined) >= 2:
+            inferred_workflow = "CRUD"
+        elif any(kw in combined for kw in ("search", "filter", "find", "query")):
             inferred_workflow = "SEARCH_FILTER"
         elif any(kw in combined for kw in ("pagination", "paging", "next page", "page number")):
             inferred_workflow = "PAGINATION"
@@ -1162,8 +1178,6 @@ Module Description: {m['description'] or 'N/A'}
             inferred_workflow = "FILE_UPLOAD"
         elif any(kw in combined for kw in ("export", "download csv", "export excel")):
             inferred_workflow = "EXPORT"
-        elif any(kw in combined for kw in ("login", "sign in", "auth", "credential")):
-            inferred_workflow = "AUTH"
         elif any(kw in combined for kw in ("crud", "create", "update", "delete", "add", "edit", "manage")):
             inferred_workflow = "CRUD"
         elif any(kw in combined for kw in ("select", "listing", "multiple", "navigate", "access", "open")):
@@ -1174,6 +1188,18 @@ Module Description: {m['description'] or 'N/A'}
         capability_ctx = self._build_capability_context(
             scenario, inferred_workflow, execution_mode, app_context=ctx
         )
+
+        interaction_guide_block = ""
+        if ctx.get("interaction_guide"):
+            interaction_guide_block = f"""
+DISCOVERED UI INTERACTIONS (built during live exploration — HIGHEST PRIORITY):
+This guide describes every action available on this module's page. Use it to:
+  1. Know WHICH actions exist (Add, Edit, Delete, Approve, bulk delete, status tabs, search)
+  2. Know WHAT happens when you trigger them (dialog title, form fields, success indicator)
+  3. Reference action labels exactly as written (e.g. "Add Product button", "Delete icon", "Pending tab")
+     The executor resolves these labels to CSS selectors automatically — do NOT put raw CSS in target.
+{ctx['interaction_guide']}
+"""
 
         return f"""APPLICATION: {ctx['app_name']}
 Description: {ctx['app_description'] or 'Enterprise business application'}
@@ -1190,7 +1216,7 @@ ALL MODULES:
 {pages_block}
 {forms_block}
 {workflows_block}
-
+{interaction_guide_block}
 INSTRUCTIONS:
 1. Classify this scenario into the correct workflow_type.
 2. Generate the COMPLETE execution plan following the matching workflow expansion.
@@ -1204,6 +1230,7 @@ INSTRUCTIONS:
 10. Think like a senior QA engineer covering the FULL feature — not just a smoke test.
 11. CRITICAL: For the navigate step, use the exact Module URL from context. NEVER navigate to "/" — use the module's specific URL hash route.
 12. If DISCOVERED FORMS are provided, reference the exact field names and the submit button label in your steps.
+13. If DISCOVERED UI INTERACTIONS are provided: reference the action labels exactly (e.g. "Add Product button", "Approve icon", "Pending tab", "Name field") — the executor resolves these to CSS selectors automatically from the exploration guide. Do NOT put CSS selectors in target fields.
 {capability_ctx}"""
 
     # ─── Post-processing ──────────────────────────────────────────────────────

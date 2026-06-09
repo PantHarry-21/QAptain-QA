@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
-import { explore as exploreApi, ApiError, type ExploreSession, type ExploreLog, type HumanDecision } from '@/lib/api';
+import { explore as exploreApi, applications as appApi, ApiError, type ExploreSession, type ExploreLog, type HumanDecision, type Module } from '@/lib/api';
 import { getSocket } from '@/lib/websocket';
 import { useAppToast } from '@/components/ui/app-notifications';
 
@@ -36,10 +36,14 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
   const [session, setSession] = useState<ExploreSession | null>(null);
   const [logs, setLogs] = useState<ExploreLog[]>([]);
   const [pendingDecision, setPendingDecision] = useState<HumanDecision | null>(null);
-  const [knowledge, setKnowledge] = useState<{ modules: number; pages: number; workflows: number } | null>(null);
   const [lastLogId, setLastLogId] = useState<string | undefined>();
   const logsEndRef = useRef<HTMLDivElement>(null);
   const socket = getSocket();
+
+  // Module selection state (used after discover_only session reaches WAITING_HUMAN)
+  const [discoveredModules, setDiscoveredModules] = useState<Module[]>([]);
+  const [selectedModuleIds, setSelectedModuleIds] = useState<Set<string>>(new Set());
+  const [startingExploration, setStartingExploration] = useState(false);
 
   // Load initial data
   useEffect(() => {
@@ -81,7 +85,16 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
     const offStatus = socket.on('explore_completed', (data) => {
       if (data.session_id !== sessionId) return;
       setSession((s) => s ? { ...s, status: 'COMPLETED', modules_discovered: Number(data.modules || 0), pages_discovered: Number(data.pages || 0), workflows_discovered: Number(data.workflows || 0) } : s);
-      setKnowledge({ modules: Number(data.modules || 0), pages: Number(data.pages || 0), workflows: Number(data.workflows || 0) });
+    });
+
+    const offModules = socket.on('modules_discovered', (data) => {
+      if (data.session_id !== sessionId) return;
+      setSession((s) => s ? { ...s, status: 'WAITING_HUMAN', modules_discovered: Number(data.modules_count || 0) } : s);
+    });
+
+    const offStatusChanged = socket.on('explore_status_changed', (data) => {
+      if (data.session_id !== sessionId) return;
+      setSession((s) => s ? { ...s, status: data.status as ExploreSession['status'] } : s);
     });
 
     const offDecision = socket.on('human_decision_required', (data) => {
@@ -99,9 +112,19 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
     return () => {
       offLog();
       offStatus();
+      offModules();
       offDecision();
+      offStatusChanged();
     };
   }, [sessionId, socket]);
+
+  // Fetch discovered modules whenever session is waiting with no login decision pending.
+  // This covers both new sessions (discover_only=true) and old sessions (discover_only=null).
+  useEffect(() => {
+    if (session?.status === 'WAITING_HUMAN' && !pendingDecision) {
+      appApi.listModules(applicationId).then(setDiscoveredModules).catch(console.error);
+    }
+  }, [session?.status, applicationId, pendingDecision]);
 
   // Polling fallback — recovers any WS events that were missed (e.g. race on page load).
   // Runs every 4s while session is active; stops once completed/failed/cancelled.
@@ -117,7 +140,14 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
           exploreApi.getSession(sessionId),
           exploreApi.getLogs(sessionId, lastLogIdRef.current),
         ]);
-        setSession((s) => (s?.status !== updatedSession.status ? updatedSession : s));
+        setSession((s) => {
+          // Prevent the polling loop from reverting RUNNING → WAITING_HUMAN during the
+          // brief window after the user clicks "Explore N modules" and before the engine
+          // commits the new status. The /continue endpoint now sets RUNNING immediately,
+          // but a concurrent poll in-flight could still return the old value.
+          if (s?.status === 'RUNNING' && updatedSession.status === 'WAITING_HUMAN') return s;
+          return s?.status !== updatedSession.status ? updatedSession : s;
+        });
         if (newLogs.length > 0) {
           setLogs((prev) => {
             const existingIds = new Set(prev.map((l) => l.id));
@@ -162,15 +192,40 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
     if (!session || restarting) return;
     setRestarting(true);
     try {
-      const newSession = await exploreApi.start({ application_id: applicationId, mode: session.mode });
-      // Navigate to the new session — replace current explore path segment
+      // Always go through discovery first — user selects modules on the next screen
+      const newSession = await exploreApi.discover({ application_id: applicationId });
       const newPath = pathname.replace(/\/explore\/[^/]+$/, `/explore/${newSession.id}`);
       router.push(newPath);
     } catch (e) {
-      toast.error(e instanceof ApiError ? e.detail : 'Failed to restart exploration');
+      toast.error(e instanceof ApiError ? e.detail : 'Failed to start discovery');
       setRestarting(false);
     }
   }, [session, restarting, applicationId, pathname, router, toast]);
+
+  const handleStartExploration = useCallback(async () => {
+    if (startingExploration || selectedModuleIds.size === 0) return;
+    setStartingExploration(true);
+    try {
+      // Signal the already-running (browser-alive) discovery session to continue.
+      // The engine is polling for this — it will resume with the existing logged-in browser.
+      await exploreApi.continueSession(sessionId, {
+        selected_module_ids: Array.from(selectedModuleIds),
+      });
+      // Stay on the same session page — the status will flip to RUNNING via polling/WS
+      setSession((s) => s ? { ...s, status: 'RUNNING' } : s);
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.detail : 'Failed to start exploration');
+      setStartingExploration(false);
+    }
+  }, [startingExploration, selectedModuleIds, sessionId, toast]);
+
+  const toggleModule = useCallback((id: string) => {
+    setSelectedModuleIds((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }, []);
 
   const handleDecision = useCallback(async (option: { label: string; value: string }) => {
     if (!pendingDecision || decidingOption) return;
@@ -243,12 +298,102 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/30 text-blue-400 rounded-lg transition-colors disabled:opacity-50"
             >
               {restarting
-                ? <><div className="w-3 h-3 border border-blue-400 border-t-transparent rounded-full animate-spin" /> Starting...</>
-                : <>↺ Restart Exploration</>}
+                ? <><div className="w-3 h-3 border border-blue-400 border-t-transparent rounded-full animate-spin" /> Discovering...</>
+                : <>↺ Discover Modules</>}
             </button>
           )}
         </div>
       </div>
+
+      {/* Module Selection Panel — shown when session is waiting for module selection (no login decision pending) */}
+      {session?.status === 'WAITING_HUMAN' && !pendingDecision && (
+        <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl p-5">
+          <div className="flex items-start gap-3">
+            <span className="text-2xl">📦</span>
+            <div className="flex-1">
+                      <div className="flex items-center justify-between mb-1">
+                <h3 className="font-semibold text-blue-300">Select modules to explore</h3>
+                <span className="text-xs text-zinc-500">{selectedModuleIds.size} of {discoveredModules.length} selected</span>
+              </div>
+              <p className="text-xs text-zinc-400 mb-4">
+                {discoveredModules.length === 0
+                  ? 'Loading discovered modules…'
+                  : 'Choose which modules QAptain should deeply analyse. Only selected modules will have their pages, forms, and workflows mapped.'}
+              </p>
+
+              {discoveredModules.length > 0 && (
+                <>
+                  {/* Select / Deselect All */}
+                  <div className="flex gap-2 mb-3">
+                    <button
+                      onClick={() => setSelectedModuleIds(new Set(discoveredModules.map((m) => m.id)))}
+                      className="px-3 py-1 text-xs bg-zinc-700/60 hover:bg-zinc-700 text-zinc-300 rounded-md transition-colors"
+                    >
+                      Select all
+                    </button>
+                    <button
+                      onClick={() => setSelectedModuleIds(new Set())}
+                      className="px-3 py-1 text-xs bg-zinc-700/60 hover:bg-zinc-700 text-zinc-300 rounded-md transition-colors"
+                    >
+                      Deselect all
+                    </button>
+                  </div>
+
+                  {/* Module checklist — all modules are selectable; children are indented */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-64 overflow-y-auto pr-1 mb-4">
+                    {discoveredModules.map((mod) => {
+                      const checked = selectedModuleIds.has(mod.id);
+                      const isChild = !!mod.parent_id;
+                      return (
+                        <button
+                          key={mod.id}
+                          onClick={() => toggleModule(mod.id)}
+                          className={`flex items-center gap-3 px-3 py-2.5 rounded-lg border text-left transition-colors ${
+                            isChild ? 'ml-4' : ''
+                          } ${
+                            checked
+                              ? 'border-blue-500/50 bg-blue-500/10 text-blue-200'
+                              : 'border-zinc-700 bg-zinc-800/40 text-zinc-400 hover:border-zinc-600 hover:text-zinc-300'
+                          }`}
+                        >
+                          <div className={`w-4 h-4 rounded border flex-shrink-0 flex items-center justify-center ${
+                            checked ? 'border-blue-400 bg-blue-500' : 'border-zinc-600'
+                          }`}>
+                            {checked && <span className="text-white text-[10px] leading-none">✓</span>}
+                          </div>
+                          <div className="min-w-0">
+                            <div className="text-sm font-medium truncate">{mod.name}</div>
+                            {mod.url_pattern && (
+                              <div className="text-[10px] text-zinc-500 truncate font-mono">{mod.url_pattern}</div>
+                            )}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <button
+                    onClick={handleStartExploration}
+                    disabled={startingExploration || selectedModuleIds.size === 0}
+                    className="flex items-center gap-2 px-5 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-sm font-medium rounded-lg transition-colors"
+                  >
+                    {startingExploration
+                      ? <><div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" /> Starting...</>
+                      : <>▶ Explore {selectedModuleIds.size} module{selectedModuleIds.size !== 1 ? 's' : ''}</>}
+                  </button>
+                </>
+              )}
+
+              {discoveredModules.length === 0 && (
+                <div className="flex items-center gap-2 text-zinc-500 text-xs">
+                  <div className="w-3 h-3 border border-zinc-600 border-t-transparent rounded-full animate-spin" />
+                  Fetching module list…
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Human-in-loop Decision Panel */}
       {pendingDecision && (

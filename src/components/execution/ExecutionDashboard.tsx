@@ -120,8 +120,7 @@ export function ExecutionDashboard({ runId }: ExecutionDashboardProps) {
       }
 
       if (r.status === 'COMPLETED' || r.status === 'FAILED') {
-        const rep = await executionsApi.getReport(runId);
-        setReport(rep);
+        executionsApi.getReport(runId).then(setReport).catch(() => {});
       }
     };
     load().catch(console.error);
@@ -158,8 +157,7 @@ export function ExecutionDashboard({ runId }: ExecutionDashboardProps) {
         }
 
         if (r.status === 'COMPLETED' || r.status === 'FAILED') {
-          const rep = await executionsApi.getReport(runId);
-          setReport(rep);
+          executionsApi.getReport(runId).then(setReport).catch(() => {});
         }
       } catch { /* ignore poll errors */ }
     };
@@ -238,9 +236,8 @@ export function ExecutionDashboard({ runId }: ExecutionDashboardProps) {
 
     const offComplete = socket.on('run_completed', async (data) => {
       if (data.run_id !== runId) return;
-      const r = await executionsApi.get(runId);
+      const [r, rep] = await Promise.all([executionsApi.get(runId), executionsApi.getReport(runId)]);
       setRun(r);
-      const rep = await executionsApi.getReport(runId);
       setReport(rep);
       addEntry({
         ts: new Date().toISOString(), kind: 'log', level: 'SUCCESS',

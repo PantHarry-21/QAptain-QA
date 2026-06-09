@@ -84,6 +84,7 @@ class BrowserManager:
 
         mgr = cls(driver)
         mgr._setup_cdp()
+        mgr.inject_network_monitor()
         return mgr
 
     def _setup_cdp(self):
@@ -291,6 +292,119 @@ class BrowserManager:
             return changes or []
         except Exception:
             return []
+
+    def inject_network_monitor(self) -> None:
+        """
+        Inject a lightweight JS shim that counts in-flight XHR + fetch requests.
+        After injection, window.__qa_pending_requests holds the live count.
+        Safe to call multiple times (idempotent guard via __qa_nm_injected).
+        """
+        try:
+            self.execute_script("""
+                if (window.__qa_nm_injected) return;
+                window.__qa_nm_injected = true;
+                window.__qa_pending_requests = 0;
+
+                // Intercept fetch
+                const _origFetch = window.fetch;
+                window.fetch = function(...args) {
+                    window.__qa_pending_requests++;
+                    return _origFetch.apply(this, args).finally(function() {
+                        window.__qa_pending_requests = Math.max(0, window.__qa_pending_requests - 1);
+                    });
+                };
+
+                // Intercept XHR
+                const _origOpen = XMLHttpRequest.prototype.open;
+                const _origSend = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.send = function(...args) {
+                    window.__qa_pending_requests++;
+                    const dec = () => {
+                        window.__qa_pending_requests = Math.max(0, window.__qa_pending_requests - 1);
+                    };
+                    this.addEventListener('load', dec);
+                    this.addEventListener('error', dec);
+                    this.addEventListener('abort', dec);
+                    this.addEventListener('timeout', dec);
+                    return _origSend.apply(this, args);
+                };
+            """)
+        except Exception:
+            pass
+
+    def wait_network_idle(self, timeout: float = 6.0, max_pending: int = 0) -> bool:
+        """
+        Block until in-flight XHR/fetch requests reach <= max_pending or timeout.
+        Returns True if idle was reached, False on timeout.
+        Gracefully degrades if the network monitor was not injected (returns True).
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                pending = self.execute_script("return window.__qa_pending_requests || 0;") or 0
+                if pending <= max_pending:
+                    return True
+            except Exception:
+                return True  # driver may have navigated — treat as idle
+            time.sleep(0.25)
+        return False
+
+    def get_console_errors(self) -> list[dict]:
+        """Collect browser console errors from the current page session."""
+        errors = []
+        try:
+            logs = self.driver.get_log("browser")
+            for entry in logs:
+                level = entry.get("level", "")
+                if level in ("SEVERE", "ERROR"):
+                    errors.append({
+                        "level": level,
+                        "message": entry.get("message", "")[:300],
+                        "timestamp": entry.get("timestamp"),
+                    })
+        except Exception:
+            pass
+        return errors[-20:]
+
+    def capture_failure_context(self) -> dict:
+        """
+        Capture a rich snapshot of the current browser state for failure diagnosis.
+        Returns: url, title, dom_summary, console_errors, pending_requests, dialog_open.
+        """
+        ctx: dict = {}
+        try:
+            ctx["url"] = self.driver.current_url
+        except Exception:
+            ctx["url"] = "unknown"
+        try:
+            ctx["title"] = self.driver.title
+        except Exception:
+            ctx["title"] = ""
+        try:
+            ctx["dom_summary"] = self.execute_script("""
+                return {
+                    input_count: document.querySelectorAll('input,textarea,select').length,
+                    button_count: document.querySelectorAll('button,[role="button"]').length,
+                    dialog_open: !!document.querySelector('[role="dialog"],[aria-modal="true"]'),
+                    visible_errors: Array.from(document.querySelectorAll(
+                        '[class*="error"],[role="alert"],[class*="alert-danger"]'
+                    )).filter(e => {
+                        const r = e.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    }).map(e => e.textContent.trim().slice(0,150)).filter(Boolean).slice(0,5),
+                    page_text_preview: (document.body && document.body.innerText || '').slice(0,300),
+                };
+            """) or {}
+        except Exception:
+            ctx["dom_summary"] = {}
+        ctx["console_errors"] = self.get_console_errors()
+        try:
+            ctx["pending_requests"] = self.execute_script(
+                "return window.__qa_pending_requests || 0;"
+            ) or 0
+        except Exception:
+            ctx["pending_requests"] = -1
+        return ctx
 
     def quit(self):
         """Clean up browser resources."""

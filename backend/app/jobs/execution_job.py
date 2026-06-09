@@ -44,8 +44,11 @@ async def _run_execution_async(run_id: str) -> None:
     from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
     from config import settings
 
-    # Playwright MCP executor is the default; falls back to legacy Selenium executor
-    # when USE_PLAYWRIGHT_MCP=false is set in the environment.
+    # Executor selection (env vars, highest priority first):
+    #   EXECUTOR=plan_driven  → PlanDrivenPlaywrightExecutor (default — KG-backed, AI-minimal)
+    #   EXECUTOR=agentic      → PlaywrightMCPExecutor (legacy AI-per-step agentic loop)
+    #   USE_PLAYWRIGHT_MCP=false → Selenium ExecutionOrchestrator (legacy fallback)
+    executor_mode = os.environ.get("EXECUTOR", "plan_driven").lower()
     use_playwright = os.environ.get("USE_PLAYWRIGHT_MCP", "true").lower() != "false"
 
     engine = create_async_engine(
@@ -57,12 +60,15 @@ async def _run_execution_async(run_id: str) -> None:
     try:
         SessionFactory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
         async with SessionFactory() as db:
-            if use_playwright:
+            if not use_playwright:
+                from app.execution.executor import ExecutionOrchestrator
+                orchestrator = ExecutionOrchestrator(db, main_loop=_main_loop)
+            elif executor_mode == "agentic":
                 from app.execution.playwright_mcp_executor import PlaywrightMCPExecutor
                 orchestrator = PlaywrightMCPExecutor(db, main_loop=_main_loop)
             else:
-                from app.execution.executor import ExecutionOrchestrator
-                orchestrator = ExecutionOrchestrator(db, main_loop=_main_loop)
+                from app.execution.plan_driven_executor import PlanDrivenPlaywrightExecutor
+                orchestrator = PlanDrivenPlaywrightExecutor(db, main_loop=_main_loop)
             await orchestrator.execute_run(run_id)
     except Exception as e:
         log.exception("Background execution failed", run_id=run_id, error=str(e))

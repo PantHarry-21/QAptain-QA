@@ -15,6 +15,7 @@ import openai
 import structlog
 
 from config import settings
+from app.intelligence.azure_rate_limiter import get_azure_limiter
 
 log = structlog.get_logger()
 
@@ -189,10 +190,14 @@ class AIClient:
         if json_mode and self._provider != "azure_openai":
             kwargs["response_format"] = {"type": "json_object"}
 
-        # Retry on 429 Rate Limit with exponential backoff.
-        # With a 180s explore timeout, 3 retries fit comfortably (15+30+60 = 105s wait).
+        # Retry on 429 Rate Limit. Azure quota windows are typically 60s, so
+        # 5 retries × 30s wait = 150s covers 2+ quota resets before giving up.
+        # The global rate limiter pre-throttles all Azure calls to prevent bursting.
+        limiter = get_azure_limiter() if self._provider == "azure_openai" else None
         last_exc: Exception | None = None
         for attempt in range(5):
+            if limiter:
+                await limiter.wait()
             try:
                 response = await self._openai.chat.completions.create(**kwargs)
                 break
@@ -207,6 +212,8 @@ class AIClient:
                 except Exception:
                     pass
                 wait = retry_after if retry_after > 0 else min(15 * (2 ** attempt), 90)
+                if limiter:
+                    limiter.record_retry_after(wait)
                 log.warning("Azure 429 rate limit — backing off",
                             provider=self._provider, model=model,
                             attempt=attempt + 1, wait_seconds=wait,
@@ -220,13 +227,14 @@ class AIClient:
             log.error("OpenAI API call failed after rate-limit retries",
                       provider=self._provider, model=model, error=str(last_exc))
             if self._anthropic_fallback is not None:
+                fallback_model = "claude-haiku-4-5-20251001"
                 log.warning(
                     "Azure OpenAI exhausted all retries — falling back to Anthropic Claude",
                     original_model=model,
-                    fallback_model="claude-haiku-4-5-20251001",
+                    fallback_model=fallback_model,
                 )
                 fallback_response = await self._anthropic_fallback.messages.create(
-                    model="claude-haiku-4-5-20251001",
+                    model=fallback_model,
                     max_tokens=max_tokens,
                     temperature=0.1,
                     system=system,
@@ -234,7 +242,7 @@ class AIClient:
                 )
                 return AIMessage(
                     content=fallback_response.content[0].text,
-                    model="claude-haiku-4-5-20251001",
+                    model=fallback_model,
                     input_tokens=fallback_response.usage.input_tokens,
                     output_tokens=fallback_response.usage.output_tokens,
                 )
@@ -260,10 +268,18 @@ class AIClient:
         if not msg:
             if refusal:
                 raise ValueError(f"AI refused: {refusal}")
+            if choice.finish_reason == "length":
+                raise ValueError(
+                    f"AI input too long — prompt exceeded model context window "
+                    f"(model={model}, finish_reason=length, no output generated). "
+                    "Reduce prompt size or increase max_tokens."
+                )
             raise ValueError(
                 f"AI returned empty content (model={model}, finish_reason={choice.finish_reason})"
             )
 
+        # When finish_reason=length the output was truncated — return the partial content
+        # and let the caller decide whether to use it (e.g. extract valid JSON prefix).
         return AIMessage(
             content=msg,
             model=model,

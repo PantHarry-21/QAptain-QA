@@ -9,7 +9,7 @@ from app.db.session import get_db
 from app.db.models import (
     User, Workspace, WorkspaceMember, WorkspaceRole, Application,
     Environment, Credential, EnvironmentType,
-    Scenario, ExecutionRun,
+    Scenario, ExecutionRun, ApplicationModule, ExploreSession, ExploreStatus,
 )
 from app.core.dependencies import get_current_user, get_workspace_access
 from app.schemas.workspace import (
@@ -169,13 +169,42 @@ async def list_applications(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # Correlated subqueries so we get all derived fields in one round trip
+    modules_sq = (
+        select(func.count(ApplicationModule.id))
+        .where(ApplicationModule.application_id == Application.id)
+        .correlate(Application)
+        .scalar_subquery()
+    )
+    last_explored_sq = (
+        select(ExploreSession.completed_at)
+        .where(
+            ExploreSession.application_id == Application.id,
+            ExploreSession.status == ExploreStatus.COMPLETED,
+            ExploreSession.completed_at.isnot(None),
+        )
+        .correlate(Application)
+        .order_by(ExploreSession.completed_at.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
     result = await db.execute(
-        select(Application)
+        select(Application, modules_sq.label("modules_count"), last_explored_sq.label("last_explored_at"))
         .where(Application.workspace_id == workspace_id)
         .order_by(Application.created_at.desc())
     )
-    apps = result.scalars().all()
-    return [ApplicationResponse.model_validate(a) for a in apps]
+    return [
+        {
+            "id": a.id, "workspace_id": a.workspace_id, "name": a.name,
+            "base_url": a.base_url, "description": a.description,
+            "explore_mode": a.explore_mode.value if hasattr(a.explore_mode, "value") else str(a.explore_mode),
+            "created_at": a.created_at,
+            "has_knowledge": a.knowledge_graph_id is not None,
+            "modules_count": modules_count or 0,
+            "last_explored_at": last_explored_at,
+        }
+        for a, modules_count, last_explored_at in result.all()
+    ]
 
 
 @router.post("/{workspace_id}/applications", response_model=ApplicationResponse, status_code=201)

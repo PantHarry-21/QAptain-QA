@@ -29,15 +29,18 @@ class CRUDEngine(BaseCapabilityEngine):
         # ── PHASE: NAVIGATE ──
         steps += [
             self._step("screenshot", "Capture initial module state", "SETUP", "Baseline evidence", engine_id=e),
+            # Use generic table/list selectors — the entity name is not a DOM element.
             self._step("wait_element", f"Wait for {entity} list to load", "NAVIGATE",
-                      "Module must be fully loaded before testing", target=entity, timeout_ms=15000, engine_id=e),
+                      "Module must be fully loaded before testing",
+                      target="table|tbody|mat-table|ag-grid|[class*=table]|[class*=list]|[class*=grid]",
+                      timeout_ms=15000, on_fail="skip", engine_id=e),
         ]
 
         # ── PHASE: CREATE ──
         steps += [
             self._step("click", f"Open {entity} create form",
                       "FORM_OPEN", f"Initiate {entity} creation workflow",
-                      target=f"Add|New|Create|Add {entity}|New {entity}|+", engine_id=e),
+                      target=f"Add|New|Create|+|Add {entity}|New {entity}", engine_id=e),
             self._step("wait_element", "Wait for create form to render",
                       "FORM_OPEN", "Form must be visible before data entry",
                       target="form|modal|dialog|panel", timeout_ms=10000, engine_id=e),

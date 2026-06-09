@@ -8,10 +8,13 @@ import json
 import re
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, func
 
 from app.db.session import get_db
-from app.db.models import User, Application, Environment, Credential, ApplicationModule, RBACScan
+from app.db.models import (
+    User, Application, Environment, Credential, ApplicationModule, RBACScan,
+    ExploreSession, ExploreStatus,
+)
 from app.core.dependencies import get_current_user
 from app.core.security import encrypt_credential, decrypt_credential
 from app.schemas.workspace import ApplicationResponse, EnvironmentResponse
@@ -29,7 +32,28 @@ async def get_application(
     app = result.scalar_one_or_none()
     if not app:
         raise HTTPException(status_code=404, detail="Application not found")
-    return ApplicationResponse.model_validate(app)
+    modules_count = (await db.execute(
+        select(func.count(ApplicationModule.id)).where(ApplicationModule.application_id == application_id)
+    )).scalar() or 0
+    last_explored_at = (await db.execute(
+        select(ExploreSession.completed_at)
+        .where(
+            ExploreSession.application_id == application_id,
+            ExploreSession.status == ExploreStatus.COMPLETED,
+            ExploreSession.completed_at.isnot(None),
+        )
+        .order_by(ExploreSession.completed_at.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    return {
+        "id": app.id, "workspace_id": app.workspace_id, "name": app.name,
+        "base_url": app.base_url, "description": app.description,
+        "explore_mode": app.explore_mode.value if hasattr(app.explore_mode, "value") else str(app.explore_mode),
+        "created_at": app.created_at,
+        "has_knowledge": app.knowledge_graph_id is not None,
+        "modules_count": modules_count,
+        "last_explored_at": last_explored_at,
+    }
 
 
 @router.get("/{application_id}/environments", response_model=list[EnvironmentResponse])
@@ -53,8 +77,7 @@ async def list_modules(
     result = await db.execute(
         select(ApplicationModule)
         .where(ApplicationModule.application_id == application_id)
-        .where(ApplicationModule.parent_id == None)
-        .order_by(ApplicationModule.order_index)
+        .order_by(ApplicationModule.parent_id.nullsfirst(), ApplicationModule.order_index)
     )
     modules = result.scalars().all()
     return [
@@ -64,6 +87,8 @@ async def list_modules(
             "description": m.description,
             "url_pattern": m.url_pattern,
             "icon": m.icon,
+            "is_accordion": bool(m.is_accordion),
+            "parent_id": m.parent_id,
             "semantic_tags": m.semantic_tags or [],
         }
         for m in modules
