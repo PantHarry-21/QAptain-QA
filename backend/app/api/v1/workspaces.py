@@ -57,10 +57,10 @@ async def create_workspace(
 @router.get("/{workspace_id}", response_model=WorkspaceResponse)
 async def get_workspace(
     workspace_id: str,
-    _member: WorkspaceMember = Depends(lambda wid=None, u=None, db=None: None),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await get_workspace_access(workspace_id, current_user, db)
     result = await db.execute(select(Workspace).where(Workspace.id == workspace_id))
     ws = result.scalar_one_or_none()
     if not ws:

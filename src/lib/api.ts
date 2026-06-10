@@ -271,7 +271,7 @@ export const scenarios = {
     );
   },
 
-  runBatch: (data: { scenario_ids: string[]; execution_mode: string; environment_id: string }) =>
+  runBatch: (data: { scenario_ids: string[]; execution_mode: string; environment_id: string; smoke_only?: boolean }) =>
     request<{ runs: BatchRun[]; total: number }>('/scenarios/run-batch', {
       method: 'POST',
       body: JSON.stringify(data),
@@ -297,6 +297,9 @@ export const scenarios = {
       `/scenarios/bulk/by-module?application_id=${applicationId}${moduleId && moduleId !== '__none__' ? `&module_id=${moduleId}` : ''}`,
       { method: 'DELETE' },
     ),
+
+  getPlaywrightScript: (scenarioId: string) =>
+    request<PlaywrightScript>(`/scenarios/${scenarioId}/playwright-script`),
 };
 
 // ─── Executions ───────────────────────────────────────────────────────────────
@@ -326,6 +329,9 @@ export const executions = {
     request<{ batch_id: string; runs: Array<{ run_id: string; title: string }> }>(
       `/executions/batch/${batchId}`,
     ),
+
+  getBatchSummary: (batchId: string) =>
+    request<BatchRunSummary>(`/executions/batch/${batchId}/summary`),
 };
 
 // ─── Reports ──────────────────────────────────────────────────────────────────
@@ -348,6 +354,12 @@ export const knowledge = {
   getPages: (moduleId: string) => request<Page[]>(`/knowledge/modules/${moduleId}/pages`),
 
   getWorkflows: (moduleId: string) => request<Workflow[]>(`/knowledge/modules/${moduleId}/workflows`),
+
+  getCoverage: (applicationId: string) =>
+    request<KgCoverageReport>(`/knowledge/applications/${applicationId}/coverage`),
+
+  getDrift: (applicationId: string) =>
+    request<KgDriftReport>(`/knowledge/applications/${applicationId}/drift`),
 };
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -480,7 +492,72 @@ export interface Scenario {
   module_url?: string;
   source: string;
   is_active: boolean;
+  is_smoke: boolean;
   created_at: string;
+  kg_plan_available?: boolean;
+  kg_workflow_types?: string[];
+  last_run_status?: 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'RUNNING' | string;
+  last_run_at?: string;
+}
+
+export interface KgModuleCoverage {
+  module_id: string;
+  module_name: string;
+  explored: boolean;
+  pages_discovered: number;
+  last_explored_at?: string;
+  kg_workflow_types: string[];
+  kg_workflows_count: number;
+  scenarios_total: number;
+  scenarios_kg_backed: number;
+  kg_coverage_pct: number;
+  status: 'kg_ready' | 'explored' | 'not_explored';
+}
+
+export interface KgCoverageReport {
+  modules: KgModuleCoverage[];
+  summary: {
+    modules_total: number;
+    modules_explored: number;
+    modules_kg_ready: number;
+    scenarios_total: number;
+    scenarios_kg_backed: number;
+    kg_coverage_pct: number;
+  };
+}
+
+export interface KgDriftReport {
+  drifted_modules: Array<{
+    module_id: string;
+    module_name: string;
+    runs_checked: number;
+    failed_runs: number;
+    fail_rate_pct: number;
+    severity: 'high' | 'medium';
+    top_failing_selectors: Array<{ target: string; error_type: string; occurrences: number }>;
+    recommendation: string;
+  }>;
+  healthy_modules: Array<{ module_id: string; module_name: string; runs_checked: number; fail_rate_pct: number }>;
+  total_checked: number;
+  drift_detected: boolean;
+}
+
+export interface BatchRunSummary {
+  batch_id: string;
+  summary: {
+    total: number; passed: number; failed: number; skipped: number;
+    quality_score: number; pass_rate_pct: number;
+  };
+  root_cause_breakdown: Array<{ error_type: string; count: number; pct: number }>;
+  module_health: Array<{
+    module_id: string | null; module_name: string;
+    total: number; passed: number; failed: number; skipped: number;
+  }>;
+  scenarios_needing_attention: Array<{
+    run_id: string; scenario_title: string; module_name: string;
+    failed_steps: number; total_steps: number;
+    top_error_type: string; error_message: string;
+  }>;
 }
 
 export interface BatchRun {
@@ -630,6 +707,69 @@ export interface CreateScenarioPayload {
   module_id?: string;
 }
 
+export interface PlaywrightScript {
+  scenario_id: string;
+  scenario_title: string;
+  script: string;
+  source: 'kg_recorded' | 'ai' | 'skeleton' | string;
+  step_count: number;
+  plan_id: string | null;
+}
+
+export interface TestDatasetItem {
+  id: string;
+  application_id: string;
+  category: string;
+  label: string;
+  data_type: 'text' | 'email' | 'number' | 'date' | 'url' | 'file';
+  text_value?: string;
+  file_path?: string;
+  file_name?: string;
+  file_size?: number;
+  description?: string;
+  created_at: string;
+}
+
+// ─── Datasets ─────────────────────────────────────────────────────────────────
+
+export const datasets = {
+  list: (applicationId: string) =>
+    request<TestDatasetItem[]>(`/datasets/${applicationId}`),
+
+  create: (applicationId: string, data: {
+    category: string;
+    label: string;
+    data_type: TestDatasetItem['data_type'];
+    text_value?: string;
+    description?: string;
+  }) =>
+    request<TestDatasetItem>(`/datasets/${applicationId}`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  uploadFile: (applicationId: string, data: { category: string; label: string; description?: string; file: File }) => {
+    const form = new FormData();
+    form.append('file', data.file);
+    form.append('category', data.category);
+    form.append('label', data.label);
+    if (data.description) form.append('description', data.description);
+    return request<TestDatasetItem>(`/datasets/${applicationId}/upload`, {
+      method: 'POST',
+      body: form,
+    });
+  },
+
+  update: (applicationId: string, itemId: string, data: { label?: string; text_value?: string; description?: string }) =>
+    request<TestDatasetItem>(`/datasets/${applicationId}/${itemId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }),
+
+  delete: (applicationId: string, itemId: string) =>
+    request<void>(`/datasets/${applicationId}/${itemId}`, { method: 'DELETE' }),
+};
+
 export { ApiError };
 
 export const api = {
@@ -641,4 +781,5 @@ export const api = {
   executions,
   reports,
   knowledge,
+  datasets,
 };

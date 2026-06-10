@@ -5,7 +5,7 @@ from sqlalchemy import select
 
 from app.db.session import get_db
 from app.db.models import User, ExecutionReport, ExecutionRun, Scenario
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, require_app_access, require_run_access
 from app.schemas.scenario import ReportResponse
 
 router = APIRouter()
@@ -18,6 +18,7 @@ async def list_reports(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_app_access(application_id, current_user, db)
     result = await db.execute(
         select(ExecutionReport, ExecutionRun, Scenario)
         .join(ExecutionRun, ExecutionReport.run_id == ExecutionRun.id)
@@ -49,8 +50,17 @@ async def get_report(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(ExecutionReport).where(ExecutionReport.id == report_id))
-    report = result.scalar_one_or_none()
-    if not report:
+    result = await db.execute(
+        select(ExecutionReport, ExecutionRun.scenario_id)
+        .join(ExecutionRun, ExecutionReport.run_id == ExecutionRun.id)
+        .where(ExecutionReport.id == report_id)
+    )
+    row = result.one_or_none()
+    if not row:
         raise HTTPException(status_code=404, detail="Report not found")
+    report, scenario_id = row
+    scenario_row = await db.execute(select(Scenario).where(Scenario.id == scenario_id))
+    scenario = scenario_row.scalar_one_or_none()
+    if scenario:
+        await require_app_access(scenario.application_id, current_user, db)
     return ReportResponse.model_validate(report)

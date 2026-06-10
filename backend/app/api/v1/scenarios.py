@@ -13,9 +13,10 @@ import csv
 from app.db.session import get_db
 from app.db.models import (
     User, Scenario, ScenarioPriority, ExecutionPlan, ExecutionRun,
-    Environment, Credential, ApplicationModule,
+    Environment, Credential, ApplicationModule, ApplicationWorkflow,
 )
-from app.core.dependencies import get_current_user
+from sqlalchemy import func
+from app.core.dependencies import get_current_user, require_app_access
 from app.schemas.scenario import (
     ScenarioCreate, ScenarioResponse,
     ExecutionPlanRequest, ExecutionPlanResponse,
@@ -44,9 +45,17 @@ def _parse_priority(value) -> ScenarioPriority:
     return ScenarioPriority.MEDIUM
 
 
-def _enrich_scenario(s: Scenario, modules_by_id: dict) -> dict:
-    """Return a scenario dict with module_name/url fields for the frontend."""
+def _enrich_scenario(
+    s: Scenario,
+    modules_by_id: dict,
+    kg_workflows_by_module: "dict[str, list[str]] | None" = None,
+    last_run: "dict | None" = None,
+) -> dict:
+    """Return a scenario dict with module_name/url fields, KG workflow status, and last run outcome."""
     mod = modules_by_id.get(s.module_id) if s.module_id else None
+    kg_types: list[str] = []
+    if kg_workflows_by_module and s.module_id:
+        kg_types = kg_workflows_by_module.get(s.module_id, [])
     return {
         "id": s.id,
         "application_id": s.application_id,
@@ -59,7 +68,14 @@ def _enrich_scenario(s: Scenario, modules_by_id: dict) -> dict:
         "module_url": mod.url_pattern if mod else None,
         "source": s.source,
         "is_active": s.is_active,
+        "is_smoke": getattr(s, "is_smoke", False) or False,
         "created_at": s.created_at.isoformat() if s.created_at else None,
+        # KG status — lets the frontend show whether a precise plan is ready
+        "kg_plan_available": len(kg_types) > 0,
+        "kg_workflow_types": kg_types,  # e.g. ["crud_create", "crud_update", "crud_delete"]
+        # Last execution outcome — drives pass/fail badge on scenario cards
+        "last_run_status": last_run.get("status") if last_run else None,
+        "last_run_at": last_run.get("completed_at") if last_run else None,
     }
 
 
@@ -71,6 +87,23 @@ async def _load_modules_by_id(db: AsyncSession, scenarios: list[Scenario]) -> di
         select(ApplicationModule).where(ApplicationModule.id.in_(module_ids))
     )
     return {m.id: m for m in result.scalars().all()}
+
+
+async def _load_kg_workflows_by_module(
+    db: AsyncSession, scenarios: list[Scenario]
+) -> "dict[str, list[str]]":
+    """Return {module_id: [workflow_type, ...]} for all modules referenced by scenarios."""
+    module_ids = {s.module_id for s in scenarios if s.module_id}
+    if not module_ids:
+        return {}
+    result = await db.execute(
+        select(ApplicationWorkflow.module_id, ApplicationWorkflow.workflow_type)
+        .where(ApplicationWorkflow.module_id.in_(module_ids))
+    )
+    out: dict[str, list[str]] = {}
+    for mid, wtype in result.all():
+        out.setdefault(mid, []).append(wtype)
+    return out
 
 
 # ─── Module Auto-Mapping ──────────────────────────────────────────────────────
@@ -339,14 +372,47 @@ async def list_scenarios(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_app_access(application_id, current_user, db)
     result = await db.execute(
         select(Scenario)
         .where(Scenario.application_id == application_id, Scenario.is_active == True)
         .order_by(Scenario.created_at.desc())
     )
     scenarios = result.scalars().all()
-    modules_by_id = await _load_modules_by_id(db, scenarios)
-    return [_enrich_scenario(s, modules_by_id) for s in scenarios]
+    modules_by_id, kg_workflows = await asyncio.gather(
+        _load_modules_by_id(db, scenarios),
+        _load_kg_workflows_by_module(db, scenarios),
+    )
+
+    # Load last execution run per scenario so the frontend can show pass/fail badges
+    last_runs: dict[str, dict] = {}
+    if scenarios:
+        scenario_ids = [s.id for s in scenarios]
+        # Subquery: max created_at per scenario_id
+        subq = (
+            select(
+                ExecutionRun.scenario_id,
+                func.max(ExecutionRun.created_at).label("max_at"),
+            )
+            .where(ExecutionRun.scenario_id.in_(scenario_ids))
+            .group_by(ExecutionRun.scenario_id)
+            .subquery()
+        )
+        runs_result = await db.execute(
+            select(ExecutionRun.scenario_id, ExecutionRun.status, ExecutionRun.completed_at)
+            .join(
+                subq,
+                (ExecutionRun.scenario_id == subq.c.scenario_id)
+                & (ExecutionRun.created_at == subq.c.max_at),
+            )
+        )
+        for sid, status, completed_at in runs_result.all():
+            last_runs[sid] = {
+                "status": status.value if hasattr(status, "value") else str(status),
+                "completed_at": completed_at.isoformat() if completed_at else None,
+            }
+
+    return [_enrich_scenario(s, modules_by_id, kg_workflows, last_runs.get(s.id)) for s in scenarios]
 
 
 # ─── Create ───────────────────────────────────────────────────────────────────
@@ -374,8 +440,11 @@ async def create_scenario(
     if not payload.module_id:
         await _auto_map_scenarios(db, payload.application_id, [scenario])
 
-    modules_by_id = await _load_modules_by_id(db, [scenario])
-    return _enrich_scenario(scenario, modules_by_id)
+    modules_by_id, kg_workflows = await asyncio.gather(
+        _load_modules_by_id(db, [scenario]),
+        _load_kg_workflows_by_module(db, [scenario]),
+    )
+    return _enrich_scenario(scenario, modules_by_id, kg_workflows)
 
 
 # ─── Update ───────────────────────────────────────────────────────────────────
@@ -386,6 +455,7 @@ class ScenarioUpdate(BaseModel):
     priority: str | None = None
     tags: list[str] | None = None
     module_id: str | None = None  # set to assign; omit to keep current
+    is_smoke: bool | None = None  # set to mark as smoke test
 
 # ─── Bulk delete by module (must be before /{scenario_id} to avoid route shadowing) ─
 
@@ -397,6 +467,7 @@ async def delete_scenarios_by_module(
     db: AsyncSession = Depends(get_db),
 ):
     """Soft-delete all scenarios for a module (or all unassigned if module_id=none)."""
+    await require_app_access(application_id, current_user, db)
     query = select(Scenario).where(
         Scenario.application_id == application_id,
         Scenario.is_active == True,
@@ -438,6 +509,8 @@ async def update_scenario(
     # module_id: explicit value assigns; "module_id" key not in request → keep current
     if "module_id" in payload.model_fields_set:
         scenario.module_id = payload.module_id or None
+    if payload.is_smoke is not None:
+        scenario.is_smoke = payload.is_smoke
     await db.commit()
     await db.refresh(scenario)
     modules_by_id = await _load_modules_by_id(db, [scenario])
@@ -680,6 +753,7 @@ class RunBatchPayload(BaseModel):
     scenario_ids: list[str]
     execution_mode: str = "functional"
     environment_id: str
+    smoke_only: bool = False  # when True, only run scenarios tagged is_smoke=True
 
 
 @router.post("/run-batch")
@@ -715,16 +789,83 @@ async def run_batch(
         for sid in requested_ids if sid not in scenario_lookup
     ]
 
-    # ── 2. Build ALL plan objects (no AI, no commit) in a single pass ─────────
+    # ── 1b. Smoke-only filter ─────────────────────────────────────────────────
+    # When smoke_only=True, skip all scenarios not flagged as smoke tests.
+    # This is the "sanity check before a release" mode — fast, focused pass.
+    if payload.smoke_only:
+        smoke_ids = {sid for sid, s in scenario_lookup.items() if getattr(s, "is_smoke", False)}
+        if not smoke_ids:
+            return {"runs": [], "total": 0, "batch_mode": True,
+                    "message": "No smoke tests found — tag scenarios with is_smoke=true first"}
+        requested_ids = [sid for sid in requested_ids if sid in smoke_ids]
+        scenario_lookup = {sid: s for sid, s in scenario_lookup.items() if sid in smoke_ids}
+
+    # ── Smart test ordering ───────────────────────────────────────────────────
+    # A human QA never runs tests randomly. Order: smoke → create → update → delete
+    # → validation → integration → everything else. Within each tier, CRITICAL first.
+    _PRIORITY_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+
+    def _order_key(scenario: Scenario) -> tuple:
+        title_lc = (scenario.title or "").lower()
+        desc_lc  = (scenario.description or "").lower()
+        tags     = [str(t).lower() for t in (scenario.tags or [])]
+        all_text = title_lc + " " + desc_lc + " " + " ".join(tags)
+
+        # Tier 0 — smoke tests (explicitly tagged or login/health-check by title)
+        if getattr(scenario, "is_smoke", False) or "smoke" in all_text or any(
+            k in title_lc for k in ("login", "sign in", "access", "health")
+        ):
+            tier = 0
+        # Tier 1 — create / add (must run before update/delete can work)
+        elif any(k in title_lc for k in ("create", "add", "new", "insert", "register")):
+            tier = 1
+        # Tier 2 — update / edit (depends on create)
+        elif any(k in title_lc for k in ("update", "edit", "modify", "change", "amend")):
+            tier = 2
+        # Tier 3 — delete / remove (depends on create)
+        elif any(k in title_lc for k in ("delete", "remove", "archive", "deactivate")):
+            tier = 3
+        # Tier 4 — validation / edge cases
+        elif any(k in title_lc for k in ("validation", "invalid", "edge", "error", "required", "boundary")):
+            tier = 4
+        # Tier 5 — integration / cross-module / e2e
+        elif any(k in title_lc for k in ("integration", "cross", "end-to-end", "e2e", "flow", "workflow")):
+            tier = 5
+        # Tier 6 — regression / everything else
+        else:
+            tier = 6
+
+        priority_val = _PRIORITY_RANK.get(
+            (scenario.priority.value if scenario.priority else "MEDIUM").upper(), 2
+        )
+        return (tier, priority_val)
+
+    # Re-order the valid requested_ids by smart ordering
+    valid_ordered = sorted(
+        [sid for sid in requested_ids if sid in scenario_lookup],
+        key=lambda sid: _order_key(scenario_lookup[sid]),
+    )
+
+    # ── 2. Build ALL plan objects — KG first, fallback for the rest ───────────
     planner = ScenarioPlanner(db)
     plan_entries: list[tuple] = []  # (plan_obj, scenario_title)
-    for sid in requested_ids:
-        if sid not in scenario_lookup:
-            continue
+    for sid in valid_ordered:
         scenario = scenario_lookup[sid]
+
+        # Try KG plan first (no AI, no rate-limit cost) for scenarios with a linked module
+        kg_plan: ExecutionPlan | None = None
+        if scenario.module_id:
+            try:
+                kg_plan = await planner._build_plan_from_kg(scenario, payload.execution_mode)
+            except Exception:
+                kg_plan = None
+
+        if kg_plan:
+            plan_entries.append((kg_plan, scenario.title))
+            continue
+
+        # Fall back to a placeholder plan — batch executor will upgrade it with AI/capability
         plan_data = planner._fallback_plan(scenario)
-        from app.db.models import ExecutionPlan
-        from config import settings as _cfg
         plan = ExecutionPlan(
             scenario_id=scenario.id,
             execution_mode=payload.execution_mode,
@@ -802,10 +943,11 @@ async def generate_execution_plan(
             .limit(1)
         )
         existing_plan = existing.scalar_one_or_none()
-        # Only reuse AI-generated plans. Capability-engine and fallback plans are
-        # always regenerated — the engines improve over time and cached plans may
-        # have stale entity names, bad selectors, etc.
-        if existing_plan and existing_plan.created_by_model not in ("fallback", "capability_engine"):
+        # Reuse AI-generated and KG-recorded plans — they are precise.
+        # Always regenerate fallback and capability_engine plans — generic patterns
+        # that improve over time, and stale entity names / bad selectors get fixed.
+        REGENERATE = {"fallback", "capability_engine"}
+        if existing_plan and existing_plan.created_by_model not in REGENERATE:
             return ExecutionPlanResponse.model_validate(existing_plan)
 
     planner = ScenarioPlanner(db)
@@ -857,6 +999,159 @@ async def list_runs(
         .order_by(ExecutionRun.created_at.desc())
     )
     return [ExecutionRunResponse.model_validate(r) for r in result.scalars().all()]
+
+
+# ─── Playwright Script ────────────────────────────────────────────────────────
+
+def _step_to_playwright(step: dict, indent: str = "  ") -> str:
+    """Convert a single plan step to Playwright TypeScript code line(s)."""
+    action = (step.get("action") or "").lower()
+    target = step.get("target") or step.get("selector") or ""
+    value = step.get("value") or step.get("test_value") or ""
+    desc = step.get("description") or step.get("business_intent") or ""
+    timeout = step.get("timeout_ms", 8000)
+
+    comment = f"{indent}// {desc}" if desc else ""
+    t = target.replace("'", "\\'")
+    v = str(value).replace("'", "\\'") if value else ""
+
+    if action == "navigate":
+        code = f"{indent}await page.goto('{t}');"
+    elif action == "click":
+        code = f"{indent}await page.click('{t}', {{ timeout: {timeout} }});"
+    elif action == "fill":
+        code = f"{indent}await page.fill('{t}', '{v}');"
+    elif action == "clear":
+        code = f"{indent}await page.fill('{t}', '');"
+    elif action == "select":
+        code = f"{indent}await page.selectOption('{t}', '{v}');"
+    elif action == "key_press":
+        key = v or target or "Enter"
+        code = f"{indent}await page.keyboard.press('{key}');"
+    elif action == "hover":
+        code = f"{indent}await page.hover('{t}');"
+    elif action == "assert_visible":
+        code = f"{indent}await expect(page.locator('{t}')).toBeVisible({{ timeout: {timeout} }});"
+    elif action == "assert_not_visible":
+        code = f"{indent}await expect(page.locator('{t}')).not.toBeVisible();"
+    elif action == "assert_text":
+        code = f"{indent}await expect(page.locator('{t}')).toContainText('{v}');"
+    elif action == "assert_not_text":
+        code = f"{indent}await expect(page.locator('{t}')).not.toContainText('{v}');"
+    elif action == "assert_url":
+        pat = (v or t).replace("/", "\\/")
+        code = f"{indent}await expect(page).toHaveURL(/{pat}/);"
+    elif action == "assert_count":
+        code = f"{indent}await expect(page.locator('{t}')).toHaveCount({v or 1});"
+    elif action == "wait_element":
+        code = f"{indent}await page.waitForSelector('{t}', {{ timeout: {timeout} }});"
+    elif action == "wait_ms":
+        ms = int(v) if str(v).isdigit() else timeout
+        code = f"{indent}await page.waitForTimeout({ms});"
+    elif action == "wait_network":
+        code = f"{indent}await page.waitForLoadState('networkidle');"
+    elif action == "scroll":
+        code = f"{indent}await page.evaluate(() => window.scrollBy(0, 400));"
+    elif action == "upload":
+        code = f"{indent}await page.setInputFiles('{t}', '{v or 'path/to/file'}');"
+    elif action == "screenshot":
+        label = desc.lower().replace(" ", "_")[:30] if desc else "step"
+        code = f"{indent}await page.screenshot({{ path: 'screenshots/{label}.png' }});"
+    elif action == "assert_ai_semantic":
+        code = f"{indent}// AI semantic assertion: {desc or v}"
+    else:
+        code = f"{indent}// TODO: {action} — {desc or target}"
+
+    return (comment + "\n" + code) if comment else code
+
+
+def _plan_to_playwright_script(scenario_title: str, steps: list[dict], base_url: str = "") -> str:
+    """Generate a complete Playwright TypeScript test file from plan steps."""
+    lines = [
+        "import { test, expect } from '@playwright/test';",
+        "",
+        f"test('{scenario_title.replace(chr(39), chr(96))}', async ({{ page }}) => {{",
+    ]
+
+    for step in steps:
+        action = (step.get("action") or "").lower()
+        if action == "screenshot":
+            # screenshots in Playwright scripts are optional evidence — include but as low noise
+            lines.append(_step_to_playwright(step))
+        else:
+            lines.append(_step_to_playwright(step))
+        lines.append("")
+
+    lines.append("});")
+    return "\n".join(lines)
+
+
+@router.get("/{scenario_id}/playwright-script")
+async def get_playwright_script(
+    scenario_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Generate a ready-to-run Playwright TypeScript test script for a scenario.
+
+    Uses the best available execution plan:
+      1. KG-recorded plan (exact selectors from exploration — guaranteed to work)
+      2. Latest AI-generated plan
+      3. Skeleton based on scenario description if no plan exists yet
+
+    The script is copy-paste ready for any Playwright test suite.
+    """
+    result = await db.execute(select(Scenario).where(Scenario.id == scenario_id))
+    scenario = result.scalar_one_or_none()
+    if not scenario:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+
+    # Prefer KG-recorded plan, then latest plan
+    plan: "ExecutionPlan | None" = None
+    kg_result = await db.execute(
+        select(ExecutionPlan)
+        .where(
+            ExecutionPlan.scenario_id == scenario_id,
+            ExecutionPlan.created_by_model == "kg_recorded",
+        )
+        .order_by(ExecutionPlan.created_at.desc())
+        .limit(1)
+    )
+    plan = kg_result.scalar_one_or_none()
+
+    if not plan:
+        latest = await db.execute(
+            select(ExecutionPlan)
+            .where(ExecutionPlan.scenario_id == scenario_id)
+            .order_by(ExecutionPlan.created_at.desc())
+            .limit(1)
+        )
+        plan = latest.scalar_one_or_none()
+
+    if plan:
+        steps = plan.plan_data.get("steps", [])
+        source = "kg_recorded" if plan.created_by_model == "kg_recorded" else (plan.created_by_model or "ai")
+    else:
+        # Build a documentation-only skeleton from the scenario description
+        raw_desc = scenario.description or ""
+        desc_lines = [ln.strip() for ln in raw_desc.splitlines() if ln.strip()]
+        steps = [{"action": "navigate", "target": "/", "description": f"Navigate to the application"}]
+        for ln in desc_lines[:20]:
+            steps.append({"action": "TODO", "target": "", "description": ln})
+        steps.append({"action": "assert_visible", "target": ".success", "description": "Verify success state"})
+        source = "skeleton"
+
+    script = _plan_to_playwright_script(scenario.title, steps)
+
+    return {
+        "scenario_id": scenario_id,
+        "scenario_title": scenario.title,
+        "script": script,
+        "source": source,
+        "step_count": len(steps),
+        "plan_id": plan.id if plan else None,
+    }
 
 
 # ─── Feature 1: Exploratory Testing ──────────────────────────────────────────

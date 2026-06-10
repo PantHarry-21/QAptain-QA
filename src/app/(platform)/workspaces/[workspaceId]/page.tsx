@@ -11,15 +11,21 @@ import {
   explore as exploreApi,
   reports as reportsApi,
   executions as executionsApi,
+  knowledge as knowledgeApi,
+  datasets as datasetsApi,
   type Application,
   type Module,
   type Scenario,
   type ReportSummary,
   type BatchHistory,
+  type KgCoverageReport,
+  type KgModuleCoverage,
+  type TestDatasetItem,
+  type PlaywrightScript,
 } from '@/lib/api';
 import { getSocket } from '@/lib/websocket';
 
-type ActiveTab = 'overview' | 'explore' | 'scenarios' | 'reports' | 'settings';
+type ActiveTab = 'overview' | 'explore' | 'scenarios' | 'dataset' | 'knowledge' | 'reports' | 'settings';
 
 export default function WorkspacePage() {
   const params = useParams();
@@ -46,6 +52,8 @@ export default function WorkspacePage() {
   const [runningModuleId, setRunningModuleId] = useState<string | null>(null);
   // Pre-loaded environment — avoids an extra API call on every "Run All" click
   const [cachedEnv, setCachedEnv] = useState<{ id: string } | null>(null);
+  // Live run tracking — updated by WebSocket events
+  const [activeRunCount, setActiveRunCount] = useState(0);
 
   // Add Application modal
   const [showAddApp, setShowAddApp] = useState(false);
@@ -95,8 +103,25 @@ export default function WorkspacePage() {
   useEffect(() => {
     socket.connect();
 
+    const offRunStarted = socket.on('run_started', () => {
+      setActiveRunCount((n) => n + 1);
+    });
+
     const offRunCompleted = socket.on('run_completed', () => {
+      setActiveRunCount((n) => Math.max(0, n - 1));
+      if (selectedAppRef.current) {
+        loadReports(selectedAppRef.current.id);
+        loadScenarios(selectedAppRef.current.id);
+      }
+    });
+
+    const offRunFailed = socket.on('run_failed', () => {
+      setActiveRunCount((n) => Math.max(0, n - 1));
       if (selectedAppRef.current) loadReports(selectedAppRef.current.id);
+    });
+
+    const offRunCancelled = socket.on('run_cancelled', () => {
+      setActiveRunCount((n) => Math.max(0, n - 1));
     });
 
     // After exploration finishes → jump to Scenarios tab and refresh
@@ -106,7 +131,10 @@ export default function WorkspacePage() {
     });
 
     return () => {
+      offRunStarted();
       offRunCompleted();
+      offRunFailed();
+      offRunCancelled();
       offExploreCompleted();
     };
   }, []);
@@ -527,7 +555,9 @@ export default function WorkspacePage() {
               [
                 { id: 'overview', label: 'Overview', icon: '📊' },
                 { id: 'explore', label: 'Explore', icon: '🔍' },
-                { id: 'scenarios', label: 'Test Data', icon: '📋', badge: scenarios.length || undefined },
+                { id: 'scenarios', label: 'Scenarios', icon: '📋', badge: scenarios.length || undefined },
+                { id: 'dataset', label: 'Dataset', icon: '🗂️' },
+                { id: 'knowledge', label: 'Knowledge Graph', icon: '🧠' },
                 { id: 'reports', label: 'Reports', icon: '📈' },
                 { id: 'settings', label: 'Settings', icon: '⚙️' },
               ] as const
@@ -553,6 +583,16 @@ export default function WorkspacePage() {
 
         {/* Main Content */}
         <main className="flex-1 overflow-y-auto p-6">
+          {/* Active run indicator — shown while any scenario is executing */}
+          {activeRunCount > 0 && (
+            <div className="flex items-center gap-3 bg-blue-500/10 border border-blue-500/25 rounded-xl px-4 py-2.5 mb-5 text-sm">
+              <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse shrink-0" />
+              <span className="text-blue-300 font-medium">
+                {activeRunCount} execution{activeRunCount > 1 ? 's' : ''} in progress
+              </span>
+              <span className="text-blue-400/60 text-xs">Scenario badges will update when complete.</span>
+            </div>
+          )}
           {!selectedApp ? (
             <div className="flex flex-col items-center justify-center h-full text-center">
               <div className="text-4xl mb-4">🚀</div>
@@ -762,6 +802,12 @@ export default function WorkspacePage() {
                   )}
                 </>
               )}
+              {tab === 'dataset' && selectedApp && (
+                <DatasetTab app={selectedApp} />
+              )}
+              {tab === 'knowledge' && selectedApp && (
+                <KnowledgeGraphTab app={selectedApp} onExploreClick={() => setTab('explore')} />
+              )}
               {tab === 'reports' && selectedApp && (
                 <ReportsTab reports={reports} workspaceId={workspaceId} appId={selectedApp.id} />
               )}
@@ -859,6 +905,15 @@ function OverviewTab({ app, scenarios, reports, onRunScenario, onExploreClick, o
     ? Math.round(recentReports.filter((r) => r.run_status === 'COMPLETED').length / recentReports.length * 100)
     : 0;
 
+  const [coverage, setCoverage] = useState<KgCoverageReport | null>(null);
+  const [drift, setDrift] = useState<import('@/lib/api').KgDriftReport | null>(null);
+  useEffect(() => {
+    if (app.has_knowledge) {
+      knowledgeApi.getCoverage(app.id).then(setCoverage).catch(() => {});
+      knowledgeApi.getDrift(app.id).then(setDrift).catch(() => {});
+    }
+  }, [app.id, app.has_knowledge]);
+
   return (
     <div>
       <div className="mb-6">
@@ -872,6 +927,43 @@ function OverviewTab({ app, scenarios, reports, onRunScenario, onExploreClick, o
         <StatCard icon="📊" label="Executions" value={reports.length} color="green" />
         <StatCard icon="✓" label="Pass Rate" value={`${passRate}%`} color={passRate >= 80 ? 'green' : passRate >= 50 ? 'amber' : 'red'} />
       </div>
+
+      {/* Selector drift alert — shown when KG selectors are consistently failing */}
+      {drift?.drift_detected && (
+        <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-4 mb-6">
+          <div className="flex items-start gap-3">
+            <span className="text-amber-400 text-lg shrink-0">⚠️</span>
+            <div className="flex-1 min-w-0">
+              <p className="text-amber-300 font-medium text-sm">
+                Selector drift detected in {drift.drifted_modules.length} module{drift.drifted_modules.length > 1 ? 's' : ''}
+              </p>
+              <p className="text-amber-400/70 text-xs mt-1">
+                KG selectors are failing consistently — the application UI may have changed.
+              </p>
+              <div className="mt-2 space-y-1.5">
+                {drift.drifted_modules.map((m) => (
+                  <div key={m.module_id} className="flex items-center gap-2 text-xs">
+                    <span className={`w-2 h-2 rounded-full shrink-0 ${m.severity === 'high' ? 'bg-red-400' : 'bg-amber-400'}`} />
+                    <span className="text-amber-200 font-medium">{m.module_name}</span>
+                    <span className="text-amber-400/60">{m.fail_rate_pct}% failure rate</span>
+                    {m.top_failing_selectors[0] && (
+                      <span className="text-zinc-500 truncate max-w-xs">
+                        Top: "{m.top_failing_selectors[0].target}" ({m.top_failing_selectors[0].error_type})
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <button
+              onClick={onExploreClick}
+              className="shrink-0 px-3 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30 text-xs rounded-lg transition-colors"
+            >
+              Re-explore now
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 mb-6">
         <div className="flex items-center justify-between">
@@ -892,6 +984,57 @@ function OverviewTab({ app, scenarios, reports, onRunScenario, onExploreClick, o
         </div>
       </div>
 
+      {/* KG Coverage Panel */}
+      {coverage && (
+        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 mb-6">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="font-semibold text-white">KG Coverage</h3>
+            <div className="flex items-center gap-3 text-xs text-zinc-500">
+              <span>{coverage.summary.modules_kg_ready}/{coverage.summary.modules_total} modules KG-ready</span>
+              <span className={`font-semibold ${
+                coverage.summary.kg_coverage_pct >= 75 ? 'text-emerald-400' :
+                coverage.summary.kg_coverage_pct >= 40 ? 'text-amber-400' : 'text-zinc-400'
+              }`}>{coverage.summary.kg_coverage_pct}% KG-backed</span>
+            </div>
+          </div>
+          {/* Progress bar */}
+          <div className="w-full bg-zinc-800 rounded-full h-1.5 mb-4">
+            <div
+              className="bg-emerald-500 h-1.5 rounded-full transition-all"
+              style={{ width: `${coverage.summary.kg_coverage_pct}%` }}
+            />
+          </div>
+          <div className="space-y-1.5">
+            {coverage.modules.map((m) => (
+              <div key={m.module_id} className="flex items-center gap-3 text-sm">
+                <span className={`w-2 h-2 rounded-full shrink-0 ${
+                  m.status === 'kg_ready' ? 'bg-emerald-500' :
+                  m.status === 'explored' ? 'bg-blue-400' : 'bg-zinc-600'
+                }`} />
+                <span className="text-zinc-300 flex-1 truncate">{m.module_name}</span>
+                {m.kg_workflow_types.length > 0 && (
+                  <div className="flex gap-1">
+                    {m.kg_workflow_types.map((t) => (
+                      <span key={t} className="text-xs bg-emerald-500/10 text-emerald-400 px-1.5 py-0.5 rounded">
+                        {t.replace('crud_', '')}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <span className="text-zinc-600 text-xs shrink-0">
+                  {m.scenarios_kg_backed}/{m.scenarios_total} scenarios
+                </span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 flex gap-4 text-xs text-zinc-600">
+            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-emerald-500 inline-block" /> KG-ready (exact selectors)</span>
+            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-blue-400 inline-block" /> Explored (no KG yet)</span>
+            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-zinc-600 inline-block" /> Not explored</span>
+          </div>
+        </div>
+      )}
+
       {scenarios.length > 0 && (
         <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 mb-6">
           <h3 className="font-semibold text-white mb-3">Quick Execute</h3>
@@ -899,7 +1042,10 @@ function OverviewTab({ app, scenarios, reports, onRunScenario, onExploreClick, o
             {scenarios.slice(0, 5).map((s) => (
               <div key={s.id} className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-lg">
                 <div className="flex-1 min-w-0 mr-3">
-                  <span className="text-sm text-zinc-300 truncate block">{s.title}</span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm text-zinc-300 truncate">{s.title}</span>
+                    <KgReadyBadge kgPlanAvailable={s.kg_plan_available} workflowTypes={s.kg_workflow_types} />
+                  </div>
                   {s.module_name && (
                     <span className="text-xs text-zinc-500">{s.module_name}</span>
                   )}
@@ -1031,15 +1177,54 @@ function ExploreTab({
 
 // ─── Scenarios Tab ────────────────────────────────────────────────────────────
 
-function ScenarioViewModal({ scenario, onClose, onEdit }: { scenario: Scenario; onClose: () => void; onEdit: () => void }) {
+function ScenarioViewModal({ scenario, onClose, onEdit, onRun }: {
+  scenario: Scenario;
+  onClose: () => void;
+  onEdit: () => void;
+  onRun?: () => void;
+}) {
+  const [showScript, setShowScript] = useState(false);
+  const [scriptData, setScriptData] = useState<PlaywrightScript | null>(null);
+  const [loadingScript, setLoadingScript] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const toast = useAppToast();
+
+  const handleLoadScript = async () => {
+    if (scriptData) { setShowScript(true); return; }
+    setLoadingScript(true);
+    try {
+      const data = await scenariosApi.getPlaywrightScript(scenario.id);
+      setScriptData(data);
+      setShowScript(true);
+    } catch (e) {
+      console.error('Failed to load Playwright script', e);
+      toast.error(e instanceof Error ? e.message : 'Failed to load Playwright script');
+    } finally {
+      setLoadingScript(false);
+    }
+  };
+
+  const handleCopy = () => {
+    if (!scriptData) return;
+    navigator.clipboard.writeText(scriptData.script);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm" onClick={onClose}>
-      <div className="bg-zinc-900 border border-zinc-700 rounded-2xl w-full max-w-2xl max-h-[85vh] flex flex-col shadow-2xl" onClick={(e) => e.stopPropagation()}>
+      <div
+        className={`bg-zinc-900 border border-zinc-700 rounded-2xl w-full flex flex-col shadow-2xl transition-all ${
+          showScript ? 'max-w-4xl max-h-[92vh]' : 'max-w-2xl max-h-[85vh]'
+        }`}
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="flex items-start justify-between px-6 py-4 border-b border-zinc-800">
           <div className="flex-1 min-w-0 pr-4">
             <div className="flex items-center gap-2 flex-wrap mb-1">
               <PriorityBadge priority={scenario.priority} />
               <SourceBadge source={scenario.source} />
+              <KgReadyBadge kgPlanAvailable={scenario.kg_plan_available} workflowTypes={scenario.kg_workflow_types} />
               {scenario.module_name && (
                 <span className="text-xs bg-zinc-700/60 text-zinc-400 px-2 py-0.5 rounded-full">{scenario.module_name}</span>
               )}
@@ -1047,37 +1232,106 @@ function ScenarioViewModal({ scenario, onClose, onEdit }: { scenario: Scenario; 
             <h2 className="text-lg font-semibold text-white leading-snug">{scenario.title}</h2>
           </div>
           <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={handleLoadScript}
+              disabled={loadingScript}
+              title="View Playwright test script"
+              className={`flex items-center gap-1.5 text-xs px-3 py-1.5 border rounded-lg transition-colors disabled:opacity-50 ${
+                showScript
+                  ? 'bg-violet-600/30 border-violet-500/40 text-violet-300'
+                  : 'bg-zinc-800 hover:bg-zinc-700 border-zinc-700 text-zinc-300'
+              }`}
+            >
+              {loadingScript ? <span className="animate-spin inline-block w-3 h-3 border border-zinc-300 border-t-transparent rounded-full" /> : '📜'}
+              Script
+            </button>
+            {onRun && (
+              <button
+                onClick={() => { onClose(); onRun(); }}
+                className="flex items-center gap-1.5 text-xs px-3 py-1.5 bg-green-600/20 hover:bg-green-600/30 text-green-300 border border-green-600/30 rounded-lg transition-colors"
+              >
+                ▶ Run
+              </button>
+            )}
             <button onClick={onEdit} className="flex items-center gap-1.5 text-xs px-3 py-1.5 bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-600/30 rounded-lg transition-colors">
               ✏️ Edit
             </button>
             <button onClick={onClose} className="text-zinc-500 hover:text-white transition-colors text-xl leading-none px-1">✕</button>
           </div>
         </div>
-        <div className="overflow-y-auto flex-1 px-6 py-5 space-y-5">
-          {scenario.description ? (
-            <div>
-              <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wide mb-2">Description / Steps</h3>
-              <div className="text-sm text-zinc-300 whitespace-pre-wrap bg-zinc-800/50 rounded-xl p-4 border border-zinc-700/50 leading-relaxed">
-                {scenario.description}
+
+        {showScript && scriptData ? (
+          <div className="flex flex-col flex-1 overflow-hidden">
+            {/* Script header bar */}
+            <div className="flex items-center justify-between px-6 py-3 bg-zinc-800/60 border-b border-zinc-800">
+              <div className="flex items-center gap-3">
+                <span className="text-xs font-mono text-zinc-400">playwright / typescript</span>
+                <span className={`text-xs px-2 py-0.5 rounded-full ${
+                  scriptData.source === 'kg_recorded'
+                    ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                    : scriptData.source === 'skeleton'
+                    ? 'bg-zinc-700 text-zinc-400'
+                    : 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
+                }`}>
+                  {scriptData.source === 'kg_recorded' ? '⚡ From KG — exact selectors' : scriptData.source === 'skeleton' ? 'Template skeleton' : 'From AI plan'}
+                </span>
+                <span className="text-xs text-zinc-600">{scriptData.step_count} steps</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleCopy}
+                  className="flex items-center gap-1.5 text-xs px-3 py-1.5 bg-zinc-700 hover:bg-zinc-600 text-zinc-200 rounded-lg transition-colors"
+                >
+                  {copied ? '✓ Copied!' : '📋 Copy'}
+                </button>
+                <button
+                  onClick={() => setShowScript(false)}
+                  className="text-xs text-zinc-500 hover:text-zinc-300 px-2 py-1.5 transition-colors"
+                >
+                  Hide
+                </button>
               </div>
             </div>
-          ) : (
-            <p className="text-sm text-zinc-600 italic">No description provided.</p>
-          )}
-          {scenario.tags && scenario.tags.length > 0 && (
-            <div>
-              <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wide mb-2">Tags</h3>
-              <div className="flex flex-wrap gap-1.5">
-                {scenario.tags.map((tag) => (
-                  <span key={tag} className="text-xs bg-zinc-700/60 text-zinc-400 px-2 py-0.5 rounded-full">{tag}</span>
-                ))}
+            {scriptData.source === 'skeleton' && (
+              <div className="px-6 py-2.5 bg-amber-500/10 border-b border-amber-500/20 flex items-center gap-2">
+                <span className="text-amber-400 text-sm">⚠️</span>
+                <p className="text-xs text-amber-300">
+                  No execution plan exists yet — this is a template skeleton with no real selectors.
+                  Run the scenario first to generate a KG-backed plan, then come back for the full script.
+                </p>
               </div>
-            </div>
-          )}
-          <div className="text-xs text-zinc-600">
-            Created {scenario.created_at ? new Date(scenario.created_at).toLocaleString() : '—'}
+            )}
+            <pre className="overflow-y-auto flex-1 px-6 py-4 text-xs font-mono text-emerald-300 bg-zinc-950 leading-relaxed whitespace-pre-wrap">
+              {scriptData.script}
+            </pre>
           </div>
-        </div>
+        ) : (
+          <div className="overflow-y-auto flex-1 px-6 py-5 space-y-5">
+            {scenario.description ? (
+              <div>
+                <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wide mb-2">Description / Steps</h3>
+                <div className="text-sm text-zinc-300 whitespace-pre-wrap bg-zinc-800/50 rounded-xl p-4 border border-zinc-700/50 leading-relaxed">
+                  {scenario.description}
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-zinc-600 italic">No description provided.</p>
+            )}
+            {scenario.tags && scenario.tags.length > 0 && (
+              <div>
+                <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wide mb-2">Tags</h3>
+                <div className="flex flex-wrap gap-1.5">
+                  {scenario.tags.map((tag) => (
+                    <span key={tag} className="text-xs bg-zinc-700/60 text-zinc-400 px-2 py-0.5 rounded-full">{tag}</span>
+                  ))}
+                </div>
+              </div>
+            )}
+            <div className="text-xs text-zinc-600">
+              Created {scenario.created_at ? new Date(scenario.created_at).toLocaleString() : '—'}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1204,17 +1458,23 @@ function ScenariosTab({
 }) {
   const [subTab, setSubTab] = useState<'scenarios' | 'user_stories'>('scenarios');
   const [search, setSearch] = useState('');
+  const [sourceFilter, setSourceFilter] = useState<string>('all');
+  const [smokeFilter, setSmokeFilter] = useState(false);
   const [viewScenario, setViewScenario] = useState<Scenario | null>(null);
   const [editScenario, setEditScenario] = useState<Scenario | null>(null);
   const [deletingModuleId, setDeletingModuleId] = useState<string | null>(null);
+  const confirm = useAppConfirm();
 
-  const filtered = search.trim()
-    ? scenarios.filter((s) =>
-        s.title.toLowerCase().includes(search.toLowerCase()) ||
-        (s.module_name || '').toLowerCase().includes(search.toLowerCase()) ||
-        (s.description || '').toLowerCase().includes(search.toLowerCase()),
-      )
-    : scenarios;
+  const filtered = scenarios.filter((s) => {
+    if (search.trim() && !(
+      s.title.toLowerCase().includes(search.toLowerCase()) ||
+      (s.module_name || '').toLowerCase().includes(search.toLowerCase()) ||
+      (s.description || '').toLowerCase().includes(search.toLowerCase())
+    )) return false;
+    if (sourceFilter !== 'all' && s.source !== sourceFilter) return false;
+    if (smokeFilter && !s.is_smoke) return false;
+    return true;
+  });
 
   type Group = { moduleName: string | null; moduleUrl: string | null; moduleId: string | null; items: Scenario[] };
   const groups: Group[] = [];
@@ -1232,7 +1492,14 @@ function ScenariosTab({
 
   const handleDeleteModule = async (moduleId: string | null) => {
     const key = moduleId || '__none__';
-    if (!window.confirm(`Delete all ${moduleMap.get(key)?.items.length ?? 0} scenarios in this group?`)) return;
+    const count = moduleMap.get(key)?.items.length ?? 0;
+    const ok = await confirm({
+      title: `Delete ${count} scenario${count !== 1 ? 's' : ''}?`,
+      message: 'All scenarios in this group will be permanently removed. This cannot be undone.',
+      confirmLabel: 'Delete All',
+      destructive: true,
+    });
+    if (!ok) return;
     setDeletingModuleId(key);
     try {
       await onDeleteModule(moduleId);
@@ -1249,6 +1516,7 @@ function ScenariosTab({
           scenario={viewScenario}
           onClose={() => setViewScenario(null)}
           onEdit={() => { setEditScenario(viewScenario); setViewScenario(null); }}
+          onRun={() => onRunScenario(viewScenario.id)}
         />
       )}
       {/* Edit modal */}
@@ -1266,7 +1534,7 @@ function ScenariosTab({
       {/* Header */}
       <div className="flex items-center justify-between mb-4">
         <div>
-          <h1 className="text-2xl font-bold text-white">Test Data</h1>
+          <h1 className="text-2xl font-bold text-white">Test Scenarios</h1>
           <p className="text-sm text-zinc-500 mt-0.5">
             {scenarios.length} scenario{scenarios.length !== 1 ? 's' : ''} for {app.name}
           </p>
@@ -1324,21 +1592,57 @@ function ScenariosTab({
         )}
       </div>
 
-      {/* Execution mode */}
-      <div className="flex items-center gap-3 mb-5">
-        <span className="text-xs text-zinc-500">Execution mode:</span>
-        <div className="flex gap-1 bg-zinc-900 border border-zinc-800 rounded-lg p-1">
-          {['smoke', 'functional', 'regression'].map((m) => (
-            <button
-              key={m}
-              onClick={() => setExecutionMode(m)}
-              className={`px-3 py-1 text-xs rounded-md transition-colors ${
-                executionMode === m ? 'bg-zinc-700 text-white' : 'text-zinc-500 hover:text-zinc-300'
-              }`}
-            >
-              {m}
-            </button>
-          ))}
+      {/* Filters row */}
+      <div className="flex flex-wrap items-center gap-3 mb-5">
+        {/* Source filter */}
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-zinc-500">Source:</span>
+          <div className="flex gap-1 bg-zinc-900 border border-zinc-800 rounded-lg p-1">
+            {([
+              { value: 'all', label: 'All' },
+              { value: 'kg_generated', label: 'KG' },
+              { value: 'ai_generated', label: 'AI' },
+              { value: 'manual', label: 'Manual' },
+            ] as const).map((opt) => (
+              <button
+                key={opt.value}
+                onClick={() => setSourceFilter(opt.value)}
+                className={`px-3 py-1 text-xs rounded-md transition-colors ${
+                  sourceFilter === opt.value ? 'bg-zinc-700 text-white' : 'text-zinc-500 hover:text-zinc-300'
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        {/* Smoke filter */}
+        <button
+          onClick={() => setSmokeFilter((v) => !v)}
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg border transition-colors ${
+            smokeFilter
+              ? 'bg-yellow-500/20 border-yellow-500/40 text-yellow-300'
+              : 'bg-zinc-900 border-zinc-800 text-zinc-500 hover:text-zinc-300'
+          }`}
+        >
+          🔥 Smoke Only
+        </button>
+        {/* Execution mode */}
+        <div className="flex items-center gap-2 ml-auto">
+          <span className="text-xs text-zinc-500">Run mode:</span>
+          <div className="flex gap-1 bg-zinc-900 border border-zinc-800 rounded-lg p-1">
+            {['smoke', 'functional', 'regression'].map((m) => (
+              <button
+                key={m}
+                onClick={() => setExecutionMode(m)}
+                className={`px-3 py-1 text-xs rounded-md transition-colors ${
+                  executionMode === m ? 'bg-zinc-700 text-white' : 'text-zinc-500 hover:text-zinc-300'
+                }`}
+              >
+                {m}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
@@ -1448,9 +1752,14 @@ function ScenariosTab({
                 {group.items.map((s) => (
                   <div key={s.id} className="flex items-center gap-3 px-5 py-3 hover:bg-zinc-800/30 transition-colors group">
                     <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-sm text-zinc-200 truncate">{s.title}</span>
+                        {s.is_smoke && (
+                          <span className="text-xs bg-yellow-500/20 text-yellow-300 border border-yellow-500/30 px-1.5 py-0.5 rounded-full">🔥 Smoke</span>
+                        )}
                         <SourceBadge source={s.source} />
+                        <KgReadyBadge kgPlanAvailable={s.kg_plan_available} workflowTypes={s.kg_workflow_types} />
+                        <LastRunBadge status={s.last_run_status} />
                       </div>
                       {s.description && (
                         <div className="text-xs text-zinc-600 truncate mt-0.5">{s.description}</div>
@@ -1781,28 +2090,66 @@ function ReportsTab({
   const passRate = (b: BatchHistory) =>
     b.total > 0 ? Math.round((b.passed / b.total) * 100) : 0;
 
+  const exportReportsCSV = () => {
+    if (!reports.length) return;
+    const headers = ['Scenario', 'Run Status', 'Quality Score', 'Risk Level', 'Pass Rate (%)', 'Steps Passed', 'Steps Total', 'Date'];
+    const rows = reports.map((r) => {
+      const s = r.summary;
+      const pr = s.pass_rate ?? (s.total ? Math.round(((s.passed ?? 0) / s.total) * 100) : '');
+      return [
+        `"${(r.scenario_title ?? '').replace(/"/g, '""')}"`,
+        r.run_status ?? '',
+        r.quality_score?.toFixed(0) ?? '',
+        r.risk_level ?? '',
+        pr,
+        s.passed ?? '',
+        s.total ?? '',
+        `"${new Date(r.created_at).toLocaleString()}"`,
+      ].join(',');
+    });
+    const csv = [headers.join(','), ...rows].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `qaptain-reports-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <div>
       {/* Header + toggle */}
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl font-bold text-white">Execution Reports</h1>
-        <div className="flex bg-zinc-800 rounded-lg p-1 gap-1">
-          <button
-            onClick={() => setView('reports')}
-            className={`px-4 py-1.5 text-sm rounded-md transition-colors font-medium ${
-              view === 'reports' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-zinc-200'
-            }`}
-          >
-            AI Reports
-          </button>
-          <button
-            onClick={() => setView('history')}
-            className={`px-4 py-1.5 text-sm rounded-md transition-colors font-medium ${
-              view === 'history' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-zinc-200'
-            }`}
-          >
-            Run History
-          </button>
+        <div className="flex items-center gap-3">
+          {view === 'reports' && reports.length > 0 && (
+            <button
+              onClick={exportReportsCSV}
+              className="text-xs px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700 transition-colors"
+              title="Export visible reports as CSV"
+            >
+              ↓ Export CSV
+            </button>
+          )}
+          <div className="flex bg-zinc-800 rounded-lg p-1 gap-1">
+            <button
+              onClick={() => setView('reports')}
+              className={`px-4 py-1.5 text-sm rounded-md transition-colors font-medium ${
+                view === 'reports' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              AI Reports
+            </button>
+            <button
+              onClick={() => setView('history')}
+              className={`px-4 py-1.5 text-sm rounded-md transition-colors font-medium ${
+                view === 'history' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              Run History
+            </button>
+          </div>
         </div>
       </div>
 
@@ -2585,6 +2932,7 @@ function PriorityBadge({ priority }: { priority: string }) {
 function SourceBadge({ source }: { source: string }) {
   const map: Record<string, { label: string; style: string }> = {
     ai_generated: { label: 'AI', style: 'bg-purple-500/20 text-purple-300' },
+    kg_generated: { label: 'KG', style: 'bg-cyan-500/20 text-cyan-300' },
     document: { label: 'Doc', style: 'bg-amber-500/20 text-amber-300' },
     excel: { label: 'Excel', style: 'bg-green-500/20 text-green-300' },
     csv: { label: 'CSV', style: 'bg-teal-500/20 text-teal-300' },
@@ -2595,5 +2943,633 @@ function SourceBadge({ source }: { source: string }) {
     <span className={`text-xs px-1.5 py-0.5 rounded ${info.style} shrink-0`}>
       {info.label}
     </span>
+  );
+}
+
+function LastRunBadge({ status }: { status?: string }) {
+  if (!status) return null;
+  const cfg =
+    status === 'COMPLETED' ? { label: '✓ Passed', cls: 'bg-green-500/15 text-green-400 border-green-500/25' } :
+    status === 'FAILED'    ? { label: '✗ Failed', cls: 'bg-red-500/15 text-red-400 border-red-500/25' } :
+    status === 'RUNNING'   ? { label: '● Running', cls: 'bg-blue-500/15 text-blue-300 border-blue-500/25 animate-pulse' } :
+    status === 'CANCELLED' ? { label: '⊘ Cancelled', cls: 'bg-zinc-700 text-zinc-400 border-zinc-600' } :
+    null;
+  if (!cfg) return null;
+  return (
+    <span className={`text-xs px-1.5 py-0.5 rounded border shrink-0 ${cfg.cls}`}>
+      {cfg.label}
+    </span>
+  );
+}
+
+function KgReadyBadge({ kgPlanAvailable, workflowTypes }: { kgPlanAvailable?: boolean; workflowTypes?: string[] }) {
+  if (!kgPlanAvailable) return null;
+  const ops = (workflowTypes || [])
+    .map((t) => t.replace('crud_', '').toUpperCase())
+    .join('+');
+  return (
+    <span
+      className="text-xs px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/25 shrink-0"
+      title={`KG-backed plan ready: ${workflowTypes?.join(', ')}`}
+    >
+      KG Ready {ops && `· ${ops}`}
+    </span>
+  );
+}
+
+// ─── Dataset Tab ──────────────────────────────────────────────────────────────
+
+const DATASET_CATEGORIES = [
+  { key: 'invalid_email',   label: 'Invalid Email',       icon: '📧', hint: 'e.g. notanemail, user@, @domain.com',    dataType: 'email' as const },
+  { key: 'invalid_file',    label: 'Invalid File',        icon: '📎', hint: 'Upload a file with wrong type/format',   dataType: 'file' as const  },
+  { key: 'oversized_file',  label: 'Oversized File',      icon: '🔼', hint: 'Upload a file exceeding the size limit', dataType: 'file' as const  },
+  { key: 'valid_file',      label: 'Valid File',          icon: '✅', hint: 'A correctly formatted upload for happy-path tests', dataType: 'file' as const },
+  { key: 'boundary_number', label: 'Boundary Number',     icon: '🔢', hint: 'e.g. -1, 0, 99999, 2147483647',         dataType: 'number' as const },
+  { key: 'boundary_date',   label: 'Boundary Date',       icon: '📅', hint: 'e.g. 1900-01-01, 2099-12-31, today',    dataType: 'date' as const  },
+  { key: 'sql_injection',   label: 'SQL Injection',       icon: '💉', hint: "e.g. '; DROP TABLE users; --",           dataType: 'text' as const  },
+  { key: 'xss_payload',     label: 'XSS Payload',        icon: '⚡', hint: "e.g. <script>alert('xss')</script>",    dataType: 'text' as const  },
+  { key: 'custom',          label: 'Custom',              icon: '🔧', hint: 'Any custom test value',                 dataType: 'text' as const  },
+];
+
+const DATASET_MAX_FILE_MB = 50;
+
+function DatasetTab({ app }: { app: Application }) {
+  const [items, setItems] = useState<TestDatasetItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const [activeCategory, setActiveCategory] = useState<string>(DATASET_CATEGORIES[0].key);
+  const [addValue, setAddValue] = useState('');
+  const [addLabel, setAddLabel] = useState('');
+  const [addDesc, setAddDesc] = useState('');
+  const [adding, setAdding] = useState(false);
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  // Inline edit state
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editLabel, setEditLabel] = useState('');
+  const [editValue, setEditValue] = useState('');
+  const [editDesc, setEditDesc] = useState('');
+  const [savingEdit, setSavingEdit] = useState(false);
+
+  const toast = useAppToast();
+  const confirm = useAppConfirm();
+
+  const catMeta = DATASET_CATEGORIES.find((c) => c.key === activeCategory)!;
+  const catItems = items.filter((i) => i.category === activeCategory);
+
+  useEffect(() => {
+    setLoadError(false);
+    datasetsApi.list(app.id)
+      .then(setItems)
+      .catch(() => { setItems([]); setLoadError(true); })
+      .finally(() => setLoading(false));
+  }, [app.id]);
+
+  const handleAddText = async () => {
+    if (!addValue.trim() && catMeta.dataType !== 'file') return;
+    setAdding(true);
+    try {
+      const item = await datasetsApi.create(app.id, {
+        category: activeCategory,
+        label: addLabel.trim() || addValue.trim().slice(0, 60),
+        data_type: catMeta.dataType === 'file' ? 'text' : catMeta.dataType,
+        text_value: addValue.trim(),
+        description: addDesc.trim() || undefined,
+      });
+      setItems((prev) => [...prev, item]);
+      setAddValue(''); setAddLabel(''); setAddDesc('');
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to add item');
+    } finally { setAdding(false); }
+  };
+
+  const handleUpload = async () => {
+    if (!uploadFile) return;
+    if (uploadFile.size > DATASET_MAX_FILE_MB * 1024 * 1024) {
+      toast.error(`File exceeds the ${DATASET_MAX_FILE_MB} MB limit. Choose a smaller file.`);
+      return;
+    }
+    setUploading(true);
+    try {
+      const item = await datasetsApi.uploadFile(app.id, {
+        category: activeCategory,
+        label: addLabel.trim() || uploadFile.name,
+        description: addDesc.trim() || undefined,
+        file: uploadFile,
+      });
+      setItems((prev) => [...prev, item]);
+      setUploadFile(null); setAddLabel(''); setAddDesc('');
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Upload failed');
+    } finally { setUploading(false); }
+  };
+
+  const handleDelete = async (id: string) => {
+    const ok = await confirm({
+      title: 'Delete this item?',
+      message: 'This cannot be undone.',
+      confirmLabel: 'Delete',
+      destructive: true,
+    });
+    if (!ok) return;
+    setDeletingId(id);
+    try {
+      await datasetsApi.delete(app.id, id);
+      setItems((prev) => prev.filter((i) => i.id !== id));
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Delete failed');
+    } finally { setDeletingId(null); }
+  };
+
+  const startEdit = (item: TestDatasetItem) => {
+    setEditingId(item.id);
+    setEditLabel(item.label);
+    setEditValue(item.text_value || '');
+    setEditDesc(item.description || '');
+  };
+
+  const cancelEdit = () => { setEditingId(null); };
+
+  const handleSaveEdit = async (item: TestDatasetItem) => {
+    setSavingEdit(true);
+    try {
+      const updated = await datasetsApi.update(app.id, item.id, {
+        label: editLabel.trim() || item.label,
+        text_value: editValue.trim() || undefined,
+        description: editDesc.trim() || undefined,
+      });
+      setItems((prev) => prev.map((i) => i.id === item.id ? updated : i));
+      setEditingId(null);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to save changes');
+    } finally { setSavingEdit(false); }
+  };
+
+  const formatSize = (bytes?: number) => {
+    if (!bytes) return '';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  };
+
+  return (
+    <div>
+      <div className="mb-6">
+        <h1 className="text-2xl font-bold text-white">Test Dataset</h1>
+        <p className="text-sm text-zinc-500 mt-1">
+          Store test values (invalid emails, oversized files, edge-case inputs) that the executor
+          automatically picks up when running validation and boundary scenarios.
+        </p>
+      </div>
+
+      <div className="flex gap-6">
+        {/* Category sidebar */}
+        <div className="w-48 shrink-0">
+          <div className="space-y-0.5">
+            {DATASET_CATEGORIES.map((cat) => {
+              const count = items.filter((i) => i.category === cat.key).length;
+              return (
+                <button
+                  key={cat.key}
+                  onClick={() => setActiveCategory(cat.key)}
+                  className={`w-full text-left flex items-center justify-between px-3 py-2 rounded-lg text-sm transition-colors ${
+                    activeCategory === cat.key
+                      ? 'bg-zinc-800 text-white'
+                      : 'text-zinc-500 hover:bg-zinc-800/60 hover:text-zinc-300'
+                  }`}
+                >
+                  <span className="flex items-center gap-2">
+                    <span>{cat.icon}</span>
+                    <span className="truncate">{cat.label}</span>
+                  </span>
+                  {count > 0 && (
+                    <span className="text-xs bg-blue-600/30 text-blue-300 px-1.5 py-0.5 rounded-full ml-1 shrink-0">
+                      {count}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Main content */}
+        <div className="flex-1 min-w-0">
+          {/* Category header */}
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 mb-4">
+            <div className="flex items-center gap-3 mb-1">
+              <span className="text-2xl">{catMeta.icon}</span>
+              <div>
+                <h2 className="text-base font-semibold text-white">{catMeta.label}</h2>
+                <p className="text-xs text-zinc-500">{catMeta.hint}</p>
+              </div>
+            </div>
+
+            {/* Add form */}
+            <div className="mt-4 space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-zinc-500 block mb-1">Label</label>
+                  <input
+                    value={addLabel}
+                    onChange={(e) => setAddLabel(e.target.value)}
+                    placeholder={catMeta.dataType === 'file' ? 'e.g. 10 MB PNG file' : 'Short label'}
+                    className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-zinc-500 block mb-1">Description (optional)</label>
+                  <input
+                    value={addDesc}
+                    onChange={(e) => setAddDesc(e.target.value)}
+                    placeholder="Why this value is useful"
+                    className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+              </div>
+
+              {catMeta.dataType === 'file' ? (
+                <div className="flex items-center gap-3">
+                  <label className="flex-1 flex items-center gap-2 cursor-pointer bg-zinc-800 border border-dashed border-zinc-600 rounded-lg px-4 py-3 hover:border-zinc-500 transition-colors">
+                    <span className="text-zinc-400 text-sm">
+                      {uploadFile ? uploadFile.name : 'Click to select a file…'}
+                    </span>
+                    <input type="file" className="hidden" onChange={(e) => setUploadFile(e.target.files?.[0] || null)} />
+                  </label>
+                  {uploadFile && (
+                    <span className="text-xs text-zinc-500 shrink-0">{formatSize(uploadFile.size)}</span>
+                  )}
+                  <button
+                    onClick={handleUpload}
+                    disabled={uploading || !uploadFile}
+                    className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg transition-colors disabled:opacity-50 flex items-center gap-2"
+                  >
+                    {uploading && <span className="animate-spin w-3 h-3 border border-white border-t-transparent rounded-full" />}
+                    {uploading ? 'Uploading…' : 'Upload'}
+                  </button>
+                </div>
+              ) : (
+                <div className="flex items-center gap-3">
+                  <input
+                    value={addValue}
+                    onChange={(e) => setAddValue(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && handleAddText()}
+                    placeholder={catMeta.hint}
+                    className="flex-1 bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
+                  />
+                  <button
+                    onClick={handleAddText}
+                    disabled={adding || !addValue.trim()}
+                    className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    {adding ? 'Adding…' : 'Add'}
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Existing items */}
+          {loading ? (
+            <div className="flex items-center gap-2 text-zinc-500 text-sm py-6">
+              <span className="animate-spin w-4 h-4 border-2 border-zinc-600 border-t-zinc-300 rounded-full" />
+              Loading…
+            </div>
+          ) : loadError ? (
+            <div className="bg-red-500/10 border border-red-500/25 rounded-xl p-8 text-center">
+              <div className="text-red-400 text-sm font-medium mb-1">Failed to load dataset items</div>
+              <div className="text-zinc-500 text-xs">Check your connection and reload the page.</div>
+            </div>
+          ) : catItems.length === 0 ? (
+            <div className="bg-zinc-900 border border-dashed border-zinc-800 rounded-xl p-8 text-center text-zinc-500 text-sm">
+              No {catMeta.label.toLowerCase()} items yet — add one above.
+            </div>
+          ) : (
+            <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
+              <div className="px-5 py-2 bg-zinc-800/40 border-b border-zinc-800 text-xs text-zinc-500 font-medium">
+                {catItems.length} item{catItems.length !== 1 ? 's' : ''}
+              </div>
+              <div className="divide-y divide-zinc-800">
+                {catItems.map((item) => (
+                  <div key={item.id} className="px-5 py-3 group">
+                    {editingId === item.id ? (
+                      <div className="flex flex-col gap-2">
+                        <input
+                          className="w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-1.5 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-zinc-500"
+                          value={editLabel}
+                          onChange={(e) => setEditLabel(e.target.value)}
+                          placeholder="Label"
+                        />
+                        {item.data_type !== 'file' && (
+                          <input
+                            className="w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-1.5 text-sm font-mono text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-zinc-500"
+                            value={editValue}
+                            onChange={(e) => setEditValue(e.target.value)}
+                            placeholder="Value"
+                          />
+                        )}
+                        <input
+                          className="w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-1.5 text-sm text-zinc-400 placeholder-zinc-500 focus:outline-none focus:border-zinc-500"
+                          value={editDesc}
+                          onChange={(e) => setEditDesc(e.target.value)}
+                          placeholder="Description (optional)"
+                        />
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => handleSaveEdit(item)}
+                            disabled={savingEdit}
+                            className="text-xs px-3 py-1 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-200 transition-colors disabled:opacity-50"
+                          >
+                            {savingEdit ? 'Saving…' : 'Save'}
+                          </button>
+                          <button
+                            onClick={cancelEdit}
+                            className="text-xs px-3 py-1 rounded text-zinc-500 hover:text-zinc-300 transition-colors"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex items-start gap-3">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm text-zinc-200 font-medium">{item.label}</span>
+                            {item.data_type === 'file' && item.file_size && (
+                              <span className="text-xs text-zinc-600">{formatSize(item.file_size)}</span>
+                            )}
+                          </div>
+                          {item.data_type !== 'file' && item.text_value && (
+                            <div className="text-xs font-mono text-zinc-400 mt-0.5 bg-zinc-800/60 px-2 py-1 rounded truncate max-w-lg">
+                              {item.text_value}
+                            </div>
+                          )}
+                          {item.data_type === 'file' && item.file_name && (
+                            <div className="text-xs text-zinc-500 mt-0.5">{item.file_name}</div>
+                          )}
+                          {item.description && (
+                            <div className="text-xs text-zinc-600 mt-0.5">{item.description}</div>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 shrink-0 mt-0.5">
+                          {item.data_type !== 'file' && (
+                            <button
+                              onClick={() => startEdit(item)}
+                              className="text-zinc-600 hover:text-zinc-300 transition-colors text-sm px-1"
+                              title="Edit"
+                            >
+                              ✎
+                            </button>
+                          )}
+                          <button
+                            onClick={() => handleDelete(item.id)}
+                            disabled={deletingId === item.id}
+                            className="text-zinc-600 hover:text-red-400 transition-colors text-sm px-1"
+                            title="Delete"
+                          >
+                            {deletingId === item.id ? (
+                              <span className="animate-spin inline-block w-3 h-3 border border-zinc-400 border-t-transparent rounded-full" />
+                            ) : '✕'}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Knowledge Graph Tab ──────────────────────────────────────────────────────
+
+function KnowledgeGraphTab({ app, onExploreClick }: { app: Application; onExploreClick: () => void }) {
+  const [coverage, setCoverage] = useState<KgCoverageReport | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [selectedModule, setSelectedModule] = useState<KgModuleCoverage | null>(null);
+
+  useEffect(() => {
+    knowledgeApi.getCoverage(app.id)
+      .then(setCoverage)
+      .catch(() => setCoverage(null))
+      .finally(() => setLoading(false));
+  }, [app.id]);
+
+  const statusColor = (status: KgModuleCoverage['status']) =>
+    status === 'kg_ready' ? 'border-emerald-500/40 bg-emerald-500/5' :
+    status === 'explored' ? 'border-amber-500/40 bg-amber-500/5' :
+    'border-zinc-700 bg-zinc-900';
+
+  const statusBadge = (status: KgModuleCoverage['status']) =>
+    status === 'kg_ready'
+      ? <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">⚡ KG Ready</span>
+      : status === 'explored'
+      ? <span className="text-xs px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/30">🔍 Explored</span>
+      : <span className="text-xs px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-500">Not Explored</span>;
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 text-zinc-500 text-sm py-20 justify-center">
+        <span className="animate-spin w-5 h-5 border-2 border-zinc-600 border-t-zinc-300 rounded-full" />
+        Loading knowledge graph…
+      </div>
+    );
+  }
+
+  if (!coverage || coverage.modules.length === 0) {
+    return (
+      <div>
+        <div className="mb-6">
+          <h1 className="text-2xl font-bold text-white">Knowledge Graph</h1>
+        </div>
+        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-12 text-center">
+          <div className="text-4xl mb-4">🧠</div>
+          <p className="text-zinc-400 font-medium mb-2">No knowledge graph yet</p>
+          <p className="text-zinc-600 text-sm mb-6">
+            Run an Explore session to let QAptain learn the application structure.
+            The KG records module layouts, selectors, and workflows — enabling tests without AI calls.
+          </p>
+          <button
+            onClick={onExploreClick}
+            className="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-colors"
+          >
+            Start Exploration
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const { summary } = coverage;
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-6">
+        <div>
+          <h1 className="text-2xl font-bold text-white">Knowledge Graph</h1>
+          <p className="text-sm text-zinc-500 mt-1">
+            Live view of the explored application structure — updates after every Explore session.
+          </p>
+        </div>
+        <button
+          onClick={onExploreClick}
+          className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-200 text-sm rounded-lg transition-colors"
+        >
+          🔍 Re-Explore
+        </button>
+      </div>
+
+      {/* Summary stats */}
+      <div className="grid grid-cols-4 gap-4 mb-8">
+        <div className="bg-zinc-900 border border-blue-500/20 rounded-xl p-4">
+          <div className="text-2xl font-bold text-white">{summary.modules_total}</div>
+          <div className="text-xs text-zinc-500">Total Modules</div>
+        </div>
+        <div className="bg-zinc-900 border border-amber-500/20 rounded-xl p-4">
+          <div className="text-2xl font-bold text-amber-400">{summary.modules_explored}</div>
+          <div className="text-xs text-zinc-500">Explored</div>
+        </div>
+        <div className="bg-zinc-900 border border-emerald-500/20 rounded-xl p-4">
+          <div className="text-2xl font-bold text-emerald-400">{summary.modules_kg_ready}</div>
+          <div className="text-xs text-zinc-500">KG Ready</div>
+        </div>
+        <div className="bg-zinc-900 border border-violet-500/20 rounded-xl p-4">
+          <div className="text-2xl font-bold text-violet-400">{summary.kg_coverage_pct}%</div>
+          <div className="text-xs text-zinc-500">KG Coverage</div>
+        </div>
+      </div>
+
+      {/* Coverage bar */}
+      <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4 mb-6">
+        <div className="flex items-center justify-between text-xs text-zinc-500 mb-2">
+          <span>KG Scenario Coverage</span>
+          <span>{summary.scenarios_kg_backed} / {summary.scenarios_total} scenarios backed by KG</span>
+        </div>
+        <div className="w-full bg-zinc-800 rounded-full h-2">
+          <div
+            className="bg-emerald-500 h-2 rounded-full transition-all"
+            style={{ width: `${summary.kg_coverage_pct}%` }}
+          />
+        </div>
+      </div>
+
+      {/* Module grid */}
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
+        {coverage.modules.map((mod) => (
+          <button
+            key={mod.module_id}
+            onClick={() => setSelectedModule(selectedModule?.module_id === mod.module_id ? null : mod)}
+            className={`text-left border rounded-xl p-4 transition-all hover:border-opacity-70 ${statusColor(mod.status)} ${
+              selectedModule?.module_id === mod.module_id ? 'ring-2 ring-blue-500/40' : ''
+            }`}
+          >
+            <div className="flex items-start justify-between gap-2 mb-2">
+              <span className="text-sm font-medium text-zinc-200 leading-snug">{mod.module_name}</span>
+              {statusBadge(mod.status)}
+            </div>
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-zinc-500">
+              {mod.pages_discovered > 0 && <span>📄 {mod.pages_discovered} pages</span>}
+              {mod.kg_workflows_count > 0 && <span>🔄 {mod.kg_workflows_count} workflows</span>}
+              {mod.scenarios_total > 0 && (
+                <span className={mod.scenarios_kg_backed > 0 ? 'text-emerald-500/80' : ''}>
+                  📋 {mod.scenarios_kg_backed}/{mod.scenarios_total} KG
+                </span>
+              )}
+            </div>
+            {mod.kg_workflow_types.length > 0 && (
+              <div className="flex flex-wrap gap-1 mt-2">
+                {mod.kg_workflow_types.map((wt) => (
+                  <span key={wt} className="text-xs bg-zinc-800 text-zinc-400 px-1.5 py-0.5 rounded">
+                    {wt.replace('crud_', '')}
+                  </span>
+                ))}
+              </div>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {/* Selected module detail panel */}
+      {selectedModule && (
+        <div className="mt-4 bg-zinc-900 border border-zinc-700 rounded-xl p-5">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-semibold text-white">{selectedModule.module_name}</h3>
+            <button
+              onClick={() => setSelectedModule(null)}
+              className="text-zinc-600 hover:text-zinc-400 text-sm"
+            >✕</button>
+          </div>
+          <div className="grid grid-cols-3 gap-4 text-sm">
+            <div>
+              <div className="text-xs text-zinc-500 mb-1">Status</div>
+              {statusBadge(selectedModule.status)}
+            </div>
+            <div>
+              <div className="text-xs text-zinc-500 mb-1">Pages Discovered</div>
+              <div className="text-zinc-300">{selectedModule.pages_discovered}</div>
+            </div>
+            <div>
+              <div className="text-xs text-zinc-500 mb-1">Last Explored</div>
+              <div className="text-zinc-400 text-xs">
+                {selectedModule.last_explored_at
+                  ? new Date(selectedModule.last_explored_at).toLocaleString()
+                  : '—'}
+              </div>
+            </div>
+            <div>
+              <div className="text-xs text-zinc-500 mb-1">KG Workflows</div>
+              <div className="flex flex-wrap gap-1 mt-1">
+                {selectedModule.kg_workflow_types.length > 0
+                  ? selectedModule.kg_workflow_types.map((wt) => (
+                      <span key={wt} className="text-xs bg-emerald-500/15 text-emerald-400 px-2 py-0.5 rounded-full border border-emerald-500/25">
+                        {wt.replace('crud_', '')}
+                      </span>
+                    ))
+                  : <span className="text-zinc-600 text-xs">None recorded yet</span>
+                }
+              </div>
+            </div>
+            <div>
+              <div className="text-xs text-zinc-500 mb-1">Scenarios</div>
+              <div className="text-zinc-300">
+                {selectedModule.scenarios_total} total
+                {selectedModule.scenarios_kg_backed > 0
+                  ? `, ${selectedModule.scenarios_kg_backed} KG-backed`
+                  : ''
+                }
+              </div>
+            </div>
+            <div>
+              <div className="text-xs text-zinc-500 mb-1">KG Coverage</div>
+              <div className="flex items-center gap-2">
+                <div className="flex-1 bg-zinc-800 rounded-full h-1.5">
+                  <div
+                    className="bg-emerald-500 h-1.5 rounded-full"
+                    style={{ width: `${selectedModule.kg_coverage_pct}%` }}
+                  />
+                </div>
+                <span className="text-xs text-zinc-400 shrink-0">{selectedModule.kg_coverage_pct}%</span>
+              </div>
+            </div>
+          </div>
+          {selectedModule.status === 'not_explored' && (
+            <div className="mt-4 flex items-center gap-3 p-3 bg-zinc-800/60 rounded-lg">
+              <span className="text-zinc-500 text-sm">This module hasn&apos;t been explored yet.</span>
+              <button
+                onClick={onExploreClick}
+                className="shrink-0 text-xs px-3 py-1.5 bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-600/30 rounded-lg transition-colors"
+              >
+                Explore now
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 }

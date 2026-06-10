@@ -206,8 +206,10 @@ class ExploreEngine:
                 app.knowledge_graph_id = kg.id if kg else None
                 await self.db.commit()
 
-                # Phase 5: Generate test scenarios
+                # Phase 5: Generate test scenarios (KG-backed + AI)
                 scenarios_count = await self._generate_test_scenarios(application_id, session_id, selected_ids)
+                # Auto-link any unlinked scenarios to their module
+                await self._auto_link_existing_scenarios(application_id)
 
                 # Complete session
                 modules_count = await self._count_modules(application_id)
@@ -245,8 +247,10 @@ class ExploreEngine:
             app.knowledge_graph_id = kg.id if kg else None
             await self.db.commit()
 
-            # Phase 6: Generate AI test scenarios from exploration data
+            # Phase 6: Generate test scenarios (KG-backed + AI)
             scenarios_count = await self._generate_test_scenarios(application_id, session_id, module_ids)
+            # Auto-link any unlinked scenarios to their module
+            await self._auto_link_existing_scenarios(application_id)
 
             # Complete session
             modules_count = await self._count_modules(application_id)
@@ -331,9 +335,13 @@ class ExploreEngine:
             return False
 
         # Wait up to 90s for the page to render at least one input field.
-        # Angular SPAs with heavy scripts (YLIMS UAT) can take 60-90s to bootstrap.
-        # Poll in 15s chunks so the timeline shows live progress instead of 90s silence.
-        await self._log("INFO", "login", "Waiting for login form to render (Angular SPA may take up to 90s)…")
+        # Angular SPAs with heavy scripts can take time to bootstrap.
+        # First wait for Angular to stabilise (up to 30s), then poll for inputs.
+        # Poll in 15s chunks so the timeline shows live progress.
+        await self._log("INFO", "login", "Waiting for Angular to stabilise and login form to render…")
+        ng_stable = await asyncio.to_thread(self._wait_for_angular_stable, 30)
+        if not ng_stable:
+            await self._log("INFO", "login", "Angular not yet stable after 30s — continuing to poll for inputs")
         page_ready = False
         for _chunk in range(6):
             page_ready = await asyncio.to_thread(self._wait_for_any_input, timeout=15)
@@ -1880,6 +1888,22 @@ class ExploreEngine:
                     if category == "add" and dialog_data.get("roundtrip"):
                         add_roundtrip_done = True
 
+                    # Record structured workflow steps to KG so the planner can build
+                    # exact-selector plans without AI for any explored module.
+                    if page.module_id and category in ("add", "edit", "delete"):
+                        try:
+                            await self._record_workflow_to_kg(
+                                page.module_id,
+                                page.url or "",
+                                el,
+                                dialog_data,
+                                category,
+                            )
+                        except Exception as _kg_err:
+                            log.warning("KG workflow recording failed",
+                                category=category, label=label,
+                                error=str(_kg_err)[:120])
+
             enriched.append(enriched_el)
 
         # Update page.forms with any discovered dialog forms
@@ -2444,6 +2468,420 @@ class ExploreEngine:
                 pass
 
         return result
+
+    async def _record_workflow_to_kg(
+        self,
+        module_id: str,
+        page_url: str,
+        el_info: dict,
+        dialog_info: dict,
+        category: str,
+    ) -> None:
+        """
+        Convert a recorded interaction (button click → form fill → submit → verify) into
+        a structured ApplicationWorkflow with exact CSS selectors and stored in the KG.
+
+        Called after every CRUD operation test during element scanning so the scenario
+        planner can build precise, AI-free plans from real selectors instead of guessing.
+
+        workflow_type mapping:
+          add    → crud_create
+          edit   → crud_update
+          delete → crud_delete
+        """
+        from app.db.models import ApplicationWorkflow
+        from sqlalchemy import delete as sa_delete
+
+        workflow_type_map = {"add": "crud_create", "edit": "crud_update", "delete": "crud_delete"}
+        workflow_type = workflow_type_map.get(category, category)
+
+        def best_css(selectors: list) -> str:
+            for s in (selectors or []):
+                if s.get("type") == "css":
+                    return s.get("value", "")
+            for s in (selectors or []):
+                if s.get("type") == "xpath":
+                    return s.get("value", "")
+            return ""
+
+        button_label = el_info.get("label", "")
+        button_selector = best_css(el_info.get("selectors", []))
+        fields = dialog_info.get("fields", [])
+        submit_selector = dialog_info.get("submit_selector", "")
+        roundtrip = dialog_info.get("roundtrip") or {}
+        filled_map = {f["field"]: f["value"] for f in roundtrip.get("filled_fields", [])}
+        success_indicator = roundtrip.get("success_indicator", "")
+
+        stages: list[dict] = []
+        seq = 1
+
+        # Always start: wait for list/table, then screenshot
+        stages.append({
+            "seq": seq, "action": "wait_element",
+            "target": "table|tbody|mat-table|ag-grid|[class*=table]|[class*=list]|[class*=grid]",
+            "description": "Wait for module list to load",
+            "phase": "NAVIGATE", "on_fail": "skip", "timeout_ms": 15000,
+        })
+        seq += 1
+        stages.append({
+            "seq": seq, "action": "screenshot",
+            "target": "", "description": "Capture initial module state", "phase": "NAVIGATE",
+        })
+        seq += 1
+
+        if category == "delete":
+            stages.append({
+                "seq": seq, "action": "click",
+                "target": button_selector or "Delete|Remove|trash icon",
+                "description": f"Click {button_label}",
+                "phase": "DELETE",
+            })
+            seq += 1
+            stages.append({
+                "seq": seq, "action": "assert_visible",
+                "target": "confirm|are you sure|delete|yes",
+                "description": "Verify delete confirmation dialog appeared",
+                "phase": "DELETE", "on_fail": "skip", "timeout_ms": 8000,
+            })
+            seq += 1
+            stages.append({
+                "seq": seq, "action": "click",
+                "target": submit_selector or "Confirm|Yes|Delete|OK",
+                "description": "Confirm deletion",
+                "phase": "DELETE",
+            })
+            seq += 1
+            stages.append({
+                "seq": seq, "action": "wait_network",
+                "target": "", "description": "Wait for deletion to complete", "phase": "DELETE",
+            })
+            seq += 1
+        else:
+            # Open form/dialog
+            stages.append({
+                "seq": seq, "action": "click",
+                "target": button_selector or button_label,
+                "description": f"Click '{button_label}'",
+                "phase": "FORM_OPEN",
+            })
+            seq += 1
+            stages.append({
+                "seq": seq, "action": "wait_element",
+                "target": "[role='dialog']|.modal|dialog|.mat-dialog-container|.cdk-overlay-pane|form",
+                "description": "Wait for form/dialog to appear",
+                "phase": "FORM_OPEN", "timeout_ms": 10000,
+            })
+            seq += 1
+            stages.append({
+                "seq": seq, "action": "screenshot",
+                "target": "", "description": "Capture form state", "phase": "FORM_OPEN",
+            })
+            seq += 1
+
+            # Fill each field with its exact selector and observed test value
+            for field in fields[:10]:
+                field_sel = field.get("selector") or (
+                    f'[name="{field["name"]}"]' if field.get("name") else ""
+                )
+                if not field_sel:
+                    continue
+                field_label = field.get("label", "")
+                test_val = filled_map.get(field_label) or field.get("test_value", "")
+                stages.append({
+                    "seq": seq, "action": "fill",
+                    "target": field_sel,
+                    "value": test_val,
+                    "description": f"Fill '{field_label}'",
+                    "phase": "DATA_ENTRY",
+                    "on_fail": "fail" if field.get("required") else "skip",
+                })
+                seq += 1
+
+            stages.append({
+                "seq": seq, "action": "wait_network",
+                "target": "", "description": "Wait for async field validation",
+                "phase": "DATA_ENTRY",
+            })
+            seq += 1
+            stages.append({
+                "seq": seq, "action": "screenshot",
+                "target": "", "description": "Capture filled form", "phase": "DATA_ENTRY",
+            })
+            seq += 1
+
+            # Submit
+            stages.append({
+                "seq": seq, "action": "click",
+                "target": submit_selector or "button[type='submit']",
+                "description": "Submit form",
+                "phase": "SUBMIT",
+            })
+            seq += 1
+            stages.append({
+                "seq": seq, "action": "wait_network",
+                "target": "", "description": "Wait for save to complete", "phase": "SUBMIT",
+            })
+            seq += 1
+
+            # Assert success if we observed one during roundtrip
+            if success_indicator:
+                stages.append({
+                    "seq": seq, "action": "assert_visible",
+                    "target": success_indicator[:150],
+                    "description": "Verify operation success indicator",
+                    "phase": "VERIFY",
+                    "on_fail": "skip", "timeout_ms": 10000, "checkpoint": True,
+                })
+                seq += 1
+
+        stages.append({
+            "seq": seq, "action": "screenshot",
+            "target": "", "description": "Capture final state", "phase": "VERIFY",
+        })
+
+        # Replace any existing workflow of the same type for this module
+        await self.db.execute(
+            sa_delete(ApplicationWorkflow).where(
+                ApplicationWorkflow.module_id == module_id,
+                ApplicationWorkflow.workflow_type == workflow_type,
+            )
+        )
+        wf = ApplicationWorkflow(
+            module_id=module_id,
+            name=f"{button_label}",
+            description=f"Recorded during exploration: {button_label}",
+            workflow_type=workflow_type,
+            stages=stages,
+            entry_point={
+                "url": page_url or "",
+                "trigger": "click",
+                "selector": button_selector,
+                "label": button_label,
+            },
+            success_indicators=[success_indicator] if success_indicator else [],
+        )
+        self.db.add(wf)
+        await self.db.flush()
+
+        log.info(
+            "Workflow recorded to KG",
+            module_id=module_id,
+            workflow_type=workflow_type,
+            button=button_label,
+            stages=len(stages),
+            has_roundtrip=bool(roundtrip.get("submitted")),
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # KG-backed scenario generation — runs without AI from recorded workflows
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _generate_kg_scenarios(self, application_id: str) -> int:
+        """
+        Generate precise, KG-backed test scenarios for every module that has
+        ApplicationWorkflow records from exploration.  These scenarios are linked
+        to exact selectors — the planner builds their plans at Tier 0 with no AI.
+
+        Idempotent: titles are de-duplicated so re-exploring a module doesn't
+        create duplicate scenarios.
+        """
+        _TEMPLATES: dict[str, dict] = {
+            "crud_create": {
+                "title": "Create {module} — Happy Path",
+                "description": (
+                    "1. Navigate to the {module} module.\n"
+                    "2. Click the Add / New button.\n"
+                    "3. Fill all required fields with valid data.\n"
+                    "4. Click Save / Submit.\n"
+                    "5. Verify the new record appears in the list."
+                ),
+                "priority": ScenarioPriority.HIGH,
+                "tags": ["kg_backed", "functional", "crud", "create", "happy_path"],
+            },
+            "crud_update": {
+                "title": "Edit {module} — Update Existing Record",
+                "description": (
+                    "1. Navigate to the {module} module.\n"
+                    "2. Select an existing record.\n"
+                    "3. Click the Edit button.\n"
+                    "4. Modify one or more fields with new valid values.\n"
+                    "5. Click Save.\n"
+                    "6. Verify the record reflects the updated values in the list."
+                ),
+                "priority": ScenarioPriority.HIGH,
+                "tags": ["kg_backed", "functional", "crud", "update", "happy_path"],
+            },
+            "crud_delete": {
+                "title": "Delete {module} — Remove Record",
+                "description": (
+                    "1. Navigate to the {module} module.\n"
+                    "2. Select a record to delete.\n"
+                    "3. Click the Delete button.\n"
+                    "4. Confirm the deletion in the confirmation dialog.\n"
+                    "5. Verify the record is no longer present in the list."
+                ),
+                "priority": ScenarioPriority.MEDIUM,
+                "tags": ["kg_backed", "functional", "crud", "delete"],
+            },
+        }
+
+        # Load modules for this application
+        mods_result = await self.db.execute(
+            select(ApplicationModule).where(
+                ApplicationModule.application_id == application_id
+            )
+        )
+        modules = list(mods_result.scalars().all())
+        if not modules:
+            return 0
+
+        module_ids = [m.id for m in modules]
+
+        # Load recorded KG workflows
+        wf_result = await self.db.execute(
+            select(ApplicationWorkflow).where(
+                ApplicationWorkflow.module_id.in_(module_ids)
+            )
+        )
+        kg_workflows = list(wf_result.scalars().all())
+        if not kg_workflows:
+            return 0
+
+        # Index by module
+        wf_by_module: dict[str, list[str]] = {}
+        for wf in kg_workflows:
+            wf_by_module.setdefault(wf.module_id, []).append(wf.workflow_type)
+
+        # Load existing kg_generated titles to avoid duplicates
+        existing_result = await self.db.execute(
+            select(Scenario.title).where(
+                Scenario.application_id == application_id,
+                Scenario.source == "kg_generated",
+            )
+        )
+        existing_titles: set[str] = {t for (t,) in existing_result.all()}
+
+        count = 0
+        mod_by_id = {m.id: m for m in modules}
+
+        for module_id_key, wf_types in wf_by_module.items():
+            mod = mod_by_id.get(module_id_key)
+            if not mod:
+                continue
+            module_name = mod.name
+
+            # One happy-path scenario per recorded workflow type
+            for wf_type in wf_types:
+                tmpl = _TEMPLATES.get(wf_type)
+                if not tmpl:
+                    continue
+                title = tmpl["title"].format(module=module_name)
+                if title in existing_titles:
+                    continue
+                self.db.add(Scenario(
+                    application_id=application_id,
+                    title=title,
+                    description=tmpl["description"].format(module=module_name),
+                    priority=tmpl["priority"],
+                    tags=list(tmpl["tags"]),
+                    module_id=module_id_key,
+                    source="kg_generated",
+                    is_active=True,
+                ))
+                existing_titles.add(title)
+                count += 1
+
+            # End-to-end CRUD scenario when all three operations are recorded
+            has_all_crud = all(
+                t in wf_types for t in ("crud_create", "crud_update", "crud_delete")
+            )
+            if has_all_crud:
+                e2e_title = f"Full CRUD — {module_name} End-to-End"
+                if e2e_title not in existing_titles:
+                    self.db.add(Scenario(
+                        application_id=application_id,
+                        title=e2e_title,
+                        description=(
+                            f"1. Navigate to the {module_name} module.\n"
+                            f"2. Create a new {module_name} record with valid data — verify it appears in the list.\n"
+                            f"3. Edit the created record with updated values — verify changes are saved.\n"
+                            f"4. Delete the record — verify it is removed from the list.\n"
+                            f"5. Confirm no data leakage or state bleed between operations."
+                        ),
+                        priority=ScenarioPriority.CRITICAL,
+                        tags=["kg_backed", "functional", "crud", "end_to_end", "regression"],
+                        module_id=module_id_key,
+                        source="kg_generated",
+                        is_active=True,
+                    ))
+                    existing_titles.add(e2e_title)
+                    count += 1
+
+        if count:
+            await self.db.commit()
+            await self._log(
+                "SUCCESS", "scenarios",
+                f"{count} KG-backed scenario(s) auto-generated from exploration "
+                f"(exact selectors recorded — no AI needed for execution)",
+            )
+        return count
+
+    async def _auto_link_existing_scenarios(self, application_id: str) -> int:
+        """
+        Scan all unlinked scenarios for this application and assign module_id
+        based on title/description keyword overlap with module names.
+        Runs after exploration so newly-discovered modules are matched.
+        """
+        unlinked_result = await self.db.execute(
+            select(Scenario).where(
+                Scenario.application_id == application_id,
+                Scenario.module_id.is_(None),
+            )
+        )
+        unlinked = list(unlinked_result.scalars().all())
+        if not unlinked:
+            return 0
+
+        mods_result = await self.db.execute(
+            select(ApplicationModule).where(
+                ApplicationModule.application_id == application_id
+            )
+        )
+        modules = list(mods_result.scalars().all())
+        if not modules:
+            return 0
+
+        def _match_score(text: str, module_name: str) -> float:
+            tl, nl = text.lower(), module_name.lower()
+            if nl in tl:
+                return 1.0
+            name_words = set(re.findall(r"\w+", nl))
+            text_words = set(re.findall(r"\w+", tl))
+            if not name_words:
+                return 0.0
+            return len(name_words & text_words) / len(name_words)
+
+        count = 0
+        for scenario in unlinked:
+            search_text = (scenario.title or "") + " " + (scenario.description or "")[:200]
+            best_mod = None
+            best_score = 0.4
+            for mod in modules:
+                score = _match_score(search_text, mod.name)
+                if score > best_score:
+                    best_score = score
+                    best_mod = mod
+            if best_mod:
+                scenario.module_id = best_mod.id
+                count += 1
+
+        if count:
+            await self.db.commit()
+            await self._log(
+                "INFO", "scenarios",
+                f"Auto-linked {count} unlinked scenario(s) to their matching module",
+            )
+        return count
 
     def _capture_current_state_snapshot(self) -> dict:
         """Lightweight snapshot of the current page list state — rows, empty message, URL."""
@@ -3705,6 +4143,12 @@ class ExploreEngine:
             await self._log("WARNING", "scenarios", "No valid modules found — skipping scenario generation")
             return 0
 
+        # ── Tier 0: Generate KG-backed scenarios first (no AI, no token budget) ──
+        kg_gen_count = await self._generate_kg_scenarios(application_id)
+        if kg_gen_count:
+            await self._log("INFO", "scenarios",
+                f"{kg_gen_count} KG-backed scenario(s) created before AI generation")
+
         # Build per-module detail context; for accordion parents, pull from child modules too
         def _module_ctx(m) -> dict:
             m_own_pages = [p for p in pages if p.module_id == m.id]
@@ -4605,6 +5049,70 @@ class ExploreEngine:
 
         return False
 
+    def _wait_for_angular_stable(self, timeout: float = 30.0) -> bool:
+        """
+        Wait until Angular's Zone.js reports that all async operations are settled.
+        Returns True if Angular stabilised within the timeout (or if not an Angular app).
+        """
+        import time as _time
+        # Fast-path: not an Angular app
+        try:
+            is_ng = self._browser.execute_script(
+                "return typeof window.getAllAngularTestabilities === 'function';"
+            )
+        except Exception:
+            return True
+        if not is_ng:
+            return True
+
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            try:
+                stable = self._browser.execute_script("""
+                    try {
+                        const testabilities = window.getAllAngularTestabilities();
+                        if (!testabilities || testabilities.length === 0) return true;
+                        return testabilities.every(function(t) { return t.isStable(); });
+                    } catch(e) { return true; }
+                """)
+                if stable:
+                    return True
+            except Exception:
+                return True
+            _time.sleep(0.5)
+        return False  # timed out, but we'll still try looking for inputs
+
+    def _count_inputs_js(self) -> int:
+        """
+        Count visible-or-enabled form inputs via JavaScript.
+        Covers: standard <input>, contenteditable, Angular/Ionic/Web Component shadow roots.
+        """
+        try:
+            return int(self._browser.execute_script("""
+                function countIn(root) {
+                    if (!root) return 0;
+                    let n = 0;
+                    try {
+                        // Standard inputs (skip hidden/submit/button/file/checkbox/radio)
+                        const SKIP = new Set(['hidden','submit','button','image','reset']);
+                        for (const el of root.querySelectorAll('input')) {
+                            if (!SKIP.has((el.type || 'text').toLowerCase())) n++;
+                        }
+                        // contenteditable elements used as rich text inputs
+                        n += root.querySelectorAll('[contenteditable="true"]').length;
+                        // Recurse into open shadow roots (Angular ViewEncapsulation.ShadowDom,
+                        // Ionic, Lit, etc.)
+                        for (const el of root.querySelectorAll('*')) {
+                            if (el.shadowRoot) n += countIn(el.shadowRoot);
+                        }
+                    } catch(e) {}
+                    return n;
+                }
+                return countIn(document);
+            """) or 0)
+        except Exception:
+            return 0
+
     def _wait_for_any_input(self, timeout: int = 30) -> bool:
         """
         Block until at least one <input> element appears in the DOM, iframes, or Shadow DOM.
@@ -4612,8 +5120,16 @@ class ExploreEngine:
         """
         from selenium.webdriver.common.by import By
         import time as _time
+
+        # For Angular SPAs: wait up to min(timeout, 30s) for the framework to be stable
+        # before we start polling. This avoids false negatives where the component has
+        # not yet been rendered by Angular's change detection.
+        ng_wait = min(timeout, 30)
+        self._wait_for_angular_stable(timeout=ng_wait)
+
         deadline = _time.time() + timeout
         while _time.time() < deadline:
+            # Strategy 1: standard Selenium find_elements
             try:
                 inputs = self._browser.driver.find_elements(By.TAG_NAME, "input")
                 if inputs:
@@ -4621,26 +5137,14 @@ class ExploreEngine:
             except Exception:
                 pass
 
-            # Shadow DOM piercing (Angular Material, web components)
+            # Strategy 2: broad JS scan (covers Shadow DOM + contenteditable)
             try:
-                shadow_count = self._browser.execute_script("""
-                    function countShadowInputs(root) {
-                        let n = 0;
-                        try {
-                            if (root.tagName === 'INPUT') n++;
-                            if (root.shadowRoot) n += countShadowInputs(root.shadowRoot);
-                            for (const c of (root.children || [])) n += countShadowInputs(c);
-                        } catch(e) {}
-                        return n;
-                    }
-                    return countShadowInputs(document.body);
-                """)
-                if shadow_count and int(shadow_count) > 0:
+                if self._count_inputs_js() > 0:
                     return True
             except Exception:
                 pass
 
-            # Iframe scan every ~2s
+            # Strategy 3: iframe scan every ~2s
             if int(_time.time() * 2) % 4 == 0:
                 try:
                     iframes = self._browser.driver.find_elements(By.TAG_NAME, "iframe")
@@ -4704,7 +5208,7 @@ class ExploreEngine:
                 target = clean_base + path
                 self._browser.navigate(target)
                 _time.sleep(2)
-                if self._browser.driver.find_elements(By.TAG_NAME, "input"):
+                if self._browser.driver.find_elements(By.TAG_NAME, "input") or self._count_inputs_js() > 0:
                     return True
             except Exception:
                 pass
@@ -4712,8 +5216,13 @@ class ExploreEngine:
         return False
 
     def _count_page_inputs(self) -> int:
-        """Count all <input> elements on the page (including inside iframes)."""
+        """Count all form inputs on the page (Shadow DOM, contenteditable, and iframes included)."""
         from selenium.webdriver.common.by import By
+        # Use the improved JS-based counter first (covers Shadow DOM and contenteditable)
+        js_count = self._count_inputs_js()
+        if js_count > 0:
+            return js_count
+        # Fallback: legacy iframe scan
         count = 0
         try:
             count += len(self._browser.driver.find_elements(By.TAG_NAME, "input"))
@@ -4825,50 +5334,93 @@ class ExploreEngine:
 
     def _find_login_fields_fast(self):
         """
-        Fast login field detection using direct find_elements (no per-strategy waits).
+        Fast login field detection.
         Returns (username_el, password_el). Either may be None.
 
-        Handles:
-        - Standard HTML inputs
-        - Angular Material (inputs may have is_displayed()=False due to CSS)
-        - Inputs inside iframes
-        - Hidden-but-enabled inputs (skips type=hidden/submit/button only)
+        Handles: standard HTML inputs, Angular Material / ViewEncapsulation.ShadowDom,
+        iframes, hidden-but-enabled inputs, and contenteditable-based fields.
         """
         from selenium.webdriver.common.by import By
 
         SKIP_TYPES = {"hidden", "submit", "button", "checkbox", "radio", "file", "image"}
 
         def scan_inputs(driver_or_context):
-            try:
-                all_inputs = driver_or_context.find_elements(By.TAG_NAME, "input")
-            except Exception:
-                return None, None
-
             pw_el = None
             user_el = None
-
-            for inp in all_inputs:
-                try:
-                    typ = (inp.get_attribute("type") or "text").lower()
-                    if typ in SKIP_TYPES:
+            try:
+                all_inputs = driver_or_context.find_elements(By.TAG_NAME, "input")
+                for inp in all_inputs:
+                    try:
+                        typ = (inp.get_attribute("type") or "text").lower()
+                        if typ in SKIP_TYPES:
+                            continue
+                        if typ == "password" and pw_el is None:
+                            pw_el = inp
+                        elif typ != "password" and user_el is None:
+                            user_el = inp
+                        if pw_el and user_el:
+                            break
+                    except Exception:
                         continue
-                    if typ == "password" and pw_el is None:
-                        pw_el = inp
-                    elif typ != "password" and user_el is None:
-                        user_el = inp
-                    if pw_el and user_el:
-                        break
-                except Exception:
-                    continue
-
+            except Exception:
+                pass
             return user_el, pw_el
 
-        # Try main document first
+        # 1) Try standard Selenium find_elements on main document
         user_el, pw_el = scan_inputs(self._browser.driver)
         if pw_el:
             return user_el, pw_el
 
-        # Try each iframe — Angular / legacy apps often render login inside iframes
+        # 2) Try JS-based search including open Shadow DOM roots
+        #    Returns [username_element, password_element] or null pairs via JS
+        try:
+            result = self._browser.execute_script("""
+                const SKIP = new Set(['hidden','submit','button','image','reset','checkbox','radio','file']);
+                function findFields(root) {
+                    let userEl = null, pwEl = null;
+                    if (!root) return [userEl, pwEl];
+                    // password first (unambiguous)
+                    try { pwEl = root.querySelector('input[type="password"]'); } catch(e) {}
+                    // username: try specific selectors in priority order
+                    const userSelectors = [
+                        'input[type="email"]',
+                        'input[name*="user" i]', 'input[id*="user" i]', 'input[name*="login" i]',
+                        'input[name*="email" i]', 'input[id*="email" i]',
+                        'input[placeholder*="user" i]', 'input[placeholder*="email" i]',
+                        'input[type="text"]',
+                        'input:not([type="password"]):not([type="hidden"]):not([type="submit"])',
+                    ];
+                    for (const sel of userSelectors) {
+                        try {
+                            const el = root.querySelector(sel);
+                            if (el && !el.disabled && !SKIP.has((el.type||'text').toLowerCase())) {
+                                userEl = el; break;
+                            }
+                        } catch(e) {}
+                    }
+                    // Recurse into open shadow roots
+                    if (!pwEl || !userEl) {
+                        try {
+                            for (const el of root.querySelectorAll('*')) {
+                                if (el.shadowRoot) {
+                                    const [su, sp] = findFields(el.shadowRoot);
+                                    if (!userEl && su) userEl = su;
+                                    if (!pwEl   && sp) pwEl   = sp;
+                                    if (userEl && pwEl) break;
+                                }
+                            }
+                        } catch(e) {}
+                    }
+                    return [userEl, pwEl];
+                }
+                return findFields(document);
+            """)
+            if result and result[1]:  # password element found
+                return result[0], result[1]
+        except Exception:
+            pass
+
+        # 3) Try each iframe — Angular / legacy apps often render login inside iframes
         try:
             iframes = self._browser.driver.find_elements(By.TAG_NAME, "iframe")
             for iframe in iframes[:5]:

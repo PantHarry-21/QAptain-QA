@@ -55,6 +55,7 @@ from app.db.models import (
     Scenario,
     SemanticElement,
     StepStatus,
+    TestDataset,
 )
 from app.core.security import decrypt_credential
 from app.intelligence.azure_rate_limiter import get_azure_limiter
@@ -120,6 +121,8 @@ class ElementResolver:
         self._kg_elements = kg_elements
         self._form_fields = form_fields
         self._ai_cache: dict[str, str] = {}  # cache_key → CSS selector
+        # Selectors discovered by AI that should be written back to KG for future runs
+        self._writebacks: list[tuple[str, str]] = []  # (target_label, css_selector)
 
     # ── Scoring ───────────────────────────────────────────────────────────────
 
@@ -356,6 +359,8 @@ class ElementResolver:
                 cnt = await loc.count()
                 if cnt > 0:
                     log.info("AI resolved element", target=target, css=css)
+                    # Queue write-back so this selector is persisted to KG for future runs
+                    self._writebacks.append((target, css))
                     return loc.nth(min(nth, cnt - 1)), "ai_fallback"
         except Exception as exc:
             log.warning(
@@ -406,12 +411,14 @@ class PlanDrivenPlaywrightExecutor:
 
         kg_context = await self._load_kg_context(scenario)
         kg_elements = await self._load_kg_elements(scenario)
+        dataset_items = await self._load_dataset_items(app_id)
         log.info(
             "KG loaded",
             run_id=run_id,
             elements=len(kg_elements),
             form_fields=len(kg_context.get("form_fields", [])),
             module=kg_context.get("module_name"),
+            dataset_items=len(dataset_items),
         )
 
         run.status     = ExecutionStatus.RUNNING
@@ -449,7 +456,8 @@ class PlanDrivenPlaywrightExecutor:
                 page = await context.new_page()
 
                 passed, steps_taken = await self._run_plan_steps(
-                    page, run, scenario, plan, env, cred_data, kg_context, kg_elements
+                    page, run, scenario, plan, env, cred_data, kg_context, kg_elements,
+                    dataset_items=dataset_items,
                 )
 
                 # Capture final-state screenshot before closing
@@ -519,6 +527,7 @@ class PlanDrivenPlaywrightExecutor:
         cred_data: dict,
         kg_context: dict,
         kg_elements: list,
+        dataset_items: list | None = None,
     ) -> tuple[bool, list[dict]]:
 
         steps = plan.plan_data.get("steps", [])
@@ -526,6 +535,25 @@ class PlanDrivenPlaywrightExecutor:
 
         resolver   = ElementResolver(page, kg_elements, form_fields)
         test_data  = TestDataStore()
+
+        # Pre-seed TestDataStore from the application's dataset items so plan steps
+        # can reference {{invalid_email}}, {{boundary_number}}, {{oversized_file_path}}, etc.
+        if dataset_items:
+            # For text-type categories pick the first item as the default value
+            _text_categories: set[str] = set()
+            for di in dataset_items:
+                cat = di.category or ""
+                if di.data_type != "file" and di.text_value and cat not in _text_categories:
+                    test_data.store(cat, di.text_value)
+                    _text_categories.add(cat)
+            # For file categories store the absolute path so upload steps can use it
+            _file_categories: set[str] = set()
+            for di in dataset_items:
+                cat = di.category or ""
+                if di.data_type == "file" and di.file_path and cat not in _file_categories:
+                    test_data.store(f"{cat}_path", di.file_path)
+                    test_data.store(f"{cat}_name", di.file_name or os.path.basename(di.file_path))
+                    _file_categories.add(cat)
         # Tracks how many times each target label has been filled (for repeating rows).
         # Reset when a page navigation occurs.
         fill_counter: dict[str, int] = {}
@@ -620,6 +648,7 @@ class PlanDrivenPlaywrightExecutor:
             result_text = await self._execute_action(
                 page, action, target, value, timeout,
                 resolver, fill_counter, test_data, env,
+                dataset_items=dataset_items,
             )
             duration_ms = int((time.monotonic() - t_start) * 1000)
 
@@ -655,6 +684,10 @@ class PlanDrivenPlaywrightExecutor:
                 "phase": phase,
                 "checkpoint": checkpoint,
                 "on_fail": on_fail,
+                "error_type": (
+                    self._classify_failure(result_text, action, target)
+                    if not step_passed else None
+                ),
             }
             steps_taken.append(step_record)
 
@@ -710,6 +743,10 @@ class PlanDrivenPlaywrightExecutor:
                                    f"Step {seq} failed with on_fail=fail — stopping run")
                 break
 
+        # Persist AI-discovered selectors back to KG so future runs skip Tier 5
+        if resolver._writebacks:
+            await self._persist_ai_writebacks(resolver._writebacks, kg_elements)
+
         return passed, steps_taken
 
     # ── Action dispatcher ─────────────────────────────────────────────────────
@@ -725,6 +762,7 @@ class PlanDrivenPlaywrightExecutor:
         fill_counter: dict[str, int],
         test_data: TestDataStore,
         env: Environment,
+        dataset_items: list | None = None,
     ) -> str:
         try:
             if action == "navigate":
@@ -804,7 +842,7 @@ class PlanDrivenPlaywrightExecutor:
                 return await self._act_hover(page, target, resolver)
 
             elif action == "upload":
-                return f"Skipped: file upload not supported in automated mode (target: '{target}')"
+                return await self._act_upload(page, target, value, resolver, test_data, dataset_items)
 
             else:
                 return f"Skipped: unknown action '{action}'"
@@ -875,6 +913,69 @@ class PlanDrivenPlaywrightExecutor:
                 return f"Typed '{target}' = '{value[:60]}' [type_fallback, {strategy}]"
             except Exception as exc:
                 return f"Error: Could not fill '{target}' — {str(exc)[:150]}"
+
+    async def _act_upload(
+        self,
+        page: Page,
+        target: str,
+        value: str,
+        resolver: ElementResolver,
+        test_data: TestDataStore,
+        dataset_items: list | None,
+    ) -> str:
+        """Upload a file.  Priority: (1) explicit path in step value, (2) dataset item matched
+        by category keyword in target/value, (3) any file dataset item available."""
+        # Resolve the file path
+        file_path: str | None = None
+        chosen_label: str = "unknown"
+
+        # 1 — Explicit path in step value
+        if value and os.path.isfile(value):
+            file_path = value
+            chosen_label = os.path.basename(value)
+
+        # 2 — Resolve {{category_path}} placeholder from test_data
+        if not file_path and value:
+            resolved = test_data.resolve(value)
+            if resolved != value and os.path.isfile(resolved):
+                file_path = resolved
+                chosen_label = os.path.basename(resolved)
+
+        # 3 — Match a dataset file item by category keyword from target+value
+        if not file_path and dataset_items:
+            hint = (target + " " + value).lower()
+            file_items = [
+                di for di in dataset_items
+                if di.data_type == "file" and di.file_path and os.path.isfile(di.file_path)
+            ]
+            for di in file_items:
+                cat_kw = di.category.replace("_", " ")
+                if any(kw in hint for kw in cat_kw.split()):
+                    file_path = di.file_path
+                    chosen_label = f"dataset:{di.category}:{di.file_name or di.label}"
+                    break
+            # 4 — Any available file as a last resort
+            if not file_path and file_items:
+                di = file_items[0]
+                file_path = di.file_path
+                chosen_label = f"dataset:{di.category}:{di.file_name or di.label}"
+
+        if not file_path:
+            return f"Skipped: no file available for upload (target: '{target}'). Add a file in the Dataset module."
+
+        # Locate the file input element
+        loc, strategy = await resolver.resolve(target, action="fill")
+        if loc is None:
+            # Fallback: find any visible file input on the page
+            loc = page.locator("input[type='file']").first
+            strategy = "file_input_fallback"
+
+        try:
+            await loc.set_input_files(file_path, timeout=STEP_TIMEOUT_MS)
+            await page.wait_for_timeout(500)
+            return f"Uploaded '{chosen_label}' to '{target}' [{strategy}]"
+        except Exception as exc:
+            return f"Error: File upload failed on '{target}' — {str(exc)[:200]}"
 
     async def _act_select(
         self, page: Page, target: str, value: str,
@@ -1230,6 +1331,83 @@ class PlanDrivenPlaywrightExecutor:
 
         return f"Login submitted — current URL: {page.url}"
 
+    # ── KG write-back and failure diagnosis ──────────────────────────────────
+
+    async def _persist_ai_writebacks(
+        self, writebacks: list[tuple[str, str]], kg_elements: list
+    ) -> None:
+        """
+        Persist AI-discovered CSS selectors back to SemanticElement so future runs
+        can resolve these elements at Tier 1 (KG CSS lookup) instead of falling all
+        the way to Tier 5 (AI).  Called after every run that had at least one
+        AI-resolved element.
+        """
+        if not writebacks or not kg_elements:
+            return
+        updated = 0
+        for target, css in writebacks:
+            best_elem = None
+            best_score = 0.7
+            for elem in kg_elements:
+                score = ElementResolver._score(elem.semantic_label, target)
+                if score > best_score:
+                    best_score = score
+                    best_elem = elem
+            if not best_elem:
+                continue
+            existing = list(best_elem.selectors or [])
+            if any(s.get("value") == css for s in existing):
+                continue  # already known
+            existing.insert(0, {
+                "type": "css",
+                "value": css,
+                "confidence": 0.75,
+                "source": "ai_resolved",
+            })
+            best_elem.selectors = existing
+            updated += 1
+            log.info("KG write-back", target=target, css=css[:80], element=best_elem.id)
+        if updated:
+            try:
+                await self.db.commit()
+                log.info("KG write-back committed", count=updated)
+            except Exception as exc:
+                log.warning("KG write-back commit failed", error=str(exc)[:100])
+
+    @staticmethod
+    def _classify_failure(error_msg: str, action: str, target: str) -> str:
+        """
+        Classify a step failure into a diagnostic category so reports and dashboards
+        can group failures by root cause instead of showing raw error strings.
+
+        Categories:
+          selector_timeout    — element found but didn't become interactive in time
+          element_not_found   — no matching element at all
+          element_stale       — element detached from DOM between detection and action
+          form_validation     — app rejected the submitted value (validation error)
+          navigation_error    — page failed to load (network / redirect issue)
+          assertion_failed    — explicit assertion step failed (content mismatch)
+          unknown             — none of the above
+        """
+        e = (error_msg or "").lower()
+        if "timed out" in e or "timeout" in e:
+            return "selector_timeout"
+        if "not found" in e or "count=0" in e or "no element" in e or "unable to locate" in e:
+            return "element_not_found"
+        if "stale" in e or "detached" in e:
+            return "element_stale"
+        if action in ("fill", "type", "select") and any(
+            kw in e for kw in ("required", "validation", "invalid", "not allowed", "must be")
+        ):
+            return "form_validation"
+        if action == "navigate" and any(
+            kw in e for kw in ("net::", "failed to load", "err_", "refused")
+        ):
+            return "navigation_error"
+        if "assertion failed" in e or "assert" in e.split(":")[0]:
+            return "assertion_failed"
+        return "unknown"
+
     # ── KG loading ────────────────────────────────────────────────────────────
 
     async def _load_kg_context(self, scenario: Scenario) -> dict:
@@ -1286,6 +1464,17 @@ class PlanDrivenPlaywrightExecutor:
         except Exception as exc:
             log.warning("KG context load failed", error=str(exc)[:150])
         return ctx
+
+    async def _load_dataset_items(self, app_id: str) -> list:
+        """Load TestDataset items for this application — used to seed TestDataStore."""
+        try:
+            result = await self.db.execute(
+                select(TestDataset).where(TestDataset.application_id == app_id)
+            )
+            return list(result.scalars().all())
+        except Exception as exc:
+            log.warning("Dataset items load failed", error=str(exc)[:150])
+            return []
 
     async def _load_kg_elements(self, scenario: Scenario) -> list:
         """Load SemanticElement rows for this module — ordered by confidence desc."""

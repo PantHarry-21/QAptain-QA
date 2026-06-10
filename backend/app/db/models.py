@@ -447,6 +447,7 @@ class Scenario(Base):
     source = Column(String(100), default="manual")  # manual, excel, csv, ai_generated, jira
     external_id = Column(String(512))  # Jira/TestRail ID
     is_active = Column(Boolean, default=True)
+    is_smoke = Column(Boolean, default=False)  # smoke tests always run first as sanity checks
     created_by = Column(String, ForeignKey("users.id"))
     created_at = Column(DateTime, default=_now)
     updated_at = Column(DateTime, default=_now, onupdate=_now)
@@ -627,3 +628,28 @@ class SelectorMemory(Base):
     # Rolling history of healing attempts
     healing_history = Column(JSON, default=list)  # Last 50 healing events
     updated_at = Column(DateTime, default=_now, onupdate=_now)
+
+
+class TestDataset(Base):
+    """
+    Test data items uploaded or typed by the user for use during execution.
+
+    Examples: invalid emails, oversized files, boundary numbers, SQL injection strings.
+    The executor picks up matching items by category when running validation/edge-case scenarios.
+    """
+    __tablename__ = "test_datasets"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    application_id = Column(String, ForeignKey("applications.id", ondelete="CASCADE"), nullable=False, index=True)
+    category = Column(String(100), nullable=False)   # invalid_email, invalid_file, boundary_number, etc.
+    label = Column(String(512), nullable=False)       # "10 MB file (over limit)"
+    data_type = Column(String(50), default="text")   # text | email | number | date | url | file
+    text_value = Column(Text)                         # actual value for non-file types
+    file_path = Column(String(2048))                  # stored path for file uploads
+    file_name = Column(String(512))                   # original filename
+    file_size = Column(Integer)                       # bytes
+    description = Column(Text)                        # human-readable note
+    created_at = Column(DateTime, default=_now)
+    updated_at = Column(DateTime, default=_now, onupdate=_now)
+
+    application = relationship("Application", backref="test_datasets")

@@ -19,10 +19,11 @@ from typing import Any
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from typing import Any
 
 from app.db.models import (
     Scenario, ExecutionPlan, Application, ApplicationModule,
-    ApplicationPage, SemanticElement,
+    ApplicationPage, SemanticElement, ApplicationWorkflow,
 )
 from app.intelligence.ai_client import get_ai_client
 from app.intelligence.qa_reasoning_engine import QAReasoningEngine
@@ -97,6 +98,18 @@ class ScenarioPlanner:
         """
         caps = MODE_CAPS.get(execution_mode, MODE_CAPS["functional"])
 
+        # Tier 0: KG-recorded workflows — exact selectors, zero AI, zero rate limits.
+        # Only available for modules that have been explored at least once.
+        if scenario.module_id:
+            try:
+                kg_plan = await self._build_plan_from_kg(scenario, execution_mode)
+                if kg_plan:
+                    return kg_plan
+            except Exception as _kg_err:
+                log.warning("KG plan build failed — falling through to AI",
+                    error=str(_kg_err)[:120], scenario_id=scenario.id)
+
+        # Tier 1: AI reasoning (with rate-limit pre-check)
         # Pre-check Azure rate limiter — skip AI if we'd wait > 5 seconds.
         if settings.AI_PROVIDER == "azure_openai":
             from app.intelligence.azure_rate_limiter import get_azure_limiter
@@ -305,6 +318,151 @@ class ScenarioPlanner:
             workflow_type=workflow_type,
             steps=len(plan_data.get("steps", [])),
             module_url=module_url,
+        )
+        return plan
+
+    async def _build_plan_from_kg(
+        self,
+        scenario: Scenario,
+        execution_mode: str,
+    ) -> "ExecutionPlan | None":
+        """
+        Tier 0 plan generation: build a precise execution plan directly from
+        KG-recorded ApplicationWorkflow stages (exact CSS selectors, real test values).
+
+        Returns None if the module has no recorded workflows yet — callers then
+        fall through to AI or the capability engine.
+        """
+        if not scenario.module_id:
+            return None
+
+        mod_result = await self.db.execute(
+            select(ApplicationModule).where(ApplicationModule.id == scenario.module_id)
+        )
+        mod = mod_result.scalar_one_or_none()
+        if not mod:
+            return None
+
+        wf_result = await self.db.execute(
+            select(ApplicationWorkflow).where(ApplicationWorkflow.module_id == scenario.module_id)
+        )
+        workflows: list = wf_result.scalars().all()
+        if not workflows:
+            return None
+
+        caps = MODE_CAPS.get(execution_mode, MODE_CAPS["functional"])
+        workflow_type = _detect_workflow_type(scenario.title, scenario.description or "")
+        wf_by_type: dict[str, Any] = {wf.workflow_type: wf for wf in workflows}
+
+        # Determine which recorded workflows to stitch based on scenario type
+        if workflow_type == "CRUD":
+            ordered_types = ["crud_create", "crud_update", "crud_delete"]
+        elif workflow_type == "AUTH":
+            ordered_types = ["auth"]
+        elif workflow_type == "SEARCH_FILTER":
+            ordered_types = ["search", "crud_create"]
+        elif workflow_type == "EXPORT":
+            ordered_types = ["export", "crud_create"]
+        else:
+            # Use whatever workflows exist for this module
+            ordered_types = list(wf_by_type.keys())
+
+        available = [t for t in ordered_types if t in wf_by_type]
+        if not available:
+            return None
+
+        # Resolve module URL for the navigate step
+        module_url = mod.url_pattern or "/"
+        if module_url == "/":
+            first_page = await self.db.execute(
+                select(ApplicationPage)
+                .where(ApplicationPage.module_id == scenario.module_id)
+                .limit(1)
+            )
+            fp = first_page.scalar_one_or_none()
+            if fp and fp.url:
+                module_url = fp.url
+
+        # Build step list: navigate → stitched KG stages
+        steps: list[dict] = [
+            {
+                "action": "navigate",
+                "target": module_url,
+                "value": "",
+                "url": module_url,
+                "description": f"Navigate to {mod.name or 'module'}",
+                "phase": "SETUP",
+                "on_fail": "fail",
+                "timeout_ms": 15000,
+                "checkpoint": False,
+                "business_intent": "Open target module",
+            },
+        ]
+        seq = 2
+        for wf_type in ordered_types:
+            wf = wf_by_type.get(wf_type)
+            if not wf or not wf.stages:
+                continue
+            for stage in wf.stages:
+                step = dict(stage)
+                step["seq"] = seq
+                # Ensure executor-expected keys are present
+                step.setdefault("target", step.pop("selector", ""))
+                step.setdefault("value", step.get("test_value", ""))
+                step.setdefault("on_fail", "skip")
+                step.setdefault("timeout_ms", 8000)
+                step.setdefault("checkpoint", False)
+                step.setdefault("business_intent", "")
+                steps.append(step)
+                seq += 1
+                if seq > caps["max_steps"]:
+                    break
+            if seq > caps["max_steps"]:
+                break
+
+        plan_data: dict[str, Any] = {
+            "workflow_type": workflow_type,
+            "goal": f"Verify {scenario.title} works as expected",
+            "qa_reasoning": (
+                f"KG-recorded plan from {len(available)} workflow(s) for '{mod.name}'. "
+                f"Exact selectors from exploration — no AI needed."
+            ),
+            "steps": steps,
+            "checkpoint_validations": [],
+            "semantic_intent": {
+                "source": "kg_recorded",
+                "module": mod.name,
+                "operation": workflow_type.lower(),
+                "kg_workflows": available,
+                "pass_criteria": "All KG-recorded steps complete without errors",
+                "fail_criteria": "Any non-skippable step fails",
+            },
+        }
+        plan_data = self._validate_and_cap(plan_data, caps["max_steps"])
+
+        latest = await self._latest_plan_version(scenario.id)
+        plan = ExecutionPlan(
+            scenario_id=scenario.id,
+            execution_mode=execution_mode,
+            plan_data=plan_data,
+            ai_reasoning=plan_data["qa_reasoning"],
+            semantic_intent=plan_data.get("semantic_intent", {}),
+            workflow_stages=self._extract_workflow_stages(plan_data),
+            risk_score=self._calculate_risk(plan_data, execution_mode),
+            estimated_duration_seconds=len(steps) * 5,
+            created_by_model="kg_recorded",
+            version=(latest.version + 1 if latest else 1),
+        )
+        self.db.add(plan)
+        await self.db.commit()
+
+        log.info(
+            "Plan built from KG recorded workflows — no AI needed",
+            plan_id=plan.id,
+            module=mod.name,
+            workflow_type=workflow_type,
+            steps=len(steps),
+            kg_workflows=available,
         )
         return plan
 

@@ -13,6 +13,7 @@ class ScenarioCreate(BaseModel):
     priority: ScenarioPriority = ScenarioPriority.MEDIUM
     tags: list[str] = []
     module_id: str | None = None
+    is_smoke: bool = False
 
 
 class ScenarioBulkImport(BaseModel):
@@ -32,6 +33,7 @@ class ScenarioResponse(BaseModel):
     module_url: str | None = None
     source: str
     is_active: bool
+    is_smoke: bool = False
     created_at: datetime
 
     class Config:

@@ -25,9 +25,12 @@ from app.api.v1 import (
     knowledge,
     reports,
     health,
+    datasets,
 )
 from app.db.session import engine, Base
+from app.db.models import ExecutionRun, ExecutionStatus
 from app.realtime.manager import connection_manager
+from sqlalchemy import update as sql_update
 
 logging.basicConfig(level=logging.INFO)
 log = structlog.get_logger()
@@ -47,6 +50,21 @@ async def lifespan(app: FastAPI):
                 raise
             log.warning("DB startup connection failed, retrying", attempt=_attempt + 1, error=str(_db_err)[:120])
             await asyncio.sleep(3 * (_attempt + 1))
+
+    # Clean up any executions left in RUNNING/QUEUED state from a previous crash.
+    from app.db.session import AsyncSessionFactory
+    async with AsyncSessionFactory() as _db:
+        result = await _db.execute(
+            sql_update(ExecutionRun)
+            .where(ExecutionRun.status.in_([ExecutionStatus.RUNNING, ExecutionStatus.QUEUED]))
+            .values(status=ExecutionStatus.FAILED, error_message="Execution interrupted by server restart.")
+            .returning(ExecutionRun.id)
+        )
+        orphaned = result.scalars().all()
+        if orphaned:
+            await _db.commit()
+            log.warning("Marked orphaned executions as FAILED", count=len(orphaned))
+
     import os
     os.makedirs(settings.SCREENSHOTS_DIR, exist_ok=True)
     os.makedirs(settings.VIDEOS_DIR, exist_ok=True)
@@ -87,6 +105,7 @@ app.include_router(executions.router, prefix="/api/v1/executions", tags=["execut
 app.include_router(explore.router, prefix="/api/v1/explore", tags=["explore"])
 app.include_router(knowledge.router, prefix="/api/v1/knowledge", tags=["knowledge"])
 app.include_router(reports.router, prefix="/api/v1/reports", tags=["reports"])
+app.include_router(datasets.router, prefix="/api/v1/datasets", tags=["datasets"])
 
 # WebSocket endpoint
 from app.realtime.websocket import websocket_endpoint

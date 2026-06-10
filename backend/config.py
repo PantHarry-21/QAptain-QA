@@ -1,7 +1,10 @@
 from __future__ import annotations
 from pydantic_settings import BaseSettings
+from pydantic import field_validator
 from functools import lru_cache
 from typing import Literal
+
+_DEFAULT_SECRET = "change-this-in-production-minimum-32-chars"
 
 
 class Settings(BaseSettings):
@@ -49,9 +52,20 @@ class Settings(BaseSettings):
     GEMINI_FAST_MODEL: str = "gemini-2.0-flash"
 
     # Security
-    SECRET_KEY: str = "change-this-in-production-minimum-32-chars"
+    SECRET_KEY: str = _DEFAULT_SECRET
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
+
+    @field_validator("SECRET_KEY")
+    @classmethod
+    def secret_key_must_be_set(cls, v: str) -> str:
+        import os
+        if v == _DEFAULT_SECRET and os.getenv("ENVIRONMENT", "development") == "production":
+            raise ValueError(
+                "SECRET_KEY must be changed from the default before running in production. "
+                "Set the SECRET_KEY environment variable to a random 32+ character string."
+            )
+        return v
 
     # Encryption (for stored credentials)
     ENCRYPTION_KEY: str = ""
