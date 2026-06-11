@@ -72,6 +72,7 @@ export function ExecutionDashboard({ runId }: ExecutionDashboardProps) {
   const [report, setReport] = useState<ExecutionReport | null>(null);
   const [showReport, setShowReport] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
+  const [cancelling, setCancelling] = useState(false);
   // Track the last DB log id for incremental polling — avoids re-fetching the entire log list
   const [lastLogId, setLastLogId] = useState<string | undefined>(undefined);
   const lastLogIdRef = useRef<string | undefined>(undefined);
@@ -256,7 +257,17 @@ export function ExecutionDashboard({ runId }: ExecutionDashboardProps) {
       });
     });
 
-    return () => { offLog(); offStepStarted(); offStepDone(); offStarted(); offComplete(); offFailed(); };
+    const offCancelled = socket.on('run_cancelled', (data) => {
+      if (data.run_id !== runId) return;
+      setRun((r) => r ? { ...r, status: 'CANCELLED' } : r);
+      setCancelling(false);
+      addEntry({
+        ts: new Date().toISOString(), kind: 'log', level: 'WARNING',
+        category: 'system', message: 'Execution cancelled by user.',
+      });
+    });
+
+    return () => { offLog(); offStepStarted(); offStepDone(); offStarted(); offComplete(); offFailed(); offCancelled(); };
   }, [runId, socket]);
 
   // ── Auto-scroll ──────────────────────────────────────────────────────────
@@ -326,10 +337,21 @@ export function ExecutionDashboard({ runId }: ExecutionDashboardProps) {
             )}
             {isActive && (
               <button
-                onClick={() => executionsApi.cancel(runId)}
-                className="text-xs text-red-400 hover:text-red-300 border border-red-500/30 hover:border-red-500/50 px-3 py-1.5 rounded-lg transition-colors"
+                disabled={cancelling}
+                onClick={async () => {
+                  setCancelling(true);
+                  try {
+                    await executionsApi.cancel(runId);
+                    setRun((r) => r ? { ...r, status: 'CANCELLED' } : r);
+                  } catch {
+                    setCancelling(false);
+                  }
+                }}
+                className="text-xs text-red-400 hover:text-red-300 border border-red-500/30 hover:border-red-500/50 px-3 py-1.5 rounded-lg transition-colors disabled:opacity-50 flex items-center gap-1.5"
               >
-                ■ Cancel
+                {cancelling
+                  ? <><div className="w-3 h-3 border border-red-400 border-t-transparent rounded-full animate-spin" /> Cancelling…</>
+                  : '■ Cancel'}
               </button>
             )}
           </div>

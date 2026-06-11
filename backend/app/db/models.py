@@ -41,6 +41,7 @@ class ExploreStatus(str, enum.Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    STOPPED = "STOPPED"
 
 
 class ExecutionStatus(str, enum.Enum):

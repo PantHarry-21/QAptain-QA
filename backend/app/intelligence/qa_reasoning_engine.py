@@ -591,18 +591,22 @@ PHASE 6 — VERIFY_AUDITABILITY (if applicable)
 ════════════════════════════════════════
 SEMANTIC TARGET RULES
 ════════════════════════════════════════
-Use human-readable element descriptions, NOT CSS selectors or XPaths.
+Use EXACT text from the DISCOVERED FORMS, KNOWN UI ELEMENTS, and DISCOVERED WORKFLOWS
+sections in the user prompt below — the executor matches your target strings against the
+live DOM. Inventing a label that doesn't exist in the UI will cause the step to fail.
 
-CORRECT:  "Add Employee button", "First Name field", "Save button", "Confirm Delete dialog"
-WRONG:    "#btn-save", "input[name='fname']", "//button[@data-id='del']"
+Priority order:
+  1. If a form field is listed in DISCOVERED FORMS → use EXACTLY that label text.
+  2. If a button/link is in KNOWN UI ELEMENTS or DISCOVERED WORKFLOWS → use EXACTLY that text.
+  3. If not found in context → use a human-readable description: "Save button", "Name field".
 
-Rules:
-  • Form fields → use the label text: "First Name", "Email Address", "Department"
-  • Buttons → use visible button text: "Save", "Cancel", "Confirm", "Delete"
-  • Navigation → use menu/tab text: "Employees", "Price List", "Settings"
-  • Table columns → use header text: "Name column header", "Status column"
-  • Pagination → use control labels: "Next page button", "Page 2", "Items per page"
-  • Sorting → use column headers: "Name column sort button", "Date column header"
+DO NOT use CSS selectors or XPaths: "#btn-save", "input[name='fname']" are wrong.
+DO NOT invent button labels like "Add Employee" if the context says the button is "+ New".
+
+Examples (use what exploration found):
+  • DISCOVERED FORMS says field "First Name" → target: "First Name"
+  • DISCOVERED WORKFLOWS entry_point trigger "Add Job Opening" → target: "Add Job Opening"
+  • No context available → target: "Save button" (descriptive fallback)
 
 ════════════════════════════════════════
 STEP WRITING RULES
@@ -618,17 +622,14 @@ STEP WRITING RULES
   • Set business_intent to explain WHY the step exists and what business rule it validates
 
 ════════════════════════════════════════
-NAVIGATION RULES — ANGULAR SPA (CRITICAL)
+NAVIGATION RULES (CRITICAL)
 ════════════════════════════════════════
-This is a Single-Page Application using Angular with IN-MEMORY authentication.
-Full page reloads (driver.get()) destroy the JWT token and log the user out.
-
 RULES:
-  1. ALWAYS use the exact Module URL from context (keep full hash: http://server/app/#/route)
-  2. Only use "navigate" action ONCE per scenario — at the very start (SETUP phase)
-  3. For moving WITHIN a module, use "click" on nav links, NOT a fresh "navigate"
-  4. NEVER navigate to "/" or base URL mid-test — user is already authenticated
-  5. After any navigate step → add wait_ms 2000 to let Angular finish routing
+  1. ALWAYS use the exact Module URL from context (include full path and hash if present)
+  2. Only use "navigate" action in the SETUP phase — do NOT navigate mid-test unless required by the workflow
+  3. For moving WITHIN a module, prefer "click" on nav links/tabs over a fresh "navigate"
+  4. For SPAs (React/Angular/Vue): after any navigate step → add wait_ms 2000 for the route to render
+  5. NEVER navigate to "/" or base URL mid-test — the user is already authenticated
 
 ════════════════════════════════════════
 OUTPUT — Return ONLY valid JSON (no markdown, no explanation)
@@ -748,9 +749,10 @@ class QAReasoningEngine:
         plan_data: dict | None = None
         last_error: str = ""
 
-        # Single attempt with a tight timeout so rate-limit failures surface
-        # quickly and let the caller (ScenarioPlanner) use the capability-engine
-        # fallback instead of waiting 2+ minutes on Azure retries.
+        # Allow up to 180s: two consecutive Azure 429s each add 30s backoff +
+        # ~13s min-interval wait = ~86s just for retries; the actual AI call
+        # takes 10-20s on top. 90s timed out exactly at the start of the 3rd
+        # attempt — 180s guarantees a full 3-retry window.
         try:
             response = await asyncio.wait_for(
                 self.ai.complete(
@@ -759,7 +761,7 @@ class QAReasoningEngine:
                     json_mode=True,
                     max_tokens=max_tokens,
                 ),
-                timeout=25.0,
+                timeout=180.0,
             )
             if response.content.strip():
                 plan_data = response.json()
@@ -1154,36 +1156,10 @@ Module Description: {m['description'] or 'N/A'}
                     lines.append(f"  ✓ Success: {si}")
             workflows_block = "\n".join(lines)
 
-        # Infer workflow type for capability context (best-effort; AI will classify definitively)
-        title_lower = scenario.title.lower()
-        desc_lower = (scenario.description or "").lower()
-        combined = title_lower + " " + desc_lower
-        # AUTH is highest priority — very specific keywords
-        if any(kw in combined for kw in ("login", "sign in", "auth", "credential", "logout")):
-            inferred_workflow = "AUTH"
-        # CRUD: if 2+ of create/edit/update/delete present, it's CRUD even if export is mentioned
-        elif sum(1 for kw in ("create", "edit", "update", "delete", "add", "manage") if kw in combined) >= 2:
-            inferred_workflow = "CRUD"
-        elif any(kw in combined for kw in ("search", "filter", "find", "query")):
-            inferred_workflow = "SEARCH_FILTER"
-        elif any(kw in combined for kw in ("pagination", "paging", "next page", "page number")):
-            inferred_workflow = "PAGINATION"
-        elif any(kw in combined for kw in ("sort", "ascending", "descending", "order by")):
-            inferred_workflow = "SORTING"
-        elif any(kw in combined for kw in ("validation", "required field", "error message", "invalid input")):
-            inferred_workflow = "FORM_VALIDATION"
-        elif any(kw in combined for kw in ("role", "access", "permission", "rbac", "restricted")):
-            inferred_workflow = "ROLE_ACCESS"
-        elif any(kw in combined for kw in ("upload", "attach file", "import file")):
-            inferred_workflow = "FILE_UPLOAD"
-        elif any(kw in combined for kw in ("export", "download csv", "export excel")):
-            inferred_workflow = "EXPORT"
-        elif any(kw in combined for kw in ("crud", "create", "update", "delete", "add", "edit", "manage")):
-            inferred_workflow = "CRUD"
-        elif any(kw in combined for kw in ("select", "listing", "multiple", "navigate", "access", "open")):
-            inferred_workflow = "NAVIGATION"
-        else:
-            inferred_workflow = "BUSINESS_WORKFLOW"
+        # Import operation intent extractor — single source of truth for CRUD scoping
+        from app.intelligence.scenario_planner import _detect_workflow_type, _extract_operation_intent
+        inferred_workflow = _detect_workflow_type(scenario.title, scenario.description or "")
+        op_intent = _extract_operation_intent(scenario.title, scenario.description or "")
 
         capability_ctx = self._build_capability_context(
             scenario, inferred_workflow, execution_mode, app_context=ctx
@@ -1201,6 +1177,23 @@ This guide describes every action available on this module's page. Use it to:
 {ctx['interaction_guide']}
 """
 
+        # Operation scope override — ensures AI doesn't generate phases outside the intent.
+        # e.g. "Test Add scenarios" → AI told to skip update/delete phases entirely.
+        op_scope_block = ""
+        if op_intent.get("scope_note"):
+            op_scope_block = f"""
+════════════════════════════════════
+OPERATION SCOPE — MANDATORY
+════════════════════════════════════
+{op_intent['scope_note']}
+Test variants required: {', '.join(op_intent.get('test_variants', ['positive', 'negative']))}
+
+This overrides the default CRUD expansion. Only generate phases relevant to the
+scoped operation above. For example, if scope is "create only": generate SETUP +
+FORM_VALIDATION + CREATE + VERIFY_CREATED. Do NOT generate UPDATE or DELETE phases.
+════════════════════════════════════
+"""
+
         return f"""APPLICATION: {ctx['app_name']}
 Description: {ctx['app_description'] or 'Enterprise business application'}
 Base URL: {ctx['base_url']}
@@ -1209,7 +1202,7 @@ SCENARIO TITLE: {scenario.title}
 SCENARIO DESCRIPTION: {scenario.description or 'N/A'}
 Priority: {scenario.priority.value if scenario.priority else 'MEDIUM'}
 Execution max steps: {max_steps}
-
+{op_scope_block}
 ALL MODULES:
 {json.dumps(ctx['all_modules'], indent=1)}
 {elements_block}
@@ -1219,18 +1212,19 @@ ALL MODULES:
 {interaction_guide_block}
 INSTRUCTIONS:
 1. Classify this scenario into the correct workflow_type.
-2. Generate the COMPLETE execution plan following the matching workflow expansion.
+2. Generate the execution plan scoped to the OPERATION SCOPE above (if provided).
 3. MANDATORY: Include negative tests, edge cases, and validations — not just the happy path.
-4. Use semantic human-readable targets — use EXACT field labels from DISCOVERED FORMS above (e.g., "First Name field", "Email field", "Save button").
+4. CRITICAL — USE EXACT LABELS: Use the EXACT field labels, button text, and entry point names from DISCOVERED FORMS, KNOWN UI ELEMENTS, and DISCOVERED WORKFLOWS above. Do NOT invent names. If DISCOVERED FORMS says the field is "Job Title", write target: "Job Title" — not "Title field". If the entry point trigger is "+ Add Job", write target: "+ Add Job".
 5. Every assertion must verify a REAL observable change — not trivially pass.
-6. For CRUD: generate ALL 10 phases including form validation, duplicate check, cancel-delete, confirmed delete.
-7. For SEARCH: include exact match, partial match, case-insensitive, no-results, clear.
-8. For PAGINATION: real Next/Prev/Goto clicks with page number verification.
-9. For SORTING: real column header clicks with ascending/descending indicator verification.
-10. Think like a senior QA engineer covering the FULL feature — not just a smoke test.
-11. CRITICAL: For the navigate step, use the exact Module URL from context. NEVER navigate to "/" — use the module's specific URL hash route.
-12. If DISCOVERED FORMS are provided, reference the exact field names and the submit button label in your steps.
-13. If DISCOVERED UI INTERACTIONS are provided: reference the action labels exactly (e.g. "Add Product button", "Approve icon", "Pending tab", "Name field") — the executor resolves these to CSS selectors automatically from the exploration guide. Do NOT put CSS selectors in target fields.
+6. For CRUD scoped to CREATE only: generate SETUP + FORM_VALIDATION + CREATE + VERIFY_CREATED phases. Stop there.
+7. For CRUD scoped to full lifecycle: generate ALL 10 phases including form validation, duplicate check, cancel-delete, confirmed delete.
+8. For SEARCH: include exact match, partial match, case-insensitive, no-results, clear.
+9. For PAGINATION: real Next/Prev/Goto clicks with page number verification.
+10. For SORTING: real column header clicks with ascending/descending indicator verification.
+11. Think like a senior QA engineer covering the scoped feature — comprehensive within the defined scope.
+12. CRITICAL: For the navigate step, use the exact Module URL from context. NEVER navigate to "/" — use the module's specific URL.
+13. If DISCOVERED FORMS are provided, reference the exact field names and the submit button label in your steps.
+14. If DISCOVERED UI INTERACTIONS are provided: reference the action labels exactly (e.g. "Add Product button", "Approve icon", "Pending tab", "Name field") — the executor resolves these to real elements automatically. Do NOT put CSS selectors in target fields.
 {capability_ctx}"""
 
     # ─── Post-processing ──────────────────────────────────────────────────────

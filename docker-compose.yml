@@ -1,7 +1,8 @@
-# QAptain v2 local stack
-# Services: PostgreSQL, Redis, ChromaDB
-# Backend: FastAPI (Python) on port 8000
-# Frontend: Next.js on port 3000
+# QAptain — Local Development Infrastructure
+# Starts: PostgreSQL, Redis (ChromaDB removed — using Supabase for vector memory)
+# Run apps separately:
+#   Backend:  cd backend && .venv/bin/python -m uvicorn main:app --reload --port 8000
+#   Frontend: cd frontend && npm run dev
 
 services:
   postgres:
@@ -34,19 +35,6 @@ services:
       timeout: 5s
       retries: 5
 
-  chromadb:
-    image: chromadb/chroma:latest
-    restart: unless-stopped
-    ports:
-      - "8001:8000"
-    volumes:
-      - qaptain_chroma:/chroma/chroma
-    environment:
-      ANONYMIZED_TELEMETRY: "false"
-      IS_PERSISTENT: "TRUE"
-
 volumes:
   qaptain_pg:
   qaptain_redis:
-  qaptain_chroma:
-

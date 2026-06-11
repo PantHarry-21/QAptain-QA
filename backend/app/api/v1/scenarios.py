@@ -1129,14 +1129,34 @@ async def get_playwright_script(
         )
         plan = latest.scalar_one_or_none()
 
+    # Helpers to judge plan quality
+    _VACUOUS = {"screenshot", "navigate", "wait_ms", "wait_element", "wait_network", "scroll"}
+
+    def _is_vacuous(plan_steps: list) -> bool:
+        meaningful = [s for s in plan_steps if (s.get("action") or "").lower() not in _VACUOUS]
+        return len(meaningful) == 0
+
     if plan:
         steps = plan.plan_data.get("steps", [])
         source = "kg_recorded" if plan.created_by_model == "kg_recorded" else (plan.created_by_model or "ai")
+
+        # If the best plan has no real test steps, try to generate a proper AI plan
+        if _is_vacuous(steps):
+            try:
+                _planner = ScenarioPlanner(db)
+                _new_plan = await _planner.generate_plan(scenario, "functional")
+                _new_steps = _new_plan.plan_data.get("steps", [])
+                if not _is_vacuous(_new_steps):
+                    plan = _new_plan
+                    steps = _new_steps
+                    source = "ai"
+            except Exception:
+                pass  # fall through and show whatever steps we have
     else:
         # Build a documentation-only skeleton from the scenario description
         raw_desc = scenario.description or ""
         desc_lines = [ln.strip() for ln in raw_desc.splitlines() if ln.strip()]
-        steps = [{"action": "navigate", "target": "/", "description": f"Navigate to the application"}]
+        steps = [{"action": "navigate", "target": "/", "description": "Navigate to the application"}]
         for ln in desc_lines[:20]:
             steps.append({"action": "TODO", "target": "", "description": ln})
         steps.append({"action": "assert_visible", "target": ".success", "description": "Verify success state"})

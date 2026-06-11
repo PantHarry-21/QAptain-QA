@@ -45,7 +45,10 @@ class CapabilityContext:
     # Hints for data entry
     entity_name: str = ""        # e.g. "Sample", "User", "Order"
     entity_plural: str = ""      # e.g. "Samples", "Users", "Orders"
-    form_fields: list[str] = field(default_factory=list)  # known field names
+    form_fields: list[str] = field(default_factory=list)   # known field names
+    # Operation intent extracted from scenario title
+    operation_type: str = "full_crud"   # "create"|"update"|"delete"|"read"|"full_crud"
+    test_variants: list[str] = field(default_factory=lambda: ["positive", "negative"])
 
 
 @dataclass

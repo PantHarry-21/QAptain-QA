@@ -47,7 +47,8 @@ from config import settings
 
 log = structlog.get_logger()
 
-MAX_ITERATIONS = 30          # Max AI turns per run
+MAX_ITERATIONS = 60          # Max plan steps per run
+MAX_AI_CALLS_PER_STEP = 4   # Max AI tool calls per individual plan step
 STEP_TIMEOUT_MS = 10_000     # Per-action timeout for Playwright
 NAV_WAIT_MS = 2_000          # Extra wait after navigation for SPAs
 
@@ -357,7 +358,7 @@ class PlaywrightMCPExecutor:
             log.exception("PlaywrightMCPExecutor crashed", run_id=run_id, error=str(exc))
             await self._fail_run(run, f"Executor error: {exc!s}")
 
-    # ─── Agentic loop ─────────────────────────────────────────────────────────
+    # ─── Plan-grounded execution loop ─────────────────────────────────────────
 
     async def _run_agentic_loop(
         self,
@@ -370,119 +371,236 @@ class PlaywrightMCPExecutor:
         kg_context: dict | None = None,
     ) -> tuple[bool, list[dict]]:
         """
-        Main agentic loop. Returns (passed: bool, steps: list[dict]).
-        Each iteration: AI response → tool calls → execute → feed results back.
-        """
-        system_prompt = self._build_system_prompt(scenario, plan, env, cred_data, kg_context or {})
-        messages: list[dict] = [
-            {
-                "role": "user",
-                "content": (
-                    f"Start executing the test scenario: '{scenario.title}'\n\n"
-                    "Begin by navigating to the application and taking a snapshot to "
-                    "understand the current page state."
-                ),
-            }
-        ]
+        Plan-grounded execution loop.
 
+        For each plan step we:
+          1. Take a fresh browser snapshot (so the AI sees the live DOM)
+          2. Send ONE focused AI message: "execute this specific step"
+          3. Execute the returned tool calls (up to MAX_AI_CALLS_PER_STEP)
+          4. Record every tool call as an ExecutionStep
+          5. Honour on_fail policy: 'fail' stops the run, 'skip' continues
+
+        This is fundamentally different from the old free-form loop where all steps
+        were dumped into a system-prompt and the AI did whatever it liked.
+        """
         steps_taken: list[dict] = []
         step_seq = 0
         passed = False
-        finished = False
-
         ai_client = self._build_ai_client()
+        system_prompt = self._build_system_prompt(scenario, plan, env, cred_data, kg_context or {})
 
-        for iteration in range(MAX_ITERATIONS):
-            if finished:
-                break
+        # ── Navigate to app ──────────────────────────────────────────────────
+        try:
+            await page.goto(env.base_url, wait_until="commit", timeout=60_000)
+            await page.wait_for_timeout(1500)
+        except Exception as exc:
+            await self._fail_run(run, f"Cannot reach {env.base_url}: {exc}")
+            return False, steps_taken
 
-            # Keep context window small — drop old middle messages but always
-            # retain the first user message (the task) and the last 12 turns.
-            if len(messages) > 25:
-                messages = [messages[0]] + messages[-24:]
+        # ── Login ────────────────────────────────────────────────────────────
+        if cred_data.get("username"):
+            login_result = await self._do_login(page, env, cred_data)
+            step_seq += 1
+            login_passed = not login_result.startswith("Error")
+            step_record = ExecutionStep(
+                id=str(_uuid_mod.uuid4()),
+                run_id=run.id,
+                sequence=step_seq,
+                action_type="login",
+                description=f"Login as {cred_data.get('username', '')}",
+                plan_step={"action": "login", "result": login_result},
+                status=StepStatus.PASSED if login_passed else StepStatus.FAILED,
+                started_at=datetime.utcnow(),
+                completed_at=datetime.utcnow(),
+                duration_ms=0,
+            )
+            self.db.add(step_record)
+            steps_taken.append({
+                "seq": step_seq, "tool": "login",
+                "args": {}, "result": login_result, "passed": login_passed,
+                "duration_ms": 0, "screenshot_path": None,
+            })
+            await self._log_db(run, "INFO" if login_passed else "ERROR", "login",
+                               f"[{step_seq}] {login_result}")
+            await self._emit("step_completed", run.id, {
+                "seq": step_seq, "tool": "login",
+                "status": (StepStatus.PASSED if login_passed else StepStatus.FAILED).value,
+                "result": login_result[:200],
+            })
+            await self.db.commit()
+            if not login_passed:
+                return False, steps_taken
 
-            # ── Call AI ──────────────────────────────────────────────────────
+        # ── Get plan steps ───────────────────────────────────────────────────
+        plan_steps: list[dict] = []
+        if plan and plan.plan_data:
+            plan_steps = plan.plan_data.get("steps", [])
+
+        if not plan_steps:
+            await self._log_db(run, "WARNING", "executor", "No plan steps found — run complete")
+            passed = True
+            return passed, steps_taken
+
+        total = len(plan_steps)
+        await self._log_db(run, "INFO", "executor",
+                           f"Executing {total} plan steps one by one via AI browser tools")
+
+        all_critical_passed = True
+
+        # ── Execute plan steps one by one ────────────────────────────────────
+        for idx, plan_step in enumerate(plan_steps[:MAX_ITERATIONS]):
+            action = (plan_step.get("action") or "").strip().lower()
+            on_fail = plan_step.get("on_fail", "skip")
+            is_critical = on_fail == "fail"
+            phase = plan_step.get("phase", "")
+
+            # ── Simple steps — execute directly, no AI needed ───────────────
+            if action == "screenshot":
+                try:
+                    await self._save_screenshot(page, run.id, step_seq + 1)
+                except Exception:
+                    pass
+                continue
+
+            if action in ("wait_ms", "wait"):
+                ms = int(plan_step.get("ms") or plan_step.get("value") or 1000)
+                await page.wait_for_timeout(min(ms, 8000))
+                continue
+
+            if action == "wait_network":
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+                continue
+
+            if action == "navigate":
+                nav_url = (plan_step.get("url") or plan_step.get("target") or "").strip()
+                if nav_url:
+                    step_seq += 1
+                    t_start = time.monotonic()
+                    try:
+                        await page.goto(nav_url, wait_until="commit", timeout=30_000)
+                        await page.wait_for_timeout(NAV_WAIT_MS)
+                        result_text = f"Navigated to {nav_url}"
+                        nav_status = StepStatus.PASSED
+                    except Exception as exc:
+                        result_text = f"Error: navigate to {nav_url} — {str(exc)[:120]}"
+                        nav_status = StepStatus.FAILED
+                    duration_ms = int((time.monotonic() - t_start) * 1000)
+                    step_record = ExecutionStep(
+                        id=str(_uuid_mod.uuid4()),
+                        run_id=run.id, sequence=step_seq,
+                        action_type="navigate",
+                        description=plan_step.get("description", f"Navigate to {nav_url}"),
+                        plan_step={"action": "navigate", "url": nav_url, "result": result_text},
+                        status=nav_status,
+                        started_at=datetime.utcnow(), completed_at=datetime.utcnow(),
+                        duration_ms=duration_ms,
+                    )
+                    self.db.add(step_record)
+                    steps_taken.append({
+                        "seq": step_seq, "tool": "navigate", "args": {"url": nav_url},
+                        "result": result_text, "passed": nav_status == StepStatus.PASSED,
+                        "duration_ms": duration_ms, "screenshot_path": None,
+                    })
+                    await self._log_db(run, "INFO", "action",
+                                       f"[{step_seq}] navigate: {result_text}")
+                    await self._emit("step_completed", run.id, {
+                        "seq": step_seq, "tool": "navigate",
+                        "status": nav_status.value, "result": result_text[:200],
+                    })
+                    await self.db.commit()
+                    if nav_status == StepStatus.FAILED and is_critical:
+                        all_critical_passed = False
+                        break
+                continue
+
+            # ── AI-driven steps ──────────────────────────────────────────────
+            # Take a fresh snapshot of the current page
             try:
-                tool_calls, text = await self._call_ai(ai_client, system_prompt, messages)
+                snapshot = await self._do_snapshot(page)
             except Exception as exc:
-                log.error("AI call failed", run_id=run.id, iteration=iteration, error=str(exc))
-                await self._log_db(run, "ERROR", "ai", f"AI call failed: {exc}")
-                break
+                snapshot = f"Snapshot unavailable: {str(exc)[:100]}"
 
-            # Build assistant message for history
-            assistant_msg: dict[str, Any] = {"role": "assistant"}
-            if text:
-                assistant_msg["content"] = text
-            if tool_calls:
-                assistant_msg["tool_calls"] = [
-                    {
-                        "id": tc["id"],
-                        "type": "function",
-                        "function": {
-                            "name": tc["name"],
-                            "arguments": json.dumps(tc["arguments"]),
-                        },
-                    }
-                    for tc in tool_calls
-                ]
-            if not tool_calls and not text:
-                log.warning("AI returned empty response", run_id=run.id)
-                break
-            messages.append(assistant_msg)
+            # Build a focused single-step message for the AI
+            step_msg = self._format_step_for_ai(idx + 1, total, plan_step, snapshot, page.url)
+
+            await self._log_db(run, "INFO", "executor",
+                               f"Step {idx+1}/{total} [{phase or action.upper()}]: {plan_step.get('description', action)[:80]}")
+
+            # Call AI with a fresh, focused context for this single step
+            try:
+                tool_calls, _text = await self._call_ai(ai_client, system_prompt, [
+                    {"role": "user", "content": step_msg}
+                ])
+            except Exception as exc:
+                await self._log_db(run, "ERROR", "ai",
+                                   f"AI call failed for step {idx+1}: {str(exc)[:200]}")
+                if is_critical:
+                    all_critical_passed = False
+                    break
+                continue
 
             if not tool_calls:
-                # AI sent text but no tool call → unexpected, end loop
-                log.info("AI finished without tool call", run_id=run.id, text=(text or "")[:200])
-                break
+                await self._log_db(run, "WARNING", "execution",
+                                   f"AI returned no tool call for step {idx+1} ({action})")
+                continue
 
-            # ── Execute tool calls ────────────────────────────────────────────
-            tool_results: list[dict] = []
-            for tc in tool_calls:
+            # Execute tool calls returned for this step
+            step_overall_passed = True
+            for tc in tool_calls[:MAX_AI_CALLS_PER_STEP]:
                 tool_name = tc["name"]
                 tool_args = tc["arguments"]
                 step_seq += 1
 
                 t_start = time.monotonic()
                 screenshot_path: str | None = None
-
-                # Take screenshot before action (evidence)
                 try:
                     screenshot_path = await self._save_screenshot(page, run.id, step_seq)
                 except Exception:
                     pass
 
-                # Execute
                 if tool_name == "test_pass":
                     result_text = f"PASS: {tool_args.get('summary', '')}"
                     passed = True
-                    finished = True
                     status = StepStatus.PASSED
                 elif tool_name == "test_fail":
                     result_text = (
-                        f"FAIL: {tool_args.get('reason', '')} | "
-                        f"Step: {tool_args.get('step_that_failed', '')} | "
-                        f"Details: {tool_args.get('error_details', '')}"
+                        f"FAIL: {tool_args.get('reason', '')} — "
+                        f"{tool_args.get('error_details', '')}"
                     )
-                    passed = False
-                    finished = True
+                    step_overall_passed = False
                     status = StepStatus.FAILED
                 else:
                     result_text = await self._execute_tool(page, tool_name, tool_args)
-                    status = StepStatus.PASSED if not result_text.startswith("Error") else StepStatus.FAILED
+                    status = (
+                        StepStatus.PASSED
+                        if not result_text.startswith("Error")
+                        else StepStatus.FAILED
+                    )
+                    if status == StepStatus.FAILED:
+                        step_overall_passed = False
 
                 duration_ms = int((time.monotonic() - t_start) * 1000)
-
-                # Record step in DB
+                step_desc = (
+                    plan_step.get("description")
+                    or f"{tool_name}: {json.dumps(tool_args)[:120]}"
+                )
                 step_record = ExecutionStep(
                     id=str(_uuid_mod.uuid4()),
                     run_id=run.id,
                     sequence=step_seq,
                     action_type=tool_name,
-                    description=f"{tool_name}: {json.dumps(tool_args)[:200]}",
+                    description=step_desc,
                     plan_step={
                         "tool": tool_name,
                         "arguments": tool_args,
                         "result": result_text[:500],
+                        "plan_step_idx": idx + 1,
+                        "plan_action": action,
+                        "plan_target": plan_step.get("target", ""),
+                        "plan_phase": phase,
                     },
                     status=status,
                     started_at=datetime.utcnow(),
@@ -491,51 +609,32 @@ class PlaywrightMCPExecutor:
                     screenshot_path=screenshot_path,
                 )
                 self.db.add(step_record)
-
                 steps_taken.append({
-                    "seq": step_seq,
-                    "tool": tool_name,
-                    "args": tool_args,
-                    "result": result_text,
-                    "passed": status == StepStatus.PASSED,
-                    "duration_ms": duration_ms,
-                    "screenshot_path": screenshot_path,
+                    "seq": step_seq, "tool": tool_name, "args": tool_args,
+                    "result": result_text, "passed": status == StepStatus.PASSED,
+                    "duration_ms": duration_ms, "screenshot_path": screenshot_path,
                 })
-
                 await self._log_db(
-                    run, "INFO", "action",
+                    run, "INFO" if status == StepStatus.PASSED else "ERROR", "action",
                     f"[{step_seq}] {tool_name}: {result_text[:150]}",
                     {"tool": tool_name, "args": tool_args, "duration_ms": duration_ms},
                 )
                 await self._emit("step_completed", run.id, {
-                    "seq": step_seq,
-                    "tool": tool_name,
-                    "status": status.value,
-                    "result": result_text[:200],
+                    "seq": step_seq, "tool": tool_name,
+                    "status": status.value, "result": result_text[:200],
                 })
-
-                # Truncate large tool results (e.g. snapshots) to keep message history small.
-                # The AI already acted on the full result; future turns only need a summary.
-                stored_result = result_text if len(result_text) <= 1200 else result_text[:1200] + "\n...(truncated)"
-                tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": stored_result,
-                })
-
-                if finished:
-                    break
 
             await self.db.commit()
 
-            # Add tool results to conversation
-            messages.extend(tool_results)
+            if not step_overall_passed and is_critical:
+                all_critical_passed = False
+                await self._log_db(run, "ERROR", "executor",
+                                   f"Critical step {idx+1} failed — stopping run")
+                break
 
-        if not finished:
-            log.warning("Agentic loop hit max iterations", run_id=run.id, iterations=MAX_ITERATIONS)
-            await self._log_db(run, "WARN", "executor",
-                               f"Test did not complete within {MAX_ITERATIONS} iterations")
-            passed = False
+        else:
+            # for-loop finished without break — all steps attempted
+            passed = all_critical_passed
 
         try:
             await ai_client.close()
@@ -543,6 +642,199 @@ class PlaywrightMCPExecutor:
             pass
 
         return passed, steps_taken
+
+    # ── Step formatter ─────────────────────────────────────────────────────────
+
+    def _format_step_for_ai(
+        self,
+        step_num: int,
+        total: int,
+        plan_step: dict,
+        snapshot: str,
+        current_url: str,
+    ) -> str:
+        """Format one plan step + live snapshot into a focused AI message."""
+        action = (plan_step.get("action") or "").upper()
+        target = plan_step.get("target", "")
+        value  = plan_step.get("value", "")
+        desc   = plan_step.get("description", "")
+        phase  = plan_step.get("phase", "")
+        intent = plan_step.get("business_intent", "")
+        checkpoint = plan_step.get("checkpoint", False)
+
+        lines = [
+            f"=== Step {step_num} of {total}" + (f"  [{phase}]" if phase else "") + " ===",
+            f"Action: {action}",
+        ]
+        if target:
+            lines.append(f'Target: "{target}"')
+        if value:
+            lines.append(f'Value: "{value}"')
+        if desc:
+            lines.append(f"What: {desc}")
+        if intent:
+            lines.append(f"Why: {intent}")
+        if checkpoint:
+            lines.append("CHECKPOINT: This step verifies a critical business outcome.")
+
+        lines += [
+            "",
+            f"Current URL: {current_url}",
+            "Current page (ARIA accessibility tree with element refs):",
+            snapshot,
+            "",
+            "Instructions:",
+            "- Look at the ARIA tree above to find the element that matches the Target.",
+            "- Prefer using 'ref' from the ARIA tree for precise targeting.",
+            "- For ASSERT_VISIBLE / ASSERT_NOT_TEXT: use browser_assert_visible / browser_assert_not_visible.",
+            "- For FILL: use browser_type with the ref of the matching input field.",
+            "- For SELECT: use browser_select_option.",
+            "- For CLICK: use browser_click with the ref or visible text.",
+            "- Make ONE tool call to execute this step.",
+        ]
+        return "\n".join(lines)
+
+    # ─── Login ────────────────────────────────────────────────────────────────
+
+    async def _do_login(self, page: Page, env: Environment, cred_data: dict) -> str:
+        """
+        Navigate to base URL, detect login form, fill credentials, submit.
+        Handles any SPA/MPA: detects login form by password field presence.
+        Returns a success or Error string.
+        """
+        username = cred_data.get("username", "")
+        password = cred_data.get("password", "")
+        if not username:
+            return "Skipped login: no credentials configured"
+
+        try:
+            await page.goto(env.base_url, wait_until="commit", timeout=60_000)
+        except Exception as exc:
+            return f"Error: Could not reach {env.base_url} — {str(exc)[:100]}"
+
+        # Wait up to 60s for login form to appear
+        try:
+            await page.wait_for_selector(
+                'input[type="password"], input[type="text"], input[name*="user" i]',
+                timeout=60_000,
+            )
+        except Exception:
+            pass
+
+        # Detect login form
+        has_form = False
+        for sel in ('input[type="password"]', 'input[name*="password" i]',
+                    'input[placeholder*="password" i]'):
+            try:
+                if await page.locator(sel).count() > 0:
+                    has_form = True
+                    break
+            except Exception:
+                pass
+
+        if not has_form:
+            return f"Login skipped: no login form at {page.url}"
+
+        # Fill username — try multiple locator strategies
+        username_filled = False
+        for loc_fn, desc in [
+            (page.get_by_label("username", exact=False),       "label:username"),
+            (page.get_by_label("email", exact=False),          "label:email"),
+            (page.get_by_placeholder("username", exact=False), "placeholder:username"),
+            (page.get_by_placeholder("email", exact=False),    "placeholder:email"),
+            (page.locator('input[name*="username" i]'),        "name:username"),
+            (page.locator('input[name*="email" i]'),           "name:email"),
+            (page.locator('input[type="email"]'),              "type:email"),
+            (page.locator('input[type="text"]:visible').first, "first_text_input"),
+        ]:
+            try:
+                cnt = await loc_fn.count() if hasattr(loc_fn, "count") else 1
+                if cnt > 0:
+                    target_loc = loc_fn.first if hasattr(loc_fn, "first") else loc_fn
+                    await target_loc.clear(timeout=2_000)
+                    await target_loc.fill(username, timeout=5_000)
+                    username_filled = True
+                    log.debug("Login: username filled", strategy=desc)
+                    break
+            except Exception:
+                continue
+
+        if not username_filled:
+            return f"Error: Could not find username/email field at {page.url}"
+
+        # Fill password
+        password_filled = False
+        for loc_fn, desc in [
+            (page.locator('input[type="password"]:visible').first, "type:password"),
+            (page.get_by_label("password", exact=False),           "label:password"),
+            (page.get_by_placeholder("password", exact=False),     "placeholder:password"),
+        ]:
+            try:
+                cnt = await loc_fn.count() if hasattr(loc_fn, "count") else 1
+                if cnt > 0:
+                    target_loc = loc_fn.first if hasattr(loc_fn, "first") else loc_fn
+                    await target_loc.fill(password, timeout=5_000)
+                    password_filled = True
+                    break
+            except Exception:
+                continue
+
+        if not password_filled:
+            return f"Error: Could not find password field at {page.url}"
+
+        # Submit — combined CSS covers all button label variants at once
+        url_before = page.url
+        submit_clicked = False
+        _submit_combined = page.locator(
+            'button[type="submit"], input[type="submit"], '
+            'button:has-text("Sign In"), button:has-text("Sign in"), '
+            'button:has-text("Log In"), button:has-text("Log in"), '
+            'button:has-text("Login"), button:has-text("login"), '
+            'button:has-text("Submit"), button:has-text("Continue"), '
+            'button:has-text("Next"), [role="button"]:has-text("Sign In"), '
+            '[role="button"]:has-text("Log In"), [role="button"]:has-text("Login")'
+        ).first
+        try:
+            if await _submit_combined.count() > 0:
+                await _submit_combined.click(timeout=5_000)
+                submit_clicked = True
+        except Exception:
+            pass
+
+        if not submit_clicked:
+            try:
+                await page.keyboard.press("Enter")
+                submit_clicked = True
+            except Exception:
+                return "Error: Could not find or click login submit button"
+
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=15_000)
+            await page.wait_for_timeout(NAV_WAIT_MS)
+        except Exception:
+            pass
+
+        current_url = page.url
+        if current_url != url_before:
+            return f"Login successful — redirected to {current_url}"
+
+        # Check for visible error elements (not full page HTML — avoids JS bundle false-positives)
+        error_sel = (
+            '[class*="error" i]:visible, [class*="alert" i]:visible, '
+            '[role="alert"]:visible, [class*="invalid" i]:visible'
+        )
+        try:
+            err_count = await page.locator(error_sel).count()
+            if err_count > 0:
+                err_text = await page.locator(error_sel).first.text_content() or ""
+                return f"Error: Login failed — {err_text.strip()[:120] or 'error shown on page'}"
+        except Exception:
+            pass
+
+        if "login" not in current_url.lower() and "signin" not in current_url.lower():
+            return f"Login successful — current URL: {current_url}"
+
+        return f"Login submitted — current URL: {current_url}"
 
     # ─── AI client setup ──────────────────────────────────────────────────────
 
@@ -587,7 +879,7 @@ class PlaywrightMCPExecutor:
                     messages=full_messages,
                     tools=_TOOLS_OPENAI,
                     tool_choice="auto",
-                    max_completion_tokens=800,
+                    max_completion_tokens=4096,
                 )
                 break
             except openai.RateLimitError as exc:
@@ -702,129 +994,64 @@ class PlaywrightMCPExecutor:
         cred_data: dict,
         kg_context: dict | None = None,
     ) -> str:
+        """
+        Concise system prompt — role + credentials + known UI context + rules.
+        Plan steps are NOT included here; they are fed one at a time in each user message.
+        """
         kg = kg_context or {}
         username = cred_data.get("username", "")
         password = cred_data.get("password", "")
-
-        # ── Module section ────────────────────────────────────────────────────
-        module_section = ""
-        module_url = kg.get("module_url", "")
         module_name = kg.get("module_name", "")
-        if module_name or module_url:
-            module_section = f"\n## Module Under Test\n"
-            if module_name:
-                module_section += f"Name: {module_name}\n"
-            if module_url:
-                module_section += f"URL: {module_url}\n"
-                module_section += "After login, navigate directly to this URL. Do NOT navigate to the base URL first — go straight to the module.\n"
+        module_url  = kg.get("module_url", "")
 
-        # ── Form fields section ───────────────────────────────────────────────
-        fields_section = ""
+        # Form fields from exploration (exact labels)
+        fields_text = ""
         form_fields = kg.get("form_fields", [])
         if form_fields:
-            fields_section = "\n## Form Fields (exact labels from exploration)\n"
-            fields_section += "When filling forms, use EXACTLY these field labels to locate inputs:\n"
-            for f in form_fields:
-                req = " (required)" if f.get("required") else ""
-                opts = ""
-                if f.get("options"):
-                    opts = f" — options: {', '.join(str(o) for o in f['options'])}"
-                fields_section += f"  - \"{f['label']}\" ({f.get('type', 'text')}{req}){opts}\n"
+            lines = ["Known form fields (exact labels from live exploration — use these when filling forms):"]
+            for f in form_fields[:25]:
+                req  = " [required]" if f.get("required") else ""
+                opts = f" options=[{', '.join(str(o) for o in f['options'][:4])}]" if f.get("options") else ""
+                lines.append(f'  - "{f["label"]}" ({f.get("type","text")}{req}{opts})')
+            fields_text = "\n".join(lines)
 
-        # ── Interaction guide (exploration-built knowledge) ───────────────────
-        guide_section = ""
-        interaction_guide = kg.get("interaction_guide", "")
-        if interaction_guide:
-            # Cap at 4000 chars to avoid bloating the context window
-            truncated = interaction_guide[:4000]
-            if len(interaction_guide) > 4000:
-                truncated += "\n... (guide truncated)"
-            guide_section = f"\n## Exploration Guide (exact UI knowledge from prior exploration)\n"
-            guide_section += "This section describes the exact buttons, selectors, and workflows discovered during live exploration.\n"
-            guide_section += "Use these element labels to find elements via browser_snapshot ARIA names:\n"
-            guide_section += truncated + "\n"
+        # Interaction guide from exploration (exact button labels, workflow patterns)
+        guide_text = ""
+        guide = kg.get("interaction_guide", "")
+        if guide:
+            cap = guide[:3000] + ("\n...(truncated)" if len(guide) > 3000 else "")
+            guide_text = f"Exploration guide (exact UI knowledge from live browser exploration):\n{cap}"
 
-        # ── Plan steps section ────────────────────────────────────────────────
-        plan_section = ""
-        if plan and plan.plan_data:
-            steps = plan.plan_data.get("steps", [])
-            workflow_type = plan.plan_data.get("workflow_type", "")
-            goal = plan.plan_data.get("goal", "")
-            if steps:
-                plan_section = "\n## AI-Generated Test Plan\n"
-                if goal:
-                    plan_section += f"Goal: {goal}\n"
-                if workflow_type:
-                    plan_section += f"Workflow type: {workflow_type}\n"
-                plan_section += "Execute these steps in order. Each step shows: action | target element | value (if any) | why it matters.\n\n"
-                current_phase = ""
-                for i, s in enumerate(steps[:40], 1):
-                    phase = s.get("phase", "")
-                    action = s.get("action", "")
-                    desc = s.get("description", "")
-                    target = s.get("target", "")
-                    value = s.get("value", "")
-                    intent = s.get("business_intent", "")
+        module_text = ""
+        if module_name or module_url:
+            module_text = f"Module: {module_name}  URL: {module_url}"
 
-                    if phase and phase != current_phase:
-                        plan_section += f"\n[{phase}]\n"
-                        current_phase = phase
+        return f"""You are an AI QA engineer executing test steps in a live browser.
 
-                    line = f"  {i}. {action.upper()}"
-                    if target:
-                        line += f" → \"{target}\""
-                    if value:
-                        line += f" = \"{value}\""
-                    if desc and desc != target:
-                        line += f"  — {desc}"
-                    if intent:
-                        line += f"  ({intent})"
-                    plan_section += line + "\n"
+Scenario: {scenario.title}
+App URL: {env.base_url}   Username: {username}   Password: {password}
+{module_text}
 
-        return f"""You are an AI QA engineer executing a test scenario in a real browser.
-You have access to browser control tools — use them to drive the browser step by step.
+{fields_text}
 
-## Test Scenario
-Title: {scenario.title}
-Description: {scenario.description or "(no description)"}
-{module_section}{fields_section}{guide_section}{plan_section}
-## Environment
-Application URL: {env.base_url}
-Username: {username}
-Password: {password}
+{guide_text}
 
-## Browser Tools at Your Disposal
-- browser_snapshot  → see the current page structure (ARIA tree with element refs) — call this after every navigation or UI change
-- browser_navigate  → go to a URL
-- browser_click     → click a button/link/element (prefer 'ref' from snapshot; fall back to 'text')
-- browser_type      → clear + type into an input field (use 'ref' from snapshot or 'selector')
-- browser_select_option → pick a dropdown value
-- browser_hover     → hover over an element
-- browser_press_key → keyboard shortcut (Enter, Tab, Escape, etc.)
-- browser_wait      → pause or wait for an element/text to appear
-- browser_assert_visible → assert that text or an element is visible — USE THIS to verify outcomes
-- browser_assert_not_visible → assert that text or an element is NOT visible — USE THIS for delete verification
-- browser_scroll    → scroll the page
-- browser_screenshot → capture evidence screenshot
-- browser_evaluate  → run JavaScript (use sparingly — prefer snapshot + click/type)
-- test_pass(summary) → call when the scenario succeeds ✓
-- test_fail(reason)  → call when the scenario cannot be completed ✗
+## How you work
+You will receive ONE plan step at a time, together with the current page ARIA tree.
+Your job: look at the ARIA tree, find the matching element, and call the RIGHT browser tool.
+You are given a FRESH snapshot with every step — you do NOT need to call browser_snapshot first.
 
-## Execution Rules
-1. Start by navigating to the module URL (above) and taking a browser_snapshot.
-2. Log in if the page shows a login form — use the credentials above.
-3. After login, navigate to the module URL again if you were redirected to a dashboard.
-4. Follow the AI-Generated Test Plan steps in order.
-5. After EVERY navigation or form submission, call browser_snapshot to re-orient.
-6. Always prefer element refs from the LATEST snapshot for targeting.
-7. When filling forms: locate each field by its label name in the ARIA tree, then type into it.
-8. For Angular/React mat-select dropdowns: click to open, wait 500ms, then click the option text.
-9. After form submission: wait 1-2s then browser_assert_visible to confirm success toast/message.
-10. After delete: use browser_assert_not_visible to confirm the item is gone from the list.
-11. NEVER call test_pass() without first asserting the expected outcome is visible.
-12. If an action fails, try one alternative (e.g. text search instead of ref) before calling test_fail.
-13. For Angular SPAs: after any navigation, wait 1-2 seconds before interacting with elements.
-14. Use browser_evaluate sparingly — only for Angular value setter issues with mat-inputs.
+## Rules
+1. Use element refs from the ARIA tree in the user message for precise targeting.
+2. For CLICK: use browser_click with ref or text matching the Target.
+3. For FILL/TYPE: use browser_type with the ref of the matching input.
+4. For SELECT: use browser_select_option.
+5. For ASSERT_VISIBLE / assert_text: use browser_assert_visible.
+6. For ASSERT_NOT_TEXT / assert_not_visible: use browser_assert_not_visible.
+7. For mat-select/custom dropdowns: browser_click to open, browser_wait 500ms, browser_click option.
+8. After form submit: browser_wait for success indicator before the next assertion step.
+9. Make ONE tool call per step — the next step will handle verification.
+10. Only call test_fail if the current step is completely impossible to execute.
 """
 
     # ─── Tool implementations ─────────────────────────────────────────────────

@@ -270,6 +270,13 @@ export default function WorkspacePage() {
         plan_id: plan.id,
         environment_id: env.id,
       });
+      try {
+        sessionStorage.setItem('qaptain_active_run', JSON.stringify({
+          runId: run.id,
+          workspaceId,
+          title: scenarios.find((s) => s.id === scenarioId)?.title || 'Execution',
+        }));
+      } catch {}
       router.push(`/workspaces/${workspaceId}/executions/${run.id}`);
     } catch (e) {
       console.error('Failed to start execution', e);
@@ -316,10 +323,25 @@ export default function WorkspacePage() {
 
       // Navigate immediately — execution already started in the background
       if (validRuns.length === 1) {
+        try {
+          sessionStorage.setItem('qaptain_active_run', JSON.stringify({
+            runId: validRuns[0].run_id,
+            workspaceId,
+            title: `${validRuns.length} scenario`,
+          }));
+        } catch {}
         router.push(`/workspaces/${workspaceId}/executions/${validRuns[0].run_id}`);
       } else {
         const batchId = (result as { batch_id?: string }).batch_id;
         if (batchId) {
+          try {
+            sessionStorage.setItem('qaptain_active_run', JSON.stringify({
+              runId: null,
+              batchId,
+              workspaceId,
+              title: `${validRuns.length} scenarios batch`,
+            }));
+          } catch {}
           router.push(`/workspaces/${workspaceId}/executions/batch?batch_id=${batchId}`);
         } else {
           // Fallback: encode data directly (small batches only)
@@ -407,6 +429,13 @@ export default function WorkspacePage() {
         mode: exploreMode,
         selected_module_ids: Array.from(selectedModuleIds),
       });
+      try {
+        sessionStorage.setItem('qaptain_active_explore', JSON.stringify({
+          sessionId: session.id,
+          workspaceId,
+          appName: selectedApp?.name || 'Application',
+        }));
+      } catch {}
       router.push(`/workspaces/${workspaceId}/explore/${session.id}`);
     } catch (e) {
       if (e instanceof Error && e.message.includes('already running')) {
@@ -429,6 +458,13 @@ export default function WorkspacePage() {
     setDiscoveryStatus('running');
     try {
       const session = await exploreApi.discover({ application_id: selectedApp.id });
+      try {
+        sessionStorage.setItem('qaptain_active_explore', JSON.stringify({
+          sessionId: session.id,
+          workspaceId,
+          appName: selectedApp?.name || 'Application',
+        }));
+      } catch {}
       router.push(`/workspaces/${workspaceId}/explore/${session.id}`);
     } catch (e) {
       if (e instanceof Error && e.message.includes('already running')) {
@@ -1014,7 +1050,7 @@ function OverviewTab({ app, scenarios, reports, onRunScenario, onExploreClick, o
                 <span className="text-zinc-300 flex-1 truncate">{m.module_name}</span>
                 {m.kg_workflow_types.length > 0 && (
                   <div className="flex gap-1">
-                    {m.kg_workflow_types.map((t) => (
+                    {[...new Set(m.kg_workflow_types)].map((t) => (
                       <span key={t} className="text-xs bg-emerald-500/10 text-emerald-400 px-1.5 py-0.5 rounded">
                         {t.replace('crud_', '')}
                       </span>
@@ -1465,6 +1501,27 @@ function ScenariosTab({
   const [deletingModuleId, setDeletingModuleId] = useState<string | null>(null);
   const confirm = useAppConfirm();
 
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [selectedGroupKey, setSelectedGroupKey] = useState<string | null>(null);
+
+  const toggleSelect = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectGroup = (ids: string[]) => {
+    setSelectedIds((prev) => {
+      const allSelected = ids.every((id) => prev.has(id));
+      const next = new Set(prev);
+      if (allSelected) ids.forEach((id) => next.delete(id));
+      else ids.forEach((id) => next.add(id));
+      return next;
+    });
+  };
+
   const filtered = scenarios.filter((s) => {
     if (search.trim() && !(
       s.title.toLowerCase().includes(search.toLowerCase()) ||
@@ -1489,6 +1546,15 @@ function ScenariosTab({
     }
     moduleMap.get(key)!.items.push(s);
   }
+
+  const detailItems = selectedGroupKey !== null
+    ? scenarios.filter((s) => (s.module_id || '__none__') === selectedGroupKey)
+    : [];
+  const detailMeta = selectedGroupKey !== null ? {
+    moduleId: selectedGroupKey === '__none__' ? null : selectedGroupKey,
+    moduleName: detailItems[0]?.module_name ?? null,
+    moduleUrl: detailItems[0]?.module_url ?? null,
+  } : null;
 
   const handleDeleteModule = async (moduleId: string | null) => {
     const key = moduleId || '__none__';
@@ -1616,6 +1682,21 @@ function ScenariosTab({
             ))}
           </div>
         </div>
+        {selectedIds.size > 0 && (
+          <button
+            onClick={() => {
+              onRunModule(Array.from(selectedIds), '__selected__');
+              setSelectedIds(new Set());
+            }}
+            disabled={!!runningModuleId}
+            className="flex items-center gap-1.5 text-xs px-3 py-1.5 bg-violet-600/20 hover:bg-violet-600/30 text-violet-300 border border-violet-600/30 rounded-lg transition-colors disabled:opacity-50 font-medium"
+          >
+            {runningModuleId === '__selected__'
+              ? <div className="animate-spin w-3 h-3 border border-violet-300 border-t-transparent rounded-full" />
+              : <span>▶</span>}
+            Run Selected ({selectedIds.size})
+          </button>
+        )}
         {/* Smoke filter */}
         <button
           onClick={() => setSmokeFilter((v) => !v)}
@@ -1678,79 +1759,188 @@ function ScenariosTab({
         </div>
       </div>
 
-      {/* Scenario groups */}
-      {filtered.length === 0 ? (
-        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-12 text-center">
-          <p className="text-zinc-500 mb-4">
-            {search ? `No scenarios matching "${search}"` : 'No scenarios yet.'}
-          </p>
-          {!search && (
-            <div className="flex flex-col items-center gap-3">
-              <p className="text-zinc-600 text-sm">Start by exploring the application or uploading a test cases file.</p>
+      {/* Two-level view: module card grid → scenario detail */}
+      {selectedGroupKey === null ? (
+        /* ── Module card grid ── */
+        filtered.length === 0 ? (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-12 text-center">
+            <p className="text-zinc-500 mb-4">
+              {search ? `No scenarios matching "${search}"` : 'No scenarios yet.'}
+            </p>
+            {!search && (
+              <div className="flex flex-col items-center gap-3">
+                <p className="text-zinc-600 text-sm">Start by exploring the application or uploading a test cases file.</p>
+                <button
+                  onClick={onOpenDocUpload}
+                  className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm rounded-lg transition-colors"
+                >
+                  Upload Test Cases Document
+                </button>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {groups.map((group, gi) => {
+              const passed = group.items.filter((s) => s.last_run_status === 'passed').length;
+              const failed = group.items.filter((s) => s.last_run_status === 'failed' || s.last_run_status === 'error').length;
+              const notRun = group.items.filter((s) => !s.last_run_status).length;
+              const groupKey = group.moduleId || '__none__';
+              return (
+                <div
+                  key={gi}
+                  onClick={() => setSelectedGroupKey(groupKey)}
+                  className="bg-zinc-900 border border-zinc-800 hover:border-zinc-600 rounded-xl p-5 cursor-pointer transition-all group/card hover:bg-zinc-800/40 flex flex-col gap-4"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <span className="text-xl shrink-0">🧩</span>
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-zinc-100 truncate">
+                          {group.moduleName || 'General / Unassigned'}
+                        </div>
+                        {group.moduleUrl && (
+                          <div className="text-xs text-zinc-500 truncate">{group.moduleUrl}</div>
+                        )}
+                      </div>
+                    </div>
+                    <span className="text-xs bg-blue-600/20 text-blue-300 px-2 py-0.5 rounded-full shrink-0">
+                      {group.items.length}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center gap-3 text-xs">
+                    {passed > 0 && (
+                      <span className="flex items-center gap-1 text-emerald-400">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block" />
+                        {passed} passed
+                      </span>
+                    )}
+                    {failed > 0 && (
+                      <span className="flex items-center gap-1 text-red-400">
+                        <span className="w-1.5 h-1.5 rounded-full bg-red-400 inline-block" />
+                        {failed} failed
+                      </span>
+                    )}
+                    {notRun > 0 && (
+                      <span className="flex items-center gap-1 text-zinc-500">
+                        <span className="w-1.5 h-1.5 rounded-full bg-zinc-600 inline-block" />
+                        {notRun} not run
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex items-center justify-between mt-auto">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onRunModule(group.items.map((s) => s.id), group.moduleId || '__ungrouped__');
+                      }}
+                      disabled={!!runningModuleId}
+                      className="flex items-center gap-1.5 text-xs px-3 py-1.5 bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-600/30 rounded-lg transition-colors disabled:opacity-50"
+                    >
+                      {runningModuleId === (group.moduleId || '__ungrouped__') ? (
+                        <div className="animate-spin w-3 h-3 border border-blue-300 border-t-transparent rounded-full" />
+                      ) : '▶'}
+                      {runningModuleId === (group.moduleId || '__ungrouped__') ? ' Starting…' : ' Run All'}
+                    </button>
+                    <span className="text-xs text-zinc-600 group-hover/card:text-zinc-400 transition-colors">
+                      View scenarios →
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )
+      ) : (
+        /* ── Module detail: scenario list ── */
+        <div>
+          {/* Back + actions bar */}
+          <div className="flex items-center justify-between mb-5">
+            <button
+              onClick={() => { setSelectedGroupKey(null); setSelectedIds(new Set()); }}
+              className="flex items-center gap-1.5 text-sm text-zinc-400 hover:text-zinc-100 transition-colors"
+            >
+              ← Modules
+            </button>
+            <div className="flex items-center gap-2">
+              {selectedIds.size > 0 && (
+                <button
+                  onClick={() => { onRunModule(Array.from(selectedIds), '__selected__'); setSelectedIds(new Set()); }}
+                  disabled={!!runningModuleId}
+                  className="flex items-center gap-1.5 text-xs px-3 py-1.5 bg-violet-600/20 hover:bg-violet-600/30 text-violet-300 border border-violet-600/30 rounded-lg transition-colors disabled:opacity-50 font-medium"
+                >
+                  {runningModuleId === '__selected__'
+                    ? <div className="animate-spin w-3 h-3 border border-violet-300 border-t-transparent rounded-full" />
+                    : <span>▶</span>}
+                  Run Selected ({selectedIds.size})
+                </button>
+              )}
               <button
-                onClick={onOpenDocUpload}
-                className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm rounded-lg transition-colors"
+                onClick={() => onRunModule(detailItems.map((s) => s.id), detailMeta?.moduleId || '__ungrouped__')}
+                disabled={!!runningModuleId}
+                className="flex items-center gap-1.5 text-xs px-3 py-1.5 bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-600/30 rounded-lg transition-colors disabled:opacity-50"
               >
-                Upload Test Cases Document
+                {runningModuleId === (detailMeta?.moduleId || '__ungrouped__') ? (
+                  <div className="animate-spin w-3 h-3 border border-blue-300 border-t-transparent rounded-full" />
+                ) : '▶'}
+                {runningModuleId === (detailMeta?.moduleId || '__ungrouped__') ? ' Starting…' : ' Run All'}
+              </button>
+              <button
+                onClick={() => handleDeleteModule(detailMeta?.moduleId ?? null)}
+                disabled={deletingModuleId === (selectedGroupKey)}
+                className="flex items-center gap-1.5 text-xs px-3 py-1.5 bg-red-600/10 hover:bg-red-600/20 text-red-400 border border-red-600/20 rounded-lg transition-colors disabled:opacity-50"
+              >
+                {deletingModuleId === selectedGroupKey ? (
+                  <div className="animate-spin w-3 h-3 border border-red-400 border-t-transparent rounded-full" />
+                ) : '🗑'}
+                Delete All
               </button>
             </div>
-          )}
-        </div>
-      ) : (
-        <div className="space-y-4">
-          {groups.map((group, gi) => (
-            <div key={gi} className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
-              {/* Module header */}
-              <div className="flex items-center justify-between px-5 py-3 bg-zinc-800/60 border-b border-zinc-800">
-                <div className="flex items-center gap-2 min-w-0">
-                  {group.moduleName ? (
-                    <>
-                      <span className="text-sm font-medium text-zinc-200">{group.moduleName}</span>
-                      {group.moduleUrl && (
-                        <span className="text-xs text-zinc-500 truncate max-w-xs">{group.moduleUrl}</span>
-                      )}
-                      <span className="text-xs bg-blue-600/20 text-blue-300 px-1.5 py-0.5 rounded-full">
-                        {group.items.length}
-                      </span>
-                    </>
-                  ) : (
-                    <>
-                      <span className="text-sm font-medium text-zinc-400">General / Unassigned</span>
-                      <span className="text-xs bg-zinc-700/60 text-zinc-400 px-1.5 py-0.5 rounded-full">
-                        {group.items.length}
-                      </span>
-                    </>
-                  )}
-                </div>
-                <div className="flex items-center gap-2 shrink-0 ml-4">
-                  <button
-                    onClick={() => onRunModule(group.items.map((s) => s.id), group.moduleId || '__ungrouped__')}
-                    disabled={!!runningModuleId}
-                    className="flex items-center gap-1.5 text-xs px-3 py-1.5 bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-600/30 rounded-lg transition-colors disabled:opacity-50"
-                  >
-                    {runningModuleId === (group.moduleId || '__ungrouped__') ? (
-                      <div className="animate-spin w-3 h-3 border border-blue-300 border-t-transparent rounded-full" />
-                    ) : '▶'}
-                    {runningModuleId === (group.moduleId || '__ungrouped__') ? ' Starting…' : ' Run All'}
-                  </button>
-                  <button
-                    onClick={() => handleDeleteModule(group.moduleId)}
-                    disabled={deletingModuleId === (group.moduleId || '__none__')}
-                    className="flex items-center gap-1.5 text-xs px-3 py-1.5 bg-red-600/10 hover:bg-red-600/20 text-red-400 border border-red-600/20 rounded-lg transition-colors disabled:opacity-50"
-                    title="Delete all scenarios in this group"
-                  >
-                    {deletingModuleId === (group.moduleId || '__none__') ? (
-                      <div className="animate-spin w-3 h-3 border border-red-400 border-t-transparent rounded-full" />
-                    ) : '🗑'}
-                    Delete All
-                  </button>
-                </div>
-              </div>
+          </div>
 
-              {/* Scenario rows */}
+          {/* Module info strip */}
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl px-5 py-3 mb-4 flex items-center gap-3">
+            <span className="text-xl shrink-0">🧩</span>
+            <div className="min-w-0 flex-1">
+              <div className="text-base font-semibold text-zinc-100">
+                {detailMeta?.moduleName || 'General / Unassigned'}
+              </div>
+              {detailMeta?.moduleUrl && (
+                <div className="text-xs text-zinc-500 truncate">{detailMeta.moduleUrl}</div>
+              )}
+            </div>
+            <span className="text-xs bg-blue-600/20 text-blue-300 px-2 py-0.5 rounded-full shrink-0">
+              {detailItems.length} scenario{detailItems.length !== 1 ? 's' : ''}
+            </span>
+          </div>
+
+          {/* Scenario list */}
+          {detailItems.length === 0 ? (
+            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-10 text-center text-zinc-500 text-sm">
+              No scenarios in this module yet.
+            </div>
+          ) : (
+            <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
+              <div className="flex items-center gap-2 px-5 py-2.5 bg-zinc-800/60 border-b border-zinc-800">
+                <input
+                  type="checkbox"
+                  checked={detailItems.length > 0 && detailItems.every((s) => selectedIds.has(s.id))}
+                  onChange={() => toggleSelectGroup(detailItems.map((s) => s.id))}
+                  className="w-3.5 h-3.5 rounded border-zinc-600 accent-violet-500 cursor-pointer"
+                />
+                <span className="text-xs text-zinc-500">Select all</span>
+              </div>
               <div className="divide-y divide-zinc-800">
-                {group.items.map((s) => (
+                {detailItems.map((s) => (
                   <div key={s.id} className="flex items-center gap-3 px-5 py-3 hover:bg-zinc-800/30 transition-colors group">
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.has(s.id)}
+                      onChange={() => toggleSelect(s.id)}
+                      className="w-3.5 h-3.5 rounded border-zinc-600 accent-violet-500 cursor-pointer shrink-0"
+                    />
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-sm text-zinc-200 truncate">{s.title}</span>
@@ -1766,7 +1956,6 @@ function ScenariosTab({
                       )}
                     </div>
                     <PriorityBadge priority={s.priority} />
-                    {/* View */}
                     <button
                       onClick={() => setViewScenario(s)}
                       className="text-zinc-600 hover:text-blue-400 transition-colors opacity-0 group-hover:opacity-100 text-sm px-1 shrink-0"
@@ -1774,7 +1963,6 @@ function ScenariosTab({
                     >
                       👁
                     </button>
-                    {/* Edit */}
                     <button
                       onClick={() => setEditScenario(s)}
                       className="text-zinc-600 hover:text-yellow-400 transition-colors opacity-0 group-hover:opacity-100 text-sm px-1 shrink-0"
@@ -1792,7 +1980,6 @@ function ScenariosTab({
                       )}
                       {runningId === s.id ? 'Planning…' : 'Run'}
                     </button>
-                    {/* Delete */}
                     <button
                       onClick={() => onDeleteScenario(s.id)}
                       className="text-zinc-600 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100 text-sm px-1 shrink-0"
@@ -1804,7 +1991,7 @@ function ScenariosTab({
                 ))}
               </div>
             </div>
-          ))}
+          )}
         </div>
       )}
       </>)}
@@ -2964,15 +3151,12 @@ function LastRunBadge({ status }: { status?: string }) {
 
 function KgReadyBadge({ kgPlanAvailable, workflowTypes }: { kgPlanAvailable?: boolean; workflowTypes?: string[] }) {
   if (!kgPlanAvailable) return null;
-  const ops = (workflowTypes || [])
-    .map((t) => t.replace('crud_', '').toUpperCase())
-    .join('+');
   return (
     <span
       className="text-xs px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/25 shrink-0"
-      title={`KG-backed plan ready: ${workflowTypes?.join(', ')}`}
+      title={workflowTypes?.length ? `KG plan covers: ${workflowTypes.join(', ')}` : 'KG-backed plan available'}
     >
-      KG Ready {ops && `· ${ops}`}
+      KG Ready
     </span>
   );
 }
@@ -3483,7 +3667,7 @@ function KnowledgeGraphTab({ app, onExploreClick }: { app: Application; onExplor
             </div>
             {mod.kg_workflow_types.length > 0 && (
               <div className="flex flex-wrap gap-1 mt-2">
-                {mod.kg_workflow_types.map((wt) => (
+                {[...new Set(mod.kg_workflow_types)].map((wt) => (
                   <span key={wt} className="text-xs bg-zinc-800 text-zinc-400 px-1.5 py-0.5 rounded">
                     {wt.replace('crud_', '')}
                   </span>
@@ -3525,7 +3709,7 @@ function KnowledgeGraphTab({ app, onExploreClick }: { app: Application; onExplor
               <div className="text-xs text-zinc-500 mb-1">KG Workflows</div>
               <div className="flex flex-wrap gap-1 mt-1">
                 {selectedModule.kg_workflow_types.length > 0
-                  ? selectedModule.kg_workflow_types.map((wt) => (
+                  ? [...new Set(selectedModule.kg_workflow_types)].map((wt) => (
                       <span key={wt} className="text-xs bg-emerald-500/15 text-emerald-400 px-2 py-0.5 rounded-full border border-emerald-500/25">
                         {wt.replace('crud_', '')}
                       </span>

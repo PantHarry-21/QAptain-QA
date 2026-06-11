@@ -162,10 +162,38 @@ class ElementResolver:
             return None, ""
         return await self._resolve_single(target, action, nth)
 
+    @staticmethod
+    def _looks_like_selector(target: str) -> bool:
+        """Return True when target is already a CSS selector or XPath expression."""
+        t = target.strip()
+        return (
+            t.startswith(("/", "("))              # XPath: //tag or (//tag)
+            or t.startswith("#")                   # CSS id
+            or t.startswith(".")                   # CSS class
+            or (t.startswith("[") and "=" in t)    # CSS attribute
+            or (len(t) > 3 and ">" in t)           # CSS descendant
+            or (len(t) > 3 and t[0].isalpha() and "[" in t)  # tag[attr=...]
+        )
+
     async def _resolve_single(
         self, target: str, action: str = "click", nth: int = 0
     ) -> tuple[Locator | None, str]:
-        """Run the full 5-tier resolution for a single (non-pipe) target."""
+        """Run the full tier resolution for a single (non-pipe) target.
+
+        Tier 0: direct CSS/XPath probe when target already looks like a selector.
+        This avoids burning tiers 1-5 on KG-recorded steps that already embed
+        the selector discovered during Selenium exploration.
+        """
+        # Tier 0: direct selector shortcut (Selenium → Playwright compatibility)
+        if self._looks_like_selector(target):
+            try:
+                loc = self._page.locator(target)
+                cnt = await loc.count()
+                if cnt > 0:
+                    return loc.nth(min(nth, cnt - 1)), f"direct:{target[:60]}"
+            except Exception:
+                pass  # malformed selector — fall through to semantic tiers
+
         # Tier 1: KG SemanticElement CSS selectors
         result = await self._kg_resolve(target, nth)
         if result[0] is not None:
@@ -198,14 +226,17 @@ class ElementResolver:
             for sel_info in sorted(
                 elem.selectors or [], key=lambda s: -(s.get("confidence", 0))
             ):
-                if sel_info.get("type") != "css" or not sel_info.get("value"):
+                sel_type = sel_info.get("type")
+                sel_val = sel_info.get("value")
+                if sel_type not in ("css", "xpath") or not sel_val:
                     continue
-                css = sel_info["value"]
+                # Playwright accepts both CSS and XPath via page.locator()
+                locator_str = sel_val if sel_type == "css" else f"xpath={sel_val}"
                 try:
-                    loc = self._page.locator(css)
+                    loc = self._page.locator(locator_str)
                     cnt = await loc.count()
                     if cnt > 0:
-                        return loc.nth(min(nth, cnt - 1)), f"kg:{css[:50]}"
+                        return loc.nth(min(nth, cnt - 1)), f"kg:{sel_type}:{sel_val[:50]}"
                 except Exception:
                     continue
         return None, ""
@@ -217,6 +248,17 @@ class ElementResolver:
             label = (field.get("label") or "").strip()
             if not label or self._score(label, target) < 0.7:
                 continue
+            # Try the direct CSS selector captured during exploration (dynamic_reveals fields)
+            sel = (field.get("selector") or "").strip()
+            if sel:
+                try:
+                    loc = self._page.locator(sel)
+                    cnt = await loc.count()
+                    if cnt > 0:
+                        return loc.nth(min(nth, cnt - 1)), f"reveals_field:{label}"
+                except Exception:
+                    pass
+            # Fallback: semantic label resolution
             try:
                 loc = self._page.get_by_label(label, exact=False)
                 cnt = await loc.count()
@@ -319,38 +361,49 @@ class ElementResolver:
             snap_text = f"URL: {self._page.url}"
 
         try:
+            # Skip AI resolution if the rate limiter is backed up — we'd block for
+            # 30-45s per step, turning a 32-step plan into a 30-minute run. Let the
+            # step fail fast (element not found) so execution can continue.
+            limiter = get_azure_limiter()
+            if limiter.current_wait() > 5.0:
+                log.debug(
+                    "AI element resolution skipped — rate limiter backed up",
+                    target=target, wait=round(limiter.current_wait(), 1),
+                )
+                return None, "not_found"
             client = openai.AsyncAzureOpenAI(
                 api_key=settings.AZURE_OPENAI_API_KEY,
                 azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
                 api_version=getattr(settings, "AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
                 max_retries=0,
             )
-            limiter = get_azure_limiter()
-            await limiter.wait()
+            try:
+                await limiter.wait()
 
-            resp = await client.chat.completions.create(
-                model=settings.AZURE_OPENAI_DEPLOYMENT,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a Playwright automation expert. "
-                            "Given an ARIA accessibility tree, return the single best CSS selector "
-                            "for the requested element. "
-                            "Respond with ONLY the CSS selector — no explanation, no quotes, no markdown."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Find: '{target}' (action: {action})\n\n"
-                            f"ARIA tree:\n{snap_text}"
-                        ),
-                    },
-                ],
-                max_completion_tokens=100,
-            )
-            await client.close()
+                resp = await client.chat.completions.create(
+                    model=settings.AZURE_OPENAI_DEPLOYMENT,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a Playwright automation expert. "
+                                "Given an ARIA accessibility tree, return the single best CSS selector "
+                                "for the requested element. "
+                                "Respond with ONLY the CSS selector — no explanation, no quotes, no markdown."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Find: '{target}' (action: {action})\n\n"
+                                f"ARIA tree:\n{snap_text}"
+                            ),
+                        },
+                    ],
+                    max_completion_tokens=100,
+                )
+            finally:
+                await client.close()
 
             css = (resp.choices[0].message.content or "").strip().strip("`\"'")
             if css:
@@ -404,6 +457,48 @@ class PlanDrivenPlaywrightExecutor:
             await self._fail_run(run, "No execution plan — generate a plan before running")
             log.error("No plan available", run_id=run_id)
             return
+
+        # Reject vacuous plans (only screenshots/navigate/waits — no real test steps).
+        # A plan tagged kg_recorded but with empty workflow stages will have ≤3 steps
+        # (screenshot + navigate + screenshot). Regenerate from AI before running.
+        _plan_steps = plan.plan_data.get("steps", [])
+        _meaningful = [s for s in _plan_steps if (s.get("action") or "").lower() not in (
+            "screenshot", "navigate", "wait_ms", "wait_element", "wait_network", "scroll"
+        )]
+        if len(_meaningful) == 0:
+            log.warning(
+                "Plan has no meaningful test steps — regenerating with AI",
+                run_id=run_id, plan_id=plan.id, steps=len(_plan_steps),
+            )
+            try:
+                from app.intelligence.scenario_planner import ScenarioPlanner
+                _planner = ScenarioPlanner(self.db)
+                _new_plan = await asyncio.wait_for(
+                    _planner.generate_plan(scenario, plan.execution_mode or "functional"),
+                    timeout=180.0,
+                )
+                _new_meaningful = [s for s in _new_plan.plan_data.get("steps", [])
+                                   if (s.get("action") or "").lower() not in (
+                                       "screenshot", "navigate", "wait_ms",
+                                       "wait_element", "wait_network", "scroll"
+                                   )]
+                if _new_meaningful:
+                    run.plan_id = _new_plan.id
+                    plan = _new_plan
+                    await self.db.commit()
+                    log.info("AI plan regenerated", run_id=run_id,
+                             steps=len(_new_plan.plan_data.get("steps", [])),
+                             meaningful=len(_new_meaningful))
+                else:
+                    await self._fail_run(
+                        run,
+                        "Could not generate a real test plan — AI returned only navigation steps. "
+                        "Run Explore first to build the Knowledge Graph for this module, then retry."
+                    )
+                    return
+            except Exception as _regen_err:
+                await self._fail_run(run, f"Plan regeneration failed: {str(_regen_err)[:200]}")
+                return
 
         app_id     = scenario.application_id
         credential = await self._load_credential(run.credential_id, app_id)
@@ -486,9 +581,12 @@ class PlanDrivenPlaywrightExecutor:
             final_status = ExecutionStatus.COMPLETED if passed else ExecutionStatus.FAILED
             run.status       = final_status
             run.completed_at = datetime.utcnow()
-            run.total_steps  = len(steps_taken)
-            run.passed_steps = sum(1 for s in steps_taken if s.get("passed"))
-            run.failed_steps = sum(1 for s in steps_taken if not s.get("passed"))
+            # Exclude the seq=9999 teardown screenshot from test statistics —
+            # it's an artifact capture, not a test step.
+            real_steps = [s for s in steps_taken if s.get("seq") != 9999]
+            run.total_steps  = len(real_steps)
+            run.passed_steps = sum(1 for s in real_steps if s.get("passed"))
+            run.failed_steps = sum(1 for s in real_steps if not s.get("passed"))
 
             # Persist evidence references on the run record
             run.screenshot_paths = [
@@ -531,7 +629,23 @@ class PlanDrivenPlaywrightExecutor:
     ) -> tuple[bool, list[dict]]:
 
         steps = plan.plan_data.get("steps", [])
-        form_fields = kg_context.get("form_fields", [])
+        form_fields = list(kg_context.get("form_fields", []))
+
+        # Enrich form_fields with fields revealed by dynamic interactions (modals, drawers,
+        # inline forms).  These are captured by the explorer when it clicks Add/Edit buttons
+        # and records what appears.  Adding them here lets Tier 2 resolve them by label
+        # AND try the exact CSS selector the explorer recorded.
+        _reveals_map: dict[str, list] = {}  # semantic_label_lower → [reveal_dicts]
+        for _elem in kg_elements:
+            for _reveal in (getattr(_elem, "dynamic_reveals", None) or []):
+                for _rf in (_reveal.get("fields") or []):
+                    _lbl = (_rf.get("label") or "").strip()
+                    _sel = (_rf.get("selector") or "").strip()
+                    if _lbl:
+                        form_fields.append({"label": _lbl, "selector": _sel})
+            _label_key = (_elem.semantic_label or "").lower().strip()
+            if _label_key and getattr(_elem, "dynamic_reveals", None):
+                _reveals_map[_label_key] = list(_elem.dynamic_reveals)
 
         resolver   = ElementResolver(page, kg_elements, form_fields)
         test_data  = TestDataStore()
@@ -621,6 +735,11 @@ class PlanDrivenPlaywrightExecutor:
             if action == "navigate" and not target:
                 target = (raw_step.get("url") or "").strip()
             value   = test_data.resolve((raw_step.get("value") or "").strip())
+            # AI plans store wait duration in "ms" key; normalise into value
+            if action in ("wait_ms", "wait") and not value:
+                ms_key = raw_step.get("ms")
+                if ms_key is not None:
+                    value = str(ms_key)
             on_fail = (raw_step.get("on_fail") or "fail").lower()
             timeout = int(raw_step.get("timeout_ms") or STEP_TIMEOUT_MS)
             checkpoint = bool(raw_step.get("checkpoint", False))
@@ -653,6 +772,30 @@ class PlanDrivenPlaywrightExecutor:
             duration_ms = int((time.monotonic() - t_start) * 1000)
 
             step_passed = not result_text.startswith("Error") and not result_text.startswith("Assertion FAILED")
+
+            # After a successful click, check if the clicked element has dynamic_reveals
+            # (modal/drawer/inline form that should appear).  Waiting for it now means
+            # the very next step's element resolution doesn't have to race the animation.
+            if action == "click" and step_passed and _reveals_map:
+                _target_lower = target.lower().strip()
+                _best_reveals: list = []
+                _best_score = 0.65
+                for _rl_key, _rl_list in _reveals_map.items():
+                    _s = ElementResolver._score(_rl_key, _target_lower)
+                    if _s > _best_score:
+                        _best_score = _s
+                        _best_reveals = _rl_list
+                for _reveal in _best_reveals:
+                    _wait_sel = _reveal.get("submit_selector") or _reveal.get("cancel_selector")
+                    if not _wait_sel:
+                        _first_fields = _reveal.get("fields") or []
+                        _wait_sel = _first_fields[0].get("selector", "") if _first_fields else ""
+                    if _wait_sel:
+                        try:
+                            await page.wait_for_selector(_wait_sel, state="visible", timeout=3000)
+                        except Exception:
+                            pass
+                        break
 
             # Screenshots: always capture on failure or checkpoint; skip routine passing steps
             # to keep artifact count manageable. Assertions, navigation, and checkpoints always
@@ -807,9 +950,9 @@ class PlanDrivenPlaywrightExecutor:
                 return await self._act_assert_count(page, target, value, resolver)
 
             elif action in ("wait_ms", "wait"):
-                ms = int(value or target or "1000") if (value or target or "").isdigit() else 1000
+                ms_raw = value or target or "1000"
                 try:
-                    ms = int(value) if value.isdigit() else int(target) if target.isdigit() else 1000
+                    ms = int(ms_raw) if str(ms_raw).isdigit() else 1000
                 except Exception:
                     ms = 1000
                 await page.wait_for_timeout(ms)
@@ -844,6 +987,9 @@ class PlanDrivenPlaywrightExecutor:
             elif action == "upload":
                 return await self._act_upload(page, target, value, resolver, test_data, dataset_items)
 
+            elif action == "assert_ai_semantic":
+                return await self._act_assert_ai_semantic(page, target, value, timeout)
+
             else:
                 return f"Skipped: unknown action '{action}'"
 
@@ -863,7 +1009,10 @@ class PlanDrivenPlaywrightExecutor:
         if not url.startswith("http"):
             url = env.base_url.rstrip("/") + "/" + url.lstrip("/")
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            # Use "commit" (same as Selenium page_load_strategy='none') so Angular SPAs
+            # don't time out. The caller's subsequent wait_ms / assert_visible / fill
+            # steps provide the real stability gate.
+            await page.goto(url, wait_until="commit", timeout=30_000)
             await page.wait_for_timeout(NAV_WAIT_MS)
             return f"Navigated to {page.url}"
         except PWTimeout:
@@ -1031,17 +1180,31 @@ class PlanDrivenPlaywrightExecutor:
         text = value or test_data.get(target) or target
         if not text:
             return "Error: No text specified for assert_visible"
-        try:
-            await page.get_by_text(text, exact=False).first.wait_for(
-                state="visible", timeout=timeout or 5_000
-            )
-            return f"Assertion passed: '{text}' is visible"
-        except Exception:
-            # Broader check: is the text anywhere in the DOM?
-            content = await page.content()
-            if text.lower() in content.lower():
-                return f"Assertion passed: '{text}' found in page content"
-            return f"Assertion FAILED: '{text}' not visible on page"
+
+        # Support pipe-separated alternatives — assertion passes if ANY alternative matches.
+        # Capability-engine steps use patterns like 'success|saved|created|added'.
+        parts = [p.strip() for p in text.split("|") if p.strip()]
+        per_timeout = max(2_000, (timeout or 5_000) // max(1, len(parts)))
+
+        page_content: str | None = None
+        for part in parts:
+            try:
+                await page.get_by_text(part, exact=False).first.wait_for(
+                    state="visible", timeout=per_timeout
+                )
+                return f"Assertion passed: '{part}' is visible"
+            except Exception:
+                pass
+            # Fallback: DOM content string search (no timeout needed)
+            if page_content is None:
+                try:
+                    page_content = (await page.content()).lower()
+                except Exception:
+                    page_content = ""
+            if part.lower() in page_content:
+                return f"Assertion passed: '{part}' found in page content"
+
+        return f"Assertion FAILED: '{text}' not visible on page"
 
     async def _act_assert_text(
         self, page: Page, target: str, value: str,
@@ -1090,6 +1253,41 @@ class PlanDrivenPlaywrightExecutor:
             return f"Assertion passed: URL contains '{expected}'"
         return f"Assertion FAILED: expected URL '{expected}', got '{current}'"
 
+    async def _act_assert_ai_semantic(
+        self, page: Page, target: str, value: str, timeout: int,
+    ) -> str:
+        """
+        Semantic assertion: checks page content/accessibility tree for the condition
+        described by `target` (the assertion description) or `value`.
+        Uses text search as primary mechanism; falls back to page content scan.
+        This avoids AI API calls at assertion time so rate limits don't block execution.
+        """
+        condition = value or target
+        if not condition:
+            return "Error: No assertion condition specified for assert_ai_semantic"
+
+        parts = [p.strip() for p in condition.split("|") if p.strip()]
+        per_timeout = max(2_000, (timeout or 8_000) // max(1, len(parts)))
+        page_content: str | None = None
+
+        for part in parts:
+            try:
+                await page.get_by_text(part, exact=False).first.wait_for(
+                    state="visible", timeout=per_timeout
+                )
+                return f"Assertion passed: '{part}' is visible on page"
+            except Exception:
+                pass
+            if page_content is None:
+                try:
+                    page_content = (await page.content()).lower()
+                except Exception:
+                    page_content = ""
+            if part.lower() in page_content:
+                return f"Assertion passed: '{part}' found in page content"
+
+        return f"Assertion FAILED: semantic condition '{condition}' not met on page"
+
     async def _act_assert_count(
         self, page: Page, target: str, value: str,
         resolver: ElementResolver,
@@ -1112,11 +1310,41 @@ class PlanDrivenPlaywrightExecutor:
         self, page: Page, target: str,
         resolver: ElementResolver, timeout: int,
     ) -> str:
+        wait_ms = timeout or 15_000
+        parts = [p.strip() for p in target.split("|") if p.strip()]
+
+        # For CSS/structural selectors (contain metacharacters or are bare HTML element
+        # names), use page.locator() directly — the semantic resolver isn't designed for
+        # CSS and would fall through to the AI tier causing long delays.
+        _HTML_ELEMENTS = {"table", "tbody", "thead", "form", "dialog", "modal", "section",
+                          "aside", "nav", "main", "article", "header", "footer", "ul", "ol"}
+        _CSS_CHARS = set(".[#*>+~:()")
+
+        def _is_css(p: str) -> bool:
+            return any(c in p for c in _CSS_CHARS) or p in _HTML_ELEMENTS
+
+        if any(_is_css(p) for p in parts):
+            # Try each part as a direct CSS selector
+            for css in parts:
+                try:
+                    loc = page.locator(css)
+                    cnt = await loc.count()
+                    if cnt > 0:
+                        try:
+                            await loc.first.wait_for(state="visible", timeout=wait_ms)
+                            return f"Element visible: '{css}'"
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+            return f"Error: Element not found for wait: '{target}'"
+
+        # Semantic target — use the full resolver pipeline
         loc, strategy = await resolver.resolve(target, action="click")
         if loc is None:
             return f"Error: Element not found for wait: '{target}'"
         try:
-            await loc.wait_for(state="visible", timeout=timeout or 15_000)
+            await loc.wait_for(state="visible", timeout=wait_ms)
             return f"Element visible: '{target}' [{strategy}]"
         except Exception as exc:
             return f"Error: Timeout waiting for '{target}' — {str(exc)[:100]}"
@@ -1175,12 +1403,10 @@ class PlanDrivenPlaywrightExecutor:
         except Exception:
             pass
 
-        # Try 3: JavaScript setter for Angular Material date pickers
+        # Try 3: JavaScript setter targeting the already-resolved locator element
         try:
-            await page.evaluate(
-                """([sel, val]) => {
-                    const el = document.querySelector(sel);
-                    if (!el) return;
+            await loc.evaluate(
+                """(el, val) => {
                     const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
                         window.HTMLInputElement.prototype, 'value'
                     ).set;
@@ -1188,7 +1414,7 @@ class PlanDrivenPlaywrightExecutor:
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
                 }""",
-                [f'input[placeholder*="date" i]', date_value],
+                date_value,
             )
             return f"Set date '{target}' = '{value}' [js_setter]"
         except Exception as exc:
@@ -1208,10 +1434,21 @@ class PlanDrivenPlaywrightExecutor:
             return "Skipped login: no credentials configured"
 
         try:
-            await page.goto(env.base_url, wait_until="domcontentloaded", timeout=30_000)
-            await page.wait_for_timeout(NAV_WAIT_MS)
+            # Use "commit" so Playwright returns as soon as navigation starts —
+            # same as Selenium's page_load_strategy='none'. Angular SPAs like YLIMS
+            # rarely fire domcontentloaded within 30s; we wait for the form instead.
+            await page.goto(env.base_url, wait_until="commit", timeout=60_000)
         except Exception as exc:
             return f"Error: Could not reach {env.base_url} — {str(exc)[:100]}"
+
+        # Wait up to 90s for Angular to bootstrap and render the login form
+        try:
+            await page.wait_for_selector(
+                'input[type="password"], input[type="text"], input[name*="user" i]',
+                timeout=90_000,
+            )
+        except Exception:
+            pass  # Will fail gracefully at username/password fill below
 
         # Check if a login form exists — if not, we may already be logged in
         login_indicators = [
@@ -1279,33 +1516,31 @@ class PlanDrivenPlaywrightExecutor:
         if not password_filled:
             return f"Error: Could not find password field at {page.url}"
 
-        # Submit
+        # Submit — combined CSS selector covers all label variants at once
         url_before = page.url
         submit_clicked = False
-        for loc_fn, desc in [
-            (page.get_by_role("button", name="login", exact=False),  "btn:login"),
-            (page.get_by_role("button", name="sign in", exact=False), "btn:sign_in"),
-            (page.get_by_role("button", name="submit", exact=False),  "btn:submit"),
-            (page.get_by_role("button", name="log in", exact=False),  "btn:log_in"),
-            (page.locator('button[type="submit"]:visible').first,     "type:submit"),
-            (page.locator('input[type="submit"]:visible').first,      "input:submit"),
-        ]:
-            try:
-                cnt = await loc_fn.count() if hasattr(loc_fn, "count") else 1
-                if cnt > 0:
-                    target_loc = loc_fn.first if hasattr(loc_fn, "first") else loc_fn
-                    await target_loc.click(timeout=5_000)
-                    submit_clicked = True
-                    log.debug("Login: submit clicked", strategy=desc)
-                    break
-            except Exception:
-                continue
+        _submit_combined = page.locator(
+            'button[type="submit"], input[type="submit"], '
+            'button:has-text("Sign In"), button:has-text("Sign in"), '
+            'button:has-text("Log In"), button:has-text("Log in"), '
+            'button:has-text("Login"), button:has-text("login"), '
+            'button:has-text("Submit"), button:has-text("Continue"), '
+            'button:has-text("Next"), [role="button"]:has-text("Sign In"), '
+            '[role="button"]:has-text("Log In"), [role="button"]:has-text("Login")'
+        ).first
+        try:
+            if await _submit_combined.count() > 0:
+                await _submit_combined.click(timeout=5_000)
+                submit_clicked = True
+                log.debug("Login: submit clicked via combined selector")
+        except Exception:
+            pass
 
         if not submit_clicked:
-            # Try pressing Enter on the password field
             try:
                 await page.keyboard.press("Enter")
                 submit_clicked = True
+                log.debug("Login: submitted via Enter key")
             except Exception:
                 return "Error: Could not find or click login submit button"
 
@@ -1316,20 +1551,30 @@ class PlanDrivenPlaywrightExecutor:
         except Exception:
             pass
 
-        if page.url != url_before or "login" not in page.url.lower():
-            return f"Login successful — redirected to {page.url}"
+        # Success: URL changed away from login page
+        current_url = page.url
+        if current_url != url_before:
+            return f"Login successful — redirected to {current_url}"
 
-        # Check for error messages
-        error_indicators = ["invalid", "incorrect", "wrong", "failed", "error"]
+        # URL unchanged — check for *visible* error elements only (not JS bundle text)
+        error_sel = (
+            '[class*="error" i]:visible, [class*="alert" i]:visible, '
+            '[role="alert"]:visible, [class*="invalid" i]:visible, '
+            '.form-error:visible, .field-error:visible'
+        )
         try:
-            content = (await page.content()).lower()
-            for err in error_indicators:
-                if err in content:
-                    return f"Error: Login failed — error message detected on page"
+            err_count = await page.locator(error_sel).count()
+            if err_count > 0:
+                err_text = await page.locator(error_sel).first.text_content() or ""
+                return f"Error: Login failed — {err_text.strip()[:120] or 'error shown on page'}"
         except Exception:
             pass
 
-        return f"Login submitted — current URL: {page.url}"
+        # No visible error and no URL change — might still be navigating
+        if "login" not in current_url.lower() and "signin" not in current_url.lower():
+            return f"Login successful — current URL: {current_url}"
+
+        return f"Login submitted — current URL: {current_url}"
 
     # ── KG write-back and failure diagnosis ──────────────────────────────────
 
@@ -1578,6 +1823,11 @@ class PlanDrivenPlaywrightExecutor:
         run.status        = ExecutionStatus.FAILED
         run.completed_at  = datetime.utcnow()
         run.error_message = msg
+        # Write a log entry so the execution log panel shows something useful
+        try:
+            await self._log_db(run, "ERROR", "executor", f"Run failed: {msg}")
+        except Exception:
+            pass
         await self.db.commit()
         await self._emit("run_failed", run.id, {"error": msg})
 

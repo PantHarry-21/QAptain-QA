@@ -1,0 +1,16 @@
+.env
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+artifacts/screenshots/*
+artifacts/videos/*
+alembic/versions/*.pyc
+.git
+.gitignore
+Dockerfile
+.dockerignore
+restart-server.ps1

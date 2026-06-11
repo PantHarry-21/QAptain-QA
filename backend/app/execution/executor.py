@@ -397,17 +397,18 @@ class ExecutionOrchestrator:
 
         await self._log(run_id, "INFO", "login", "Submitting login form")
 
-        # Click login button
+        # Click login button — combined XPath covers all label variants at once
         from selenium.webdriver.common.keys import Keys
         healer = SelfHealingEngine(browser.driver)
-        login_btn_found = False
-        for label in ("Sign In", "Login", "Log In", "Submit", "SIGN IN"):
-            result = healer.find_element(label)
-            if result[0]:
-                healer.click_with_healing(result[0])
-                login_btn_found = True
-                break
-        if not login_btn_found:
+        _LOGIN_LABELS = [
+            "Sign In", "Sign in", "signin", "Log In", "Log in", "login",
+            "Login", "LOG IN", "SIGN IN", "Submit", "Continue", "Next",
+        ]
+        result = healer.find_element_any(_LOGIN_LABELS)
+        login_btn_found = bool(result[0])
+        if login_btn_found:
+            healer.click_with_healing(result[0])
+        else:
             try:
                 password_el.send_keys(Keys.RETURN)
             except Exception:
@@ -446,17 +447,15 @@ class ExecutionOrchestrator:
 
         healer = SelfHealingEngine(browser.driver)
         clicked_next = False
-        for label in ("Next", "Continue", "Proceed", "Sign In", "Login"):
-            result = healer.find_element(label)
-            if result[0]:
-                try:
-                    result[0].click()
-                    clicked_next = True
-                    await self._log(run_id, "INFO", "login",
-                        f"Two-step: clicked '{label}'")
-                    break
-                except Exception:
-                    pass
+        _NEXT_LABELS = ["Next", "Continue", "Proceed", "Sign In", "Sign in", "Log In", "Login"]
+        result = healer.find_element_any(_NEXT_LABELS)
+        if result[0]:
+            try:
+                result[0].click()
+                clicked_next = True
+                await self._log(run_id, "INFO", "login", "Two-step: clicked submit button")
+            except Exception:
+                pass
         if not clicked_next:
             try:
                 username_el.send_keys(Keys.RETURN)
@@ -483,12 +482,14 @@ class ExecutionOrchestrator:
 
         healer2 = SelfHealingEngine(browser.driver)
         submitted = False
-        for label in ("Sign In", "Login", "Log In", "Submit", "SIGN IN", "Next"):
-            result = healer2.find_element(label)
-            if result[0]:
-                healer2.click_with_healing(result[0])
-                submitted = True
-                break
+        _SUBMIT_LABELS = [
+            "Sign In", "Sign in", "Log In", "Log in", "Login", "login",
+            "Submit", "SIGN IN", "Next", "Continue",
+        ]
+        result2 = healer2.find_element_any(_SUBMIT_LABELS)
+        if result2[0]:
+            healer2.click_with_healing(result2[0])
+            submitted = True
         if not submitted:
             try:
                 password_el.send_keys(Keys.RETURN)
@@ -613,18 +614,17 @@ class ExecutionOrchestrator:
                 await self._log(run_id, "INFO", "login",
                     f"Clicked '{_clicked}' after context selection (JS fast-scan)")
             else:
-                # Fallback: healer for top-2 most-likely labels only
+                # Fallback: healer with all label variants at once
                 healer = SelfHealingEngine(browser.driver)
-                for btn_label in ("Sign In", "Login"):
-                    btn_result = healer.find_element(btn_label)
-                    if btn_result[0]:
-                        try:
-                            btn_result[0].click()
-                            await self._log(run_id, "INFO", "login",
-                                f"Clicked '{btn_label}' after context selection (healer)")
-                            break
-                        except Exception:
-                            pass
+                _CTX_LABELS = ["Sign In", "Sign in", "Log In", "Log in", "Login", "Submit", "Continue"]
+                btn_result = healer.find_element_any(_CTX_LABELS)
+                if btn_result[0]:
+                    try:
+                        btn_result[0].click()
+                        await self._log(run_id, "INFO", "login",
+                            "Clicked submit after context selection (healer)")
+                    except Exception:
+                        pass
 
             await asyncio.sleep(2)
 

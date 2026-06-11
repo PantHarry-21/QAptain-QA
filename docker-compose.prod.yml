@@ -1,0 +1,86 @@
+version: "3.9"
+
+# ── QAptain Production Stack ───────────────────────────────────────────────────
+# Usage:
+#   1. Copy backend/.env.example → backend/.env  (fill in real values)
+#   2. Copy frontend/.env.example → frontend/.env  (fill in real values)
+#   3. docker compose -f docker-compose.prod.yml up --build -d
+#
+# Note: DATABASE_URL and REDIS_URL in backend/.env should point to
+#       managed cloud services (Neon + Upstash) for production.
+#       The local postgres/redis services below are for self-hosted deployments.
+
+services:
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: qaptain
+      POSTGRES_PASSWORD: qaptain
+      POSTGRES_DB: qaptain
+    volumes:
+      - qaptain_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qaptain"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - qaptain_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Backend (FastAPI) ────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment:
+      # Override to use local DB/Redis when not using cloud services
+      # DATABASE_URL: postgresql+asyncpg://qaptain:qaptain@postgres:5432/qaptain
+      # REDIS_URL: redis://redis:6379
+      ENVIRONMENT: production
+    ports:
+      - "8000:8000"
+    volumes:
+      - qaptain_artifacts:/app/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Frontend (Next.js) ───────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://backend:8000/api/v1
+        NEXT_PUBLIC_WS_URL: ws://backend:8000/ws
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  qaptain_pg:
+  qaptain_redis:
+  qaptain_artifacts:

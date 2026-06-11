@@ -26,6 +26,7 @@ from app.db.models import (
     ApplicationModule, ApplicationPage, ApplicationWorkflow, SemanticElement,
     KnowledgeGraph, HumanDecision, ExploreMode,
     Scenario, ScenarioPriority, AIMemoryChunk, MemoryKind,
+    ExecutionRun,
 )
 from app.execution.browser_manager import BrowserManager
 from app.execution.self_healing import SelfHealingEngine
@@ -338,10 +339,7 @@ class ExploreEngine:
         # Angular SPAs with heavy scripts can take time to bootstrap.
         # First wait for Angular to stabilise (up to 30s), then poll for inputs.
         # Poll in 15s chunks so the timeline shows live progress.
-        await self._log("INFO", "login", "Waiting for Angular to stabilise and login form to render…")
-        ng_stable = await asyncio.to_thread(self._wait_for_angular_stable, 30)
-        if not ng_stable:
-            await self._log("INFO", "login", "Angular not yet stable after 30s — continuing to poll for inputs")
+        await self._log("INFO", "login", "Waiting for login form to render…")
         page_ready = False
         for _chunk in range(6):
             page_ready = await asyncio.to_thread(self._wait_for_any_input, timeout=15)
@@ -402,12 +400,10 @@ class ExploreEngine:
 
         await self._log("INFO", "login", "Credentials entered — submitting login form")
 
-        # Click login button
-        login_button = (None, None)
-        for label in ("Sign In", "Login", "Log In", "Submit", "SIGN IN"):
-            login_button = self._healer.find_element(label)
-            if login_button[0]:
-                break
+        # Click login button — try all common variants in one combined query
+        LOGIN_BTN_LABELS = ["Sign In", "Sign in", "signin", "Log In", "Log in",
+                            "Login", "login", "LOG IN", "SIGN IN", "Submit", "Continue", "Next"]
+        login_button = self._healer.find_element_any(LOGIN_BTN_LABELS)
 
         if login_button[0]:
             self._healer.click_with_healing(login_button[0])
@@ -1747,15 +1743,17 @@ class ExploreEngine:
             except Exception:
                 pass
 
-        # Fallback: use healer (slower but more reliable for complex elements)
-        for lbl in ("Submit", "Continue", "Proceed", "Sign In", "Login", "OK", "Confirm", "Next", "Go"):
-            result = self._healer.find_element(lbl)
-            if result[0]:
-                try:
-                    result[0].click()
-                    return
-                except Exception:
-                    pass
+        # Fallback: healer with all variants in one combined query
+        result = self._healer.find_element_any(
+            ["Submit", "Continue", "Proceed", "Sign In", "Sign in", "Login",
+             "Log In", "OK", "Confirm", "Next", "Go"]
+        )
+        if result[0]:
+            try:
+                result[0].click()
+                return
+            except Exception:
+                pass
 
     # ─────────────────────────────────────────────────────────────────────────
     # Phase: Deep Element Scan
@@ -2129,7 +2127,7 @@ class ExploreEngine:
         if f_type == "tel":
             return "+1-555-0100"
         if f_type == "date":
-            return "2025-06-01"
+            return "2027-01-01"
         if f_type == "url":
             return "https://qatest.example.com"
         if f_type == "textarea":
@@ -2142,7 +2140,7 @@ class ExploreEngine:
         if any(k in label for k in ("price", "cost", "amount", "rate", "salary")):
             return "99.99"
         if any(k in label for k in ("date", "dob", "birthday", "expiry")):
-            return "2025-06-01"
+            return "2027-01-01"
         if any(k in label for k in ("url", "website", "link")):
             return "https://qatest.example.com"
         if any(k in label for k in ("qty", "quantity", "count", "number", "no.", "age", "limit")):
@@ -3602,7 +3600,7 @@ class ExploreEngine:
         try:
             el = self._browser.driver.find_element(By.CSS_SELECTOR, checkbox_sel)
             self._browser.execute_script("arguments[0].click()", el)
-            time.sleep(0.8)
+            await asyncio.sleep(0.8)
         except Exception:
             return None
 
@@ -3632,7 +3630,7 @@ class ExploreEngine:
                 actions_el = self._browser.driver.find_element(By.CSS_SELECTOR, actions_btn_sel)
                 actions_el_text = actions_el.text.strip()
                 self._browser.execute_script("arguments[0].click()", actions_el)
-                time.sleep(0.6)
+                await asyncio.sleep(0.6)
 
                 # Look for Delete in the opened dropdown
                 delete_sel = self._browser.execute_script("""
@@ -3676,7 +3674,7 @@ class ExploreEngine:
             # Close the dropdown
             try:
                 self._browser.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-                time.sleep(0.3)
+                await asyncio.sleep(0.3)
             except Exception:
                 pass
 
@@ -3685,7 +3683,7 @@ class ExploreEngine:
             el = self._browser.driver.find_element(By.CSS_SELECTOR, checkbox_sel)
             if el.is_selected():
                 self._browser.execute_script("arguments[0].click()", el)
-            time.sleep(0.3)
+            await asyncio.sleep(0.3)
         except Exception:
             pass
 
@@ -3939,7 +3937,7 @@ class ExploreEngine:
                 else el.value = val;
                 ['input','change'].forEach(e => el.dispatchEvent(new Event(e, {bubbles:true})));
             """, input_el, IMPOSSIBLE_STRING)
-            time.sleep(0.3)
+            await asyncio.sleep(0.3)
 
             # Click search button or press Enter
             if search_btn_sel:
@@ -4417,7 +4415,7 @@ class ExploreEngine:
             application_id=application_id,
             kind=MemoryKind.MODULE,
             content="\n".join(lines),
-            metadata={"session_id": self._session_id, "source": "exploration"},
+            extra={"session_id": self._session_id, "source": "exploration"},
             confidence=0.9,
         )
         self.db.add(chunk)
@@ -4501,6 +4499,8 @@ class ExploreEngine:
                     lines.append(f"  Trigger selector: {sel}")
 
                 for rev in (reveals or []):
+                    if not isinstance(rev, dict):
+                        continue
                     title = rev.get("title", "")
                     fields = rev.get("fields", [])
                     submit_sel = rev.get("submit_selector", "")
@@ -4513,6 +4513,8 @@ class ExploreEngine:
                     if fields:
                         lines.append("  Form fields:")
                         for f in fields[:15]:
+                            if not isinstance(f, dict):
+                                continue
                             f_label = f.get("label", "")
                             f_type = f.get("type", "text")
                             f_sel = f.get("selector", "")
@@ -4522,7 +4524,7 @@ class ExploreEngine:
                             opts = f.get("options", [])
                             opts_hint = f" options=[{', '.join(opts[:5])}]" if opts else ""
                             # Inline validation error for this field
-                            field_errors = validation_rules.get(f_label, [])
+                            field_errors = validation_rules.get(f_label, []) if isinstance(validation_rules, dict) else []
                             err_hint = f" validation-error='{field_errors[0]}'" if field_errors else ""
                             lines.append(
                                 f"    - {f_label} ({f_type}{f_required}){opts_hint}{err_hint}"
@@ -4561,9 +4563,17 @@ class ExploreEngine:
 
         # Table info from page data
         for table in (page.tables or [])[:3]:
+            if not isinstance(table, dict):
+                continue
             t_name = table.get("name", "Table")
             row_actions = table.get("row_actions", [])
-            cols = [c.get("name", "") for c in table.get("columns", [])[:8] if c.get("name")]
+            raw_cols = table.get("columns", [])
+            # AI may return columns as strings or dicts — handle both
+            cols = [
+                c.get("name", "") if isinstance(c, dict) else str(c)
+                for c in (raw_cols or [])[:8]
+                if (c.get("name", "") if isinstance(c, dict) else c)
+            ]
             lines.append(f"\nTABLE: {t_name}")
             if cols:
                 lines.append(f"  Columns: {', '.join(cols)}")
@@ -4572,6 +4582,8 @@ class ExploreEngine:
 
         # Table row interaction discoveries (from live clicking)
         for disc in (row_discoveries or []):
+            if not isinstance(disc, dict):
+                continue
             dtype = disc.get("type", "")
             if dtype == "row_opens_detail":
                 lines.append(f"\nTABLE ROW INTERACTION: Clicking a row navigates to a detail page")
@@ -4579,8 +4591,12 @@ class ExploreEngine:
                 lines.append(f"  NOTE: To edit/view a record, click the row to navigate to its detail page")
             elif dtype == "row_opens_dialog":
                 dialog = disc.get("dialog", {})
+                if not isinstance(dialog, dict):
+                    dialog = {}
                 lines.append(f"\nTABLE ROW INTERACTION: Clicking a row opens '{dialog.get('title', 'a dialog')}'")
                 for f in dialog.get("fields", [])[:10]:
+                    if not isinstance(f, dict):
+                        continue
                     f_sel = f.get("selector", "") or (f"[name=\"{f.get('name', '')}\"]" if f.get("name") else "")
                     f_required = " (required)" if f.get("required") else ""
                     lines.append(f"  Field: {f.get('label', '')} ({f.get('type', 'text')}{f_required})"
@@ -4589,10 +4605,14 @@ class ExploreEngine:
                     lines.append(f"  Submit selector: {dialog['submit_selector']}")
             elif dtype == "row_action_opens_dialog":
                 dialog = disc.get("dialog", {})
+                if not isinstance(dialog, dict):
+                    dialog = {}
                 action = disc.get("action", "")
                 lines.append(f"\nROW ACTION: '{action}' button (selector: {disc.get('selector', '')})")
                 lines.append(f"  Opens: '{dialog.get('title', 'a dialog')}'")
                 for f in dialog.get("fields", [])[:10]:
+                    if not isinstance(f, dict):
+                        continue
                     f_sel = f.get("selector", "") or (f"[name=\"{f.get('name', '')}\"]" if f.get("name") else "")
                     opts = f.get("options", [])
                     opts_hint = f" options=[{', '.join(opts[:5])}]" if opts else ""
@@ -4606,6 +4626,8 @@ class ExploreEngine:
 
         # Tab content discoveries (from live tab clicking)
         for disc in (tab_discoveries or []):
+            if not isinstance(disc, dict):
+                continue
             dtype = disc.get("type", "")
             if dtype == "tab_content":
                 tab_label = disc.get("tab_label", "")
@@ -4615,16 +4637,25 @@ class ExploreEngine:
                 if btn_labels:
                     lines.append(f"  Buttons: {', '.join(btn_labels[:6])}")
                 for form in tab_forms[:2]:
-                    field_names = [f.get("label", "") for f in form.get("fields", [])[:6]]
+                    if not isinstance(form, dict):
+                        continue
+                    field_names = [
+                        f.get("label", "") for f in form.get("fields", [])[:6]
+                        if isinstance(f, dict)
+                    ]
                     if field_names:
                         lines.append(f"  Form fields: {', '.join(field_names)}")
             elif dtype == "tab_action_dialog":
                 tab_label = disc.get("tab_label", "")
                 action = disc.get("action", "")
                 dialog = disc.get("dialog", {})
+                if not isinstance(dialog, dict):
+                    dialog = {}
                 lines.append(f"\nTAB '{tab_label}' ACTION: '{action}'")
                 lines.append(f"  Opens: '{dialog.get('title', 'a dialog')}'")
                 for f in dialog.get("fields", [])[:8]:
+                    if not isinstance(f, dict):
+                        continue
                     f_sel = f.get("selector", "")
                     lines.append(f"  Field: {f.get('label', '')} ({f.get('type', 'text')})"
                                  + (f" — selector: {f_sel}" if f_sel else ""))
@@ -4970,19 +5001,20 @@ class ExploreEngine:
         if clicked:
             return True
 
-        # Fallback: use healer for complex elements
-        for label in ("Sign In", "Login", "Log In", "Submit", "SIGN IN", "LOG IN", "LOGIN", "Continue"):
-            result = self._healer.find_element(label)
-            if result[0]:
+        # Fallback: healer with all variants in one combined query
+        LOGIN_BTN_LABELS = ["Sign In", "Sign in", "signin", "Log In", "Log in",
+                            "Login", "login", "LOG IN", "SIGN IN", "Submit", "Continue"]
+        result = self._healer.find_element_any(LOGIN_BTN_LABELS)
+        if result[0]:
+            try:
+                result[0].click()
+                return True
+            except Exception:
                 try:
-                    result[0].click()
+                    self._browser.execute_script("arguments[0].click()", result[0])
                     return True
                 except Exception:
-                    try:
-                        self._browser.execute_script("arguments[0].click()", result[0])
-                        return True
-                    except Exception:
-                        pass
+                    pass
         return False
 
     def _keyboard_login(self, username: str, password: str) -> bool:
@@ -5256,16 +5288,16 @@ class ExploreEngine:
 
         # Try pressing Enter or clicking a "Next" / "Continue" button
         clicked_next = False
-        for label in ("Next", "Continue", "Proceed", "Sign In", "Login"):
-            result = self._healer.find_element(label)
-            if result[0]:
-                try:
-                    result[0].click()
-                    clicked_next = True
-                    await self._log("INFO", "login", f"Two-step login: clicked '{label}' button")
-                    break
-                except Exception:
-                    pass
+        result = self._healer.find_element_any(
+            ["Next", "Continue", "Proceed", "Sign In", "Sign in", "Login", "Log In"]
+        )
+        if result[0]:
+            try:
+                result[0].click()
+                clicked_next = True
+                await self._log("INFO", "login", f"Two-step login: clicked button via combined search")
+            except Exception:
+                pass
         if not clicked_next:
             try:
                 username_el.send_keys(Keys.RETURN)
@@ -5293,12 +5325,10 @@ class ExploreEngine:
         await asyncio.to_thread(self._fill_login_field, password_el, password)
         await asyncio.sleep(0.3)
 
-        # Submit
-        login_button = (None, None)
-        for label in ("Sign In", "Login", "Log In", "Submit", "SIGN IN", "Next"):
-            login_button = self._healer.find_element(label)
-            if login_button[0]:
-                break
+        # Submit — try all common variants in one combined query
+        LOGIN_BTN_LABELS = ["Sign In", "Sign in", "signin", "Log In", "Log in",
+                            "Login", "login", "LOG IN", "SIGN IN", "Submit", "Next", "Continue"]
+        login_button = self._healer.find_element_any(LOGIN_BTN_LABELS)
         if login_button[0]:
             self._healer.click_with_healing(login_button[0])
         else:
@@ -5590,9 +5620,12 @@ class ExploreEngine:
             for (const el of document.querySelectorAll('div, section, nav, aside, ul')) {
                 if (SKIP_TAGS.has(el.tagName.toLowerCase())) continue;
                 const r = el.getBoundingClientRect();
-                // Must be a narrow vertical strip (sidebar width < 320px) on the left
-                if (r.width < 50 || r.width > 350 || r.left > 400) continue;
                 if (!isVisible(el)) continue;
+                const viewW = window.innerWidth || 1280;
+                // Allow sidebars up to 50% viewport width; exclude full-width main content
+                if (r.width < 30 || r.width > viewW * 0.5) continue;
+                // Allow sidebars anywhere in the left 60% of viewport
+                if (r.left > viewW * 0.6) continue;
                 const linkCount = el.querySelectorAll('a[href]').length;
                 if (linkCount > maxLinks) {
                     maxLinks = linkCount;
@@ -6063,19 +6096,27 @@ class ExploreEngine:
                 for (const n of el.childNodes) { if (n.nodeType === 3) t += n.textContent; }
                 return (t.trim() || el.textContent || '').trim().replace(/\\s+/g, ' ').toLowerCase();
             }
-            const NAV_SELS = ['nav','[role="navigation"]','aside','[class*="sidebar" i]',
-                              '[class*="menu" i]','body'];
+            // Search ALL matching containers (querySelectorAll not querySelector)
+            // so apps with both header nav + sidebar are both searched.
+            const NAV_SELS = [
+                'nav','[role="navigation"]','aside','[role="menubar"]',
+                '[class*="sidebar" i]','[class*="sidenav" i]','[class*="side-nav" i]',
+                '[class*="menu" i]','header','body'
+            ];
+            const tried = new Set();
             for (const sel of NAV_SELS) {
-                const container = document.querySelector(sel);
-                if (!container) continue;
-                for (const el of container.querySelectorAll(
-                    'a, li, [role="menuitem"], [role="treeitem"], button'
-                )) {
-                    if (!isVisible(el)) continue;
-                    const t = getDirectText(el);
-                    if (t === target || t.startsWith(target) || target.startsWith(t)) {
-                        el.click();
-                        return true;
+                for (const container of document.querySelectorAll(sel)) {
+                    if (tried.has(container)) continue;
+                    tried.add(container);
+                    for (const el of container.querySelectorAll(
+                        'a, li, [role="menuitem"], [role="treeitem"], button'
+                    )) {
+                        if (!isVisible(el)) continue;
+                        const t = getDirectText(el);
+                        if (t === target || t.startsWith(target) || target.startsWith(t)) {
+                            el.click();
+                            return true;
+                        }
                     }
                 }
             }
@@ -7309,10 +7350,20 @@ class ExploreEngine:
         return None
 
     async def _fail_session(self, session: ExploreSession, reason: str):
+        # Roll back any aborted transaction before writing the failure status —
+        # a FK violation or other DB error leaves the connection in an aborted
+        # state; committing on top of it raises InFailedSQLTransactionError.
+        try:
+            await self.db.rollback()
+        except Exception:
+            pass
         session.status = ExploreStatus.FAILED
         session.error_message = reason
         session.completed_at = datetime.utcnow()
-        await self.db.commit()
+        try:
+            await self.db.commit()
+        except Exception:
+            pass
         await self._log("WARNING", "system", f"Exploration failed: {reason}")
         await self._emit_event("explore_failed", {"session_id": self._session_id, "reason": reason})
 
@@ -7403,17 +7454,43 @@ class ExploreEngine:
             f"Refreshing {len(module_ids)} module(s): removing {page_count} page(s), "
             f"{wf_count} workflow(s), {len(child_ids)} child module(s) — other modules untouched")
 
-        # Remove AI-generated scenarios for these modules
-        await self.db.execute(
-            sa_delete(Scenario).where(
+        # Remove AI-generated scenarios for these modules.
+        # Scenarios that already have execution_runs can't be hard-deleted (FK constraint
+        # on execution_runs.scenario_id has no CASCADE). Detach those instead so history
+        # is preserved; delete the rest cleanly.
+        ai_ids_result = await self.db.execute(
+            select(Scenario.id).where(
                 Scenario.module_id.in_(all_ids),
                 Scenario.source == "ai_generated",
             )
         )
-        # Detach user-created scenarios from module so they survive
+        ai_ids = [row[0] for row in ai_ids_result.all()]
+        if ai_ids:
+            has_runs_result = await self.db.execute(
+                select(ExecutionRun.scenario_id).where(
+                    ExecutionRun.scenario_id.in_(ai_ids)
+                ).distinct()
+            )
+            has_runs_ids = {row[0] for row in has_runs_result.all()}
+            safe_to_delete = [sid for sid in ai_ids if sid not in has_runs_ids]
+            must_detach    = [sid for sid in ai_ids if sid in has_runs_ids]
+            if safe_to_delete:
+                await self.db.execute(
+                    sa_delete(Scenario).where(Scenario.id.in_(safe_to_delete))
+                )
+            if must_detach:
+                await self.db.execute(
+                    sa_update(Scenario)
+                    .where(Scenario.id.in_(must_detach))
+                    .values(module_id=None)
+                )
+        # Detach user-created scenarios from module so they survive re-exploration
         await self.db.execute(
             sa_update(Scenario)
-            .where(Scenario.module_id.in_(all_ids))
+            .where(
+                Scenario.module_id.in_(all_ids),
+                Scenario.source != "ai_generated",
+            )
             .values(module_id=None)
         )
         # Delete child modules — DB cascade removes their pages, workflows, semantic elements
@@ -7494,6 +7571,78 @@ class ExploreEngine:
         result = await self.db.execute(select(Application).where(Application.id == application_id))
         return result.scalar_one_or_none()
 
+    def _discover_nav_from_page_links(self) -> list[dict]:
+        """
+        Fallback nav discovery: collect unique internal <a href> links from the page.
+        Groups them by distinct URL path to avoid duplicates, and returns them as
+        synthetic nav items so _hierarchical_explore can click/visit each one.
+        """
+        return self._browser.execute_script("""
+        (function() {
+            const origin = window.location.origin;
+            const currentPath = window.location.pathname;
+            const seen = new Set();
+            const results = [];
+            const NOISE_TEXT = new Set(['logout','log out','sign out','skip','close','cancel',
+                                        'back','next','previous','submit','save','delete']);
+
+            for (const a of document.querySelectorAll('a[href]')) {
+                const href = a.getAttribute('href') || '';
+                if (!href || href.startsWith('javascript') || href === '#' || href === '') continue;
+
+                let full;
+                try { full = new URL(href, window.location.href).href; } catch(e) { continue; }
+                if (!full.startsWith(origin)) continue;
+
+                const path = new URL(full).pathname;
+                if (path === currentPath || path === '/' || path === '') continue;
+
+                const key = path.toLowerCase().replace(/\\/$/, '');
+                if (seen.has(key)) continue;
+                seen.add(key);
+
+                // Robust text extraction for icon-only sidebars
+                let text = '';
+                // 1. aria-label (most reliable for icon buttons)
+                text = (a.getAttribute('aria-label') || '').trim();
+                // 2. title attribute
+                if (!text) text = (a.getAttribute('title') || '').trim();
+                // 3. data-tooltip variants
+                if (!text) text = (a.getAttribute('data-tooltip') || a.getAttribute('data-tip') || a.getAttribute('data-content') || '').trim();
+                // 4. sr-only / visually-hidden spans (shadcn/ui collapsed sidebar pattern)
+                if (!text) {
+                    for (const span of a.querySelectorAll('span, p')) {
+                        const cls = (span.className || '').toLowerCase();
+                        if (cls.includes('sr-only') || cls.includes('screen-reader') ||
+                            cls.includes('visually-hidden') || cls.includes('sr-text')) {
+                            const t = (span.textContent || '').trim();
+                            if (t && t.length >= 2 && t.length < 80) { text = t; break; }
+                        }
+                    }
+                }
+                // 5. textContent minus SVG nodes (catches hidden-but-present text spans)
+                if (!text) {
+                    const clone = a.cloneNode(true);
+                    for (const s of clone.querySelectorAll('svg, path, circle, rect, line, polyline, polygon')) s.remove();
+                    text = clone.textContent.trim().replace(/\\s+/g, ' ');
+                    if (text.length > 80) text = '';
+                }
+                // 6. Derive a readable name from the URL path segment (icon-only with no text)
+                if (!text || text.length < 2) {
+                    const seg = path.split('/').filter(Boolean).pop() || '';
+                    if (seg) text = seg.replace(/[-_]/g, ' ').replace(/\\b\\w/g, c => c.toUpperCase());
+                }
+                if (!text || text.length < 2) continue;
+                if (NOISE_TEXT.has(text.toLowerCase())) continue;
+
+                results.push({ text: text, href: href, is_accordion: false, tag: 'a' });
+            }
+            // Sort alphabetically so the order is deterministic
+            results.sort((a, b) => a.text.localeCompare(b.text));
+            return results.slice(0, 60);
+        })()
+        """) or []
+
     def _scan_parent_navs(self) -> list[dict]:
         """Scan the sidebar/navigation DOM for parent/top-level nav items."""
         return self._browser.execute_script("""
@@ -7506,15 +7655,53 @@ class ExploreEngine:
                     && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
             }
             function getDirectText(el) {
-                let t = '';
+                // Priority 1: aria-label (most reliable for icon-only nav items)
+                let t = (el.getAttribute('aria-label') || '').trim();
+                if (t && t.length >= 2 && t.length < 80) return t;
+                // Priority 2: title attribute
+                t = (el.getAttribute('title') || '').trim();
+                if (t && t.length >= 2 && t.length < 80) return t;
+                // Priority 3: data-tooltip variants
+                t = (el.getAttribute('data-tooltip') || el.getAttribute('data-tip') || el.getAttribute('data-content') || '').trim();
+                if (t && t.length >= 2 && t.length < 80) return t;
+                // Priority 4: sr-only / visually-hidden child spans (shadcn/ui collapsed sidebar)
+                for (const span of el.querySelectorAll('span, p')) {
+                    const cls = (span.className || '').toLowerCase();
+                    if (cls.includes('sr-only') || cls.includes('screen-reader') ||
+                        cls.includes('visually-hidden') || cls.includes('sr-text')) {
+                        t = (span.textContent || '').trim();
+                        if (t && t.length >= 2 && t.length < 80) return t;
+                    }
+                }
+                // Priority 5: direct text nodes (traditional nav items)
+                t = '';
                 for (const n of el.childNodes) { if (n.nodeType === 3) t += n.textContent; }
                 t = t.trim().replace(/\\s+/g, ' ');
-                if (!t) t = (el.getAttribute('aria-label') || el.textContent || '').trim().replace(/\\s+/g, ' ');
-                return t.slice(0, 80);
+                if (t && t.length >= 2 && t.length < 80) return t;
+                // Priority 6: textContent minus SVG (catches hidden-but-present text spans)
+                const clone = el.cloneNode(true);
+                for (const s of clone.querySelectorAll('svg, path, circle, rect, line, polyline, polygon')) s.remove();
+                t = clone.textContent.trim().replace(/\\s+/g, ' ');
+                if (t && t.length >= 2 && t.length < 80) return t;
+                // Priority 7: URL path segment for <a href> (pure icon-only with NO text at all)
+                if (el.tagName === 'A') {
+                    const href = el.getAttribute('href') || '';
+                    const seg = href.split('/').filter(Boolean).pop() || '';
+                    if (seg) return seg.replace(/[-_]/g, ' ').replace(/\\b\\w/g, c => c.toUpperCase());
+                }
+                return '';
             }
-            const NOISE = new Set(['logout','log out','sign out','notifications','help','about','profile','account','settings']);
-            const NAV_SELS = ['nav', '[role="navigation"]', 'aside', '[role="menubar"]',
-                              '[class*="sidebar" i]', '[class*="sider" i]', '[class*="menu-bar" i]'];
+            // Only hard-block structural noise — profile/account/settings are valid modules
+            const NOISE = new Set(['logout','log out','sign out']);
+            const NAV_SELS = [
+                'nav', '[role="navigation"]', 'aside', '[role="menubar"]', '[role="tree"]',
+                '[class*="sidebar" i]', '[class*="sider" i]', '[class*="sidenav" i]',
+                '[class*="side-nav" i]', '[class*="menu-bar" i]', '[class*="left-nav" i]',
+                '[class*="leftnav" i]', '[class*="left-menu" i]', '[class*="leftmenu" i]',
+                '[class*="nav-wrapper" i]', '[class*="navigation" i]',
+                '[class*="app-menu" i]', '[class*="main-menu" i]', '[class*="vertical-nav" i]',
+                'header nav', 'header [role="menubar"]'
+            ];
             let bestRoot = null;
             let maxItems = 0;
             for (const sel of NAV_SELS) {
@@ -7534,15 +7721,17 @@ class ExploreEngine:
             const seen = new Set();
 
             function isSubMenuItem(el) {
+                // Only exclude items explicitly inside sub-menu containers by class/id name.
+                // Do NOT use role='menu' or role='group' — those are legitimately used on
+                // top-level nav lists by Ant Design, MUI, Chakra, etc., and falsely exclude
+                // every real nav item when the nav ul has role="menu".
                 let p = el.parentElement;
                 while (p && p !== root) {
                     const cls = (p.className || '').toLowerCase();
                     const id = (p.id || '').toLowerCase();
-                    const role = (p.getAttribute('role') || '').toLowerCase();
                     if (cls.includes('submenu') || cls.includes('sub-menu') || cls.includes('nested') ||
-                        cls.includes('dropdown-menu') || cls.includes('accordion-body') || 
-                        cls.includes('accordion-content') || id.includes('submenu') || 
-                        role === 'group' || role === 'menu') {
+                        cls.includes('dropdown-menu') || cls.includes('accordion-body') ||
+                        cls.includes('accordion-content') || id.includes('submenu')) {
                         return true;
                     }
                     p = p.parentElement;
@@ -7654,60 +7843,108 @@ class ExploreEngine:
             await asyncio.to_thread(self._browser.navigate, self._dashboard_url)
             await asyncio.sleep(0.8)
 
-            # Try to navigate by clicking the nav item by name
+            # Try to navigate by clicking the nav item by name; fall back to url_pattern
             clicked = await asyncio.to_thread(self._click_nav_item, module.name)
             if not clicked:
-                await self._log("WARNING", "exploration",
-                    f"Could not click nav item '{module.name}' — skipping")
-                continue
+                url_pat = (module.url_pattern or "").strip()
+                if url_pat and url_pat not in ("#", "/", "javascript:void(0)", "javascript:;"):
+                    nav_url = url_pat if url_pat.startswith("http") else base_url + url_pat
+                    await self._log("INFO", "exploration",
+                        f"Text-click failed for '{module.name}' — navigating directly to {nav_url}")
+                    await asyncio.to_thread(self._browser.navigate, nav_url)
+                else:
+                    await self._log("WARNING", "exploration",
+                        f"Could not navigate to '{module.name}' (no url_pattern, click failed) — skipping")
+                    continue
             await asyncio.sleep(1.0)
 
             actual_url = await asyncio.to_thread(self._get_full_url)
 
-            # Detect accordion: URL hasn't changed from dashboard → has sub-items
-            if actual_url.rstrip("/") == self._dashboard_url.rstrip("/"):
+            # If URL hasn't changed from dashboard, try direct URL navigation before
+            # concluding this is an accordion — covers icon-only sidebars and apps
+            # where click-by-text doesn't trigger navigation.
+            url_unchanged = actual_url.rstrip("/") == self._dashboard_url.rstrip("/")
+            if url_unchanged:
+                url_pat = (module.url_pattern or "").strip()
+                if url_pat and url_pat not in ("#", "/", "javascript:void(0)", "javascript:;"):
+                    direct_url = url_pat if url_pat.startswith("http") else base_url + url_pat
+                    # Only try if it's actually a different URL from the dashboard
+                    if direct_url.rstrip("/") != self._dashboard_url.rstrip("/"):
+                        await self._log("INFO", "exploration",
+                            f"URL unchanged after click — navigating directly to {direct_url}")
+                        await asyncio.to_thread(self._browser.navigate, direct_url)
+                        await asyncio.sleep(1.5)
+                        actual_url = await asyncio.to_thread(self._get_full_url)
+                        url_unchanged = actual_url.rstrip("/") == self._dashboard_url.rstrip("/")
+
+            if url_unchanged:
+                # Still on dashboard — check if it's a real accordion with sub-items
                 children = await asyncio.to_thread(self._scan_child_navs, module.name)
-                if not children:
-                    await self._log("WARNING", "exploration",
-                        f"'{module.name}' is an accordion but no children found — skipping")
-                    continue
-                await self._log("INFO", "exploration",
-                    f"'{module.name}' has {len(children)} sub-item(s) — exploring each")
-                for c_idx, child in enumerate(children):
-                    if self._should_stop:
-                        return
-                    child_text = child["text"]
+                if children:
                     await self._log("INFO", "exploration",
-                        f"  [{c_idx + 1}/{len(children)}] Sub-item: {module.name} → {child_text}")
-                    await asyncio.to_thread(self._browser.navigate, self._dashboard_url)
-                    await asyncio.sleep(0.7)
-                    await asyncio.to_thread(self._click_nav_item, module.name)
-                    await asyncio.sleep(0.6)
-                    await asyncio.to_thread(self._click_nav_item, child_text)
-                    await asyncio.sleep(1.0)
-                    child_url = await asyncio.to_thread(self._get_full_url)
-                    if await asyncio.to_thread(self._is_login_page):
-                        continue
-                    # Create a child module for each sub-item
-                    rel_url = child_url[len(base_url):] if child_url.startswith(base_url) else child_url
-                    if not rel_url.startswith("/"): rel_url = "/" + rel_url
-                    child_module = ApplicationModule(
-                        application_id=self._app.id,
-                        name=f"{module.name} - {child_text}",
-                        description=f"Sub-module: {child_text}",
-                        url_pattern=rel_url,
-                        icon="layout",
-                        parent_id=module.id,
-                        order_index=c_idx,
-                    )
-                    self.db.add(child_module)
-                    await self.db.flush()
-                    await self._explore_and_scan_module_page(
-                        child_url, child_module.id, nav_hint=f"{module.name} - {child_text}"
-                    )
-                await self.db.commit()
+                        f"'{module.name}' has {len(children)} sub-item(s) — exploring each")
+                    for c_idx, child in enumerate(children):
+                        if self._should_stop:
+                            return
+                        child_text = child["text"]
+                        child_href = child.get("href", "").strip()
+                        await self._log("INFO", "exploration",
+                            f"  [{c_idx + 1}/{len(children)}] Sub-item: {module.name} → {child_text}")
+
+                        # Navigate to child: prefer direct href, fall back to click sequence
+                        navigated = False
+                        if child_href and child_href not in ("#", "/", "javascript:void(0)", "javascript:;"):
+                            child_nav_url = child_href if child_href.startswith("http") else base_url + child_href
+                            await asyncio.to_thread(self._browser.navigate, child_nav_url)
+                            await asyncio.sleep(1.0)
+                            navigated = True
+                        else:
+                            await asyncio.to_thread(self._browser.navigate, self._dashboard_url)
+                            await asyncio.sleep(0.7)
+                            await asyncio.to_thread(self._click_nav_item, module.name)
+                            await asyncio.sleep(0.6)
+                            await asyncio.to_thread(self._click_nav_item, child_text)
+                            await asyncio.sleep(1.0)
+                            navigated = True
+
+                        child_url = await asyncio.to_thread(self._get_full_url)
+                        if await asyncio.to_thread(self._is_login_page):
+                            continue
+                        if child_url.rstrip("/") == self._dashboard_url.rstrip("/"):
+                            await self._log("WARNING", "exploration",
+                                f"  Sub-item '{child_text}' stayed on dashboard — skipping")
+                            continue
+
+                        rel_url = child_url[len(base_url):] if child_url.startswith(base_url) else child_url
+                        if not rel_url.startswith("/"): rel_url = "/" + rel_url
+                        child_module = ApplicationModule(
+                            application_id=self._app.id,
+                            name=f"{module.name} - {child_text}",
+                            description=f"Sub-module: {child_text}",
+                            url_pattern=rel_url,
+                            icon="layout",
+                            parent_id=module.id,
+                            order_index=c_idx,
+                        )
+                        self.db.add(child_module)
+                        await self.db.flush()
+                        await self._explore_and_scan_module_page(
+                            child_url, child_module.id, nav_hint=f"{module.name} - {child_text}"
+                        )
+                    await self.db.commit()
+                else:
+                    # No sub-items found AND no URL change — explore the current page anyway.
+                    # The module might be the dashboard itself or a page we can still scan.
+                    await self._log("INFO", "exploration",
+                        f"'{module.name}' appears to be the current page — scanning it")
+                    if not await asyncio.to_thread(self._is_login_page):
+                        module.url_pattern = module.url_pattern or actual_url[len(base_url):]
+                        await self.db.commit()
+                        await self._explore_and_scan_module_page(
+                            actual_url, module.id, nav_hint=module.name
+                        )
             else:
-                # Standalone page — update the module's URL and explore
+                # URL changed — standalone page, explore it
                 if await asyncio.to_thread(self._is_login_page):
                     await self._log("WARNING", "exploration",
                         f"Login redirect for '{module.name}' — skipping")
@@ -7841,16 +8078,15 @@ class ExploreEngine:
         # 1. Discover all parent nav items
         parents = await asyncio.to_thread(self._scan_parent_navs)
         if not parents:
-            try:
-                html_dump = await asyncio.to_thread(self._browser.execute_script, "return document.body.outerHTML;")
-                import os
-                # Dump to the absolute artifacts path of the AI workspace
-                dump_path = "/Users/harry/.gemini/antigravity-ide/brain/401b3f56-e33c-4de6-8011-6771115e18d4/artifacts/nav_debug.html"
-                with open(dump_path, "w", encoding="utf-8") as f:
-                    f.write(html_dump)
-                await self._log("WARNING", "navigation", "DUMPED DOM to artifacts/nav_debug.html for AI analysis!")
-            except Exception as e:
-                await self._log("ERROR", "navigation", f"Failed to dump DOM: {e}")
+            await self._log("WARNING", "navigation",
+                "Nav scan found 0 items — falling back to page-link discovery")
+            parents = await asyncio.to_thread(self._discover_nav_from_page_links)
+            if parents:
+                await self._log("INFO", "navigation",
+                    f"Link-based fallback found {len(parents)} candidate module(s)")
+            else:
+                await self._log("WARNING", "navigation",
+                    "No navigation items found via any method — check that login succeeded and the dashboard has a sidebar/nav")
 
         await self._log("INFO", "navigation", f"Navigation scan: {len(parents)} parent navigation item(s) found")
 
@@ -7923,36 +8159,75 @@ class ExploreEngine:
             await asyncio.to_thread(self._browser.navigate, self._dashboard_url)
             await asyncio.sleep(1.5)
 
-            # Click the parent nav
+            # Click the parent nav item by text; fall back to direct URL navigation
+            # (needed for icon-only sidebars where there is no visible text to click by)
             clicked = await asyncio.to_thread(self._click_nav_item, parent_text)
             if not clicked:
-                continue
+                href = p_item.get("href", "").strip()
+                if href and href not in ("#", "/", "javascript:void(0)", "javascript:;"):
+                    base_url = self._app.base_url.rstrip("/")
+                    nav_url = href if href.startswith("http") else base_url + href
+                    await self._log("INFO", "navigation",
+                        f"  Text-click failed for '{parent_text}' — navigating directly to {nav_url}")
+                    await asyncio.to_thread(self._browser.navigate, nav_url)
+                else:
+                    await self._log("WARNING", "navigation",
+                        f"  Could not navigate to '{parent_text}' (no href, click failed) — skipping")
+                    continue
             await asyncio.sleep(1.5)
 
-            children = []
-            if is_accordion:
+            # Check if URL actually changed — if not, try direct href navigation first
+            current_url_after_click = await asyncio.to_thread(self._get_full_url)
+            base_url = self._app.base_url.rstrip("/")
+            url_unchanged = current_url_after_click.rstrip("/") == self._dashboard_url.rstrip("/")
+
+            if url_unchanged and is_accordion:
+                # Genuine accordion: try to find children that reveal on expand
                 children = await asyncio.to_thread(self._scan_child_navs, parent_text)
+            else:
+                children = []
+
+            if url_unchanged and not children:
+                # URL didn't change and no accordion children — try direct href navigation
+                href = p_item.get("href", "").strip()
+                if href and href not in ("#", "/", "javascript:void(0)", "javascript:;"):
+                    direct_url = href if href.startswith("http") else base_url + href
+                    if direct_url.rstrip("/") != self._dashboard_url.rstrip("/"):
+                        await self._log("INFO", "navigation",
+                            f"  URL unchanged after click — navigating directly to {direct_url}")
+                        await asyncio.to_thread(self._browser.navigate, direct_url)
+                        await asyncio.sleep(1.5)
+                        current_url_after_click = await asyncio.to_thread(self._get_full_url)
+                        url_unchanged = current_url_after_click.rstrip("/") == self._dashboard_url.rstrip("/")
 
             if children:
                 for c_idx, child in enumerate(children):
                     if self._should_stop: return
                     child_text = child["text"]
+                    child_href = child.get("href", "").strip()
                     await self._log("INFO", "navigation",
                         f"  [{c_idx + 1}/{len(children)}] Sub-item: {parent_text} → {child_text}")
 
-                    await asyncio.to_thread(self._browser.navigate, self._dashboard_url)
-                    await asyncio.sleep(1.5)
-                    await asyncio.to_thread(self._click_nav_item, parent_text)
-                    await asyncio.sleep(1.0)
-                    await asyncio.to_thread(self._click_nav_item, child_text)
-                    await asyncio.sleep(1.5)
+                    # Prefer direct navigation via child href
+                    if child_href and child_href not in ("#", "/", "javascript:void(0)", "javascript:;"):
+                        child_nav_url = child_href if child_href.startswith("http") else base_url + child_href
+                        await asyncio.to_thread(self._browser.navigate, child_nav_url)
+                        await asyncio.sleep(1.5)
+                    else:
+                        await asyncio.to_thread(self._browser.navigate, self._dashboard_url)
+                        await asyncio.sleep(1.5)
+                        await asyncio.to_thread(self._click_nav_item, parent_text)
+                        await asyncio.sleep(1.0)
+                        await asyncio.to_thread(self._click_nav_item, child_text)
+                        await asyncio.sleep(1.5)
 
                     child_url = await asyncio.to_thread(self._get_full_url)
                     if await asyncio.to_thread(self._is_login_page) or child_url in discovered_urls:
                         continue
+                    if child_url.rstrip("/") == self._dashboard_url.rstrip("/"):
+                        continue
 
                     discovered_urls.add(child_url)
-                    base_url = self._app.base_url.rstrip("/")
                     rel_url = child_url[len(base_url):] if child_url.startswith(base_url) else child_url
                     if not rel_url.startswith("/"): rel_url = "/" + rel_url
 
@@ -7971,17 +8246,16 @@ class ExploreEngine:
                     order_idx += 1
                     await self._log("SUCCESS", "module",
                         f"Module saved: {parent_text} - {child_text} ({rel_url})")
-
                     await self._explore_and_scan_module_page(child_url, module.id, nav_hint=f"{parent_text} - {child_text}")
                 await self.db.commit()
+
             else:
-                # Standalone parent
-                parent_url = await asyncio.to_thread(self._get_full_url)
+                # Standalone page (URL changed or direct nav worked)
+                parent_url = current_url_after_click
                 if await asyncio.to_thread(self._is_login_page) or parent_url in discovered_urls:
                     continue
 
                 discovered_urls.add(parent_url)
-                base_url = self._app.base_url.rstrip("/")
                 rel_url = parent_url[len(base_url):] if parent_url.startswith(base_url) else parent_url
                 if not rel_url.startswith("/"): rel_url = "/" + rel_url
 
@@ -7999,6 +8273,5 @@ class ExploreEngine:
                 self._module_map[rel_url] = module.id
                 order_idx += 1
                 await self._log("SUCCESS", "module", f"Module saved: {parent_text} ({rel_url})")
-
                 await self._explore_and_scan_module_page(parent_url, module.id, nav_hint=parent_text)
                 await self.db.commit()

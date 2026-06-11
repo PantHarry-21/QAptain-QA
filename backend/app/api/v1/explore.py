@@ -256,6 +256,13 @@ async def cancel_session(
     session.status = ExploreStatus.CANCELLED
     session.completed_at = datetime.utcnow()
     await db.commit()
+
+    # Broadcast so the frontend banners clear immediately
+    await connection_manager.broadcast_json({
+        "event": "explore_cancelled",
+        "session_id": session_id,
+    })
+
     return ExploreSessionResponse.model_validate(session)
 
 

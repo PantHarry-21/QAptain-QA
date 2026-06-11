@@ -141,6 +141,76 @@ class SelfHealingEngine:
         log.warning("All healing strategies failed", label=semantic_label, attempts=len(attempts))
         return None, None, attempts
 
+    def find_element_any(
+        self,
+        labels: list[str],
+        element_type: str | None = None,
+    ) -> tuple:
+        """
+        Find an element matching ANY of the given labels.
+
+        Builds combined XPath selectors covering all variants at once so the
+        cost is O(strategies) rather than O(labels × strategies × timeout).
+        Designed for login-button detection where the exact text ("Sign In" vs
+        "Log In" vs "Login") is unpredictable.
+        """
+        xl = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        xs = "abcdefghijklmnopqrstuvwxyz"
+        ci_body = f'translate(., "{xl}", "{xs}")'
+        ci_aria = f'translate(@aria-label, "{xl}", "{xs}")'
+
+        def or_text(lbs: list[str]) -> str:
+            return " or ".join(f'contains({ci_body}, "{lb.lower().strip()}")' for lb in lbs)
+
+        def or_aria(lbs: list[str]) -> str:
+            return " or ".join(f'contains({ci_aria}, "{lb.lower().strip()}")' for lb in lbs)
+
+        ot = or_text(labels)
+        oa = or_aria(labels)
+
+        combined = [
+            ("button_any",       By.XPATH,        f'//button[{ot}]'),
+            ("submit_input",     By.CSS_SELECTOR, 'button[type="submit"], input[type="submit"]'),
+            ("link_any",         By.XPATH,        f'//a[{ot}]'),
+            ("aria_any",         By.XPATH,        f'//*[{oa}]'),
+            ("role_btn_any",     By.XPATH,        f'//*[@role="button"][{ot}]'),
+            ("span_in_btn_any",  By.XPATH,        f'//button[.//*[{ot}]]'),
+        ]
+
+        # Fast path: instant DOM snapshot — no wait
+        for strat, by, val in combined:
+            try:
+                for el in self.driver.find_elements(by, val):
+                    try:
+                        if el.is_displayed() or el.is_enabled():
+                            log.debug("Element found (find_element_any fast)", strategy=strat, labels=labels)
+                            return el, strat, []
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        # Slow path: single wait per combined selector (O(strategies), not O(labels×strategies))
+        for strat, by, val in combined:
+            start = time.monotonic()
+            try:
+                element = WebDriverWait(self.driver, self.STRATEGY_TIMEOUT).until(
+                    EC.presence_of_element_located((by, val))
+                )
+                try:
+                    if element.is_displayed() or element.is_enabled():
+                        log.debug("Element found (find_element_any)", strategy=strat, labels=labels)
+                        return element, strat, []
+                except Exception:
+                    pass
+            except (TimeoutException, NoSuchElementException):
+                continue
+            except Exception:
+                continue
+
+        log.warning("find_element_any: all labels failed", labels=labels)
+        return None, None, []
+
     def click_with_healing(
         self,
         element,

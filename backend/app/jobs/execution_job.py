@@ -45,10 +45,10 @@ async def _run_execution_async(run_id: str) -> None:
     from config import settings
 
     # Executor selection (env vars, highest priority first):
-    #   EXECUTOR=plan_driven  → PlanDrivenPlaywrightExecutor (default — KG-backed, AI-minimal)
-    #   EXECUTOR=agentic      → PlaywrightMCPExecutor (legacy AI-per-step agentic loop)
+    #   EXECUTOR=agentic      → PlaywrightMCPExecutor (default — plan-step-driven AI loop)
+    #   EXECUTOR=plan_driven  → PlanDrivenPlaywrightExecutor (deterministic, KG-backed)
     #   USE_PLAYWRIGHT_MCP=false → Selenium ExecutionOrchestrator (legacy fallback)
-    executor_mode = os.environ.get("EXECUTOR", "plan_driven").lower()
+    executor_mode = os.environ.get("EXECUTOR", "agentic").lower()
     use_playwright = os.environ.get("USE_PLAYWRIGHT_MCP", "true").lower() != "false"
 
     engine = create_async_engine(

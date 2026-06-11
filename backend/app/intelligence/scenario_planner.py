@@ -34,15 +34,23 @@ log = structlog.get_logger()
 
 def _detect_workflow_type(title: str, description: str = "") -> str:
     """Detect workflow type from scenario title — mirrors QA engine classification."""
-    text = (title + " " + description).lower()
-    # AUTH is highest priority — very specific keywords
-    if any(w in text for w in ("login", "sign in", "logout", "auth", "credential", "session")):
+    title_lower = title.lower()
+    text = (title_lower + " " + description.lower())
+
+    # AUTH is highest priority — very specific keywords (not "session" alone — too broad)
+    if any(w in text for w in ("login", "sign in", "logout", "auth", "credential")):
         return "AUTH"
-    # CRUD: if the scenario mentions create/edit/delete together, it's CRUD even if
-    # it also mentions export (e.g. "create edit export delete CRM record").
+
+    # CRUD: a single CRUD verb in the TITLE is sufficient — the description often
+    # contains "navigate to ..." which would otherwise suppress CRUD detection.
+    # e.g. "Add Column record end-to-end" → title has "add" → CRUD.
+    if any(w in title_lower for w in ("create", "add", "edit", "update", "delete", "remove")):
+        return "CRUD"
+    # If not in title, require 2+ signals from the full text
     crud_signals = sum(1 for w in ("create", "edit", "delete", "add", "update") if w in text)
     if crud_signals >= 2:
         return "CRUD"
+
     if any(w in text for w in ("search", "filter", "find record", "query")):
         return "SEARCH_FILTER"
     if any(w in text for w in ("pagination", "next page", "previous page", "paging")):
@@ -60,6 +68,96 @@ def _detect_workflow_type(title: str, description: str = "") -> str:
     if any(w in text for w in ("navigate", "access module", "open page", "go to")):
         return "NAVIGATION"
     return "CRUD"  # safe default — covers most entity-management scenarios
+
+
+def _extract_operation_intent(title: str, description: str = "") -> dict:
+    """
+    Extract which specific CRUD operation(s) the scenario intends to test.
+
+    Returns:
+      operation       — "create" | "update" | "delete" | "read" | "full_crud"
+      crud_workflows  — ordered list of KG workflow types to stitch
+      test_variants   — which test categories to include
+      scope_note      — one-line scope constraint injected into the AI prompt
+    """
+    text = (title + " " + (description or "")).lower()
+    title_lower = title.lower()
+
+    _CREATE = ("add", "create", "insert", "new record", "add new", "create new",
+               "adding", "submit form", "fill form")
+    _UPDATE = ("edit", "update", "modify", "change", "amend", "alter", "updating")
+    _DELETE = ("delete", "remove", "archive", "deactivate", "purge", "deleting")
+    _READ   = ("view only", "read only", "display", "listing", "list records")
+
+    in_title = {
+        "create": any(w in title_lower for w in _CREATE),
+        "update": any(w in title_lower for w in _UPDATE),
+        "delete": any(w in title_lower for w in _DELETE),
+        "read":   any(w in title_lower for w in _READ),
+    }
+
+    # Strong scope phrases take precedence over individual verb matching
+    if any(p in text for p in ("e2e add", "end to end add", "add scenario", "test add",
+                                "add test", "add only", "add feature", "add functionality",
+                                "add record", "test adding", "adding scenario")):
+        operation = "create"
+    elif any(p in text for p in ("e2e edit", "end to end edit", "edit scenario", "test edit",
+                                  "e2e update", "update scenario", "update only", "update feature",
+                                  "update record", "test updating")):
+        operation = "update"
+    elif any(p in text for p in ("e2e delete", "end to end delete", "delete scenario",
+                                  "test delete", "delete only", "delete feature",
+                                  "delete record", "test deleting")):
+        operation = "delete"
+    elif any(p in text for p in ("full crud", "all operations", "create edit delete",
+                                  "create update delete", "crud operations")):
+        operation = "full_crud"
+    # Single-operation title signals
+    elif in_title["create"] and not in_title["update"] and not in_title["delete"]:
+        operation = "create"
+    elif in_title["update"] and not in_title["create"] and not in_title["delete"]:
+        operation = "update"
+    elif in_title["delete"] and not in_title["create"] and not in_title["update"]:
+        operation = "delete"
+    elif in_title["read"] and not any(in_title[k] for k in ("create", "update", "delete")):
+        operation = "read"
+    else:
+        operation = "full_crud"  # ambiguous or multi-operation — run everything
+
+    # Which KG workflow types to load (create is always first — need a record to edit/delete)
+    workflow_map = {
+        "create":    ["crud_create"],
+        "update":    ["crud_create", "crud_update"],
+        "delete":    ["crud_create", "crud_delete"],
+        "read":      ["crud_create"],
+        "full_crud": ["crud_create", "crud_update", "crud_delete"],
+    }
+
+    # Test variant categories — always positive + validation; expand if keywords present
+    variants = ["positive", "validation"]
+    if any(w in text for w in ("negative", "invalid", "error", "fail", "bad data")):
+        variants.append("negative")
+    if any(w in text for w in ("boundary", "bva", "edge case", "edge cases", "min", "max")):
+        variants.append("bva")
+    if any(w in text for w in ("security", "injection", "xss", "sql")):
+        variants.append("security")
+    if operation in ("create", "full_crud") and "negative" not in variants:
+        variants.append("negative")
+
+    scope_notes = {
+        "create":    "SCOPE: Test ADD/CREATE only — do NOT generate update, edit, or delete phases.",
+        "update":    "SCOPE: Test EDIT/UPDATE flow — create a record first, then test editing it. Do NOT generate delete phases.",
+        "delete":    "SCOPE: Test DELETE flow — create a record first, then test deleting it. Do NOT generate update phases.",
+        "read":      "SCOPE: Test READ/VIEW only — verify records are visible and data is correct. No mutations.",
+        "full_crud": "SCOPE: Test the complete CRUD lifecycle — create, edit, and delete in sequence.",
+    }
+
+    return {
+        "operation": operation,
+        "crud_workflows": workflow_map.get(operation, ["crud_create", "crud_update", "crud_delete"]),
+        "test_variants": list(dict.fromkeys(variants)),
+        "scope_note": scope_notes.get(operation, ""),
+    }
 
 ALLOWED_ACTIONS = frozenset([
     "navigate", "click", "fill", "clear", "select", "key_press", "hover",
@@ -114,7 +212,7 @@ class ScenarioPlanner:
         if settings.AI_PROVIDER == "azure_openai":
             from app.intelligence.azure_rate_limiter import get_azure_limiter
             limiter = get_azure_limiter()
-            wait = limiter._next_allowed - time.monotonic()
+            wait = limiter.current_wait()
             if wait > 5.0:
                 log.warning(
                     "Azure rate limiter active — using capability engine plan immediately",
@@ -133,7 +231,11 @@ class ScenarioPlanner:
         plan_data = self._validate_and_cap(plan_data, caps["max_steps"])
 
         # Detect fallback so the batch executor can identify and retry these plans
-        _is_fallback = plan_data.get("qa_reasoning", "").startswith("Fallback plan")
+        _qa_reasoning = plan_data.get("qa_reasoning", "")
+        _is_fallback = (
+            _qa_reasoning.startswith("Fallback plan")
+            or _qa_reasoning.startswith("Capability engine plan")
+        )
 
         plan = ExecutionPlan(
             scenario_id=scenario.id,
@@ -203,17 +305,25 @@ class ScenarioPlanner:
                 .where(ApplicationPage.module_id == scenario.module_id)
                 .limit(4)
             )
+            # Keywords that indicate a search/filter widget on the list view,
+            # not a field on a create/edit form.
+            _SEARCH_KEYWORDS = ("search", "filter", "find", "query", "lookup",
+                                 "look up", "by product", "by name", "by id")
             seen_fields: set[str] = set()
             for page in pages_result.scalars().all():
                 for form in (page.forms or [])[:2]:
                     for fld in form.get("fields", [])[:10]:
-                        lbl = (fld.get("label") or "").strip()
-                        if lbl and lbl not in seen_fields:
-                            seen_fields.add(lbl)
-                            form_fields.append(lbl)
+                        lbl = (fld.get("label") or fld.get("placeholder") or "").strip()
+                        if not lbl or lbl in seen_fields:
+                            continue
+                        if any(k in lbl.lower() for k in _SEARCH_KEYWORDS):
+                            continue
+                        seen_fields.add(lbl)
+                        form_fields.append(lbl)
 
-        # Detect workflow type + run capability engine
+        # Detect workflow type + operation intent, then run capability engine
         workflow_type = _detect_workflow_type(scenario.title, scenario.description or "")
+        op_intent = _extract_operation_intent(scenario.title, scenario.description or "")
         registry = get_engine_registry()
         cap_ctx = registry.build_capability_context(
             scenario_title=scenario.title,
@@ -224,6 +334,9 @@ class ScenarioPlanner:
             execution_mode=execution_mode,
         )
         cap_ctx.form_fields = form_fields
+        # Pass operation intent so capability engines scope their step generation
+        cap_ctx.operation_type = op_intent["operation"]
+        cap_ctx.test_variants = op_intent["test_variants"]
 
         steps_by_cat = registry.generate_capability_steps(cap_ctx)
 
@@ -352,11 +465,33 @@ class ScenarioPlanner:
 
         caps = MODE_CAPS.get(execution_mode, MODE_CAPS["functional"])
         workflow_type = _detect_workflow_type(scenario.title, scenario.description or "")
-        wf_by_type: dict[str, Any] = {wf.workflow_type: wf for wf in workflows}
+        op_intent = _extract_operation_intent(scenario.title, scenario.description or "")
 
-        # Determine which recorded workflows to stitch based on scenario type
+        # Normalise workflow type names: AI page-analyzer emits "crud_lifecycle",
+        # "data_entry", "form_submission" etc. Map them to the canonical planner names.
+        _WF_TYPE_ALIASES = {
+            "crud_lifecycle":   "crud_create",
+            "data_entry":       "crud_create",
+            "form_submission":  "crud_create",
+            "list_management":  "crud_create",
+            "record_update":    "crud_update",
+            "record_delete":    "crud_delete",
+            "login":            "auth",
+            "authentication":   "auth",
+            "search_filter":    "search",
+            "export_report":    "export",
+        }
+        wf_by_type: dict[str, Any] = {}
+        for wf in workflows:
+            canonical = _WF_TYPE_ALIASES.get(wf.workflow_type, wf.workflow_type)
+            wf_by_type[canonical] = wf
+            if wf.workflow_type != canonical:
+                wf_by_type[wf.workflow_type] = wf  # keep original too
+
+        # Determine which recorded workflows to stitch, scoped by operation intent.
+        # e.g. "Test Add scenarios" → only crud_create; "Test Delete" → crud_create + crud_delete
         if workflow_type == "CRUD":
-            ordered_types = ["crud_create", "crud_update", "crud_delete"]
+            ordered_types = op_intent["crud_workflows"]
         elif workflow_type == "AUTH":
             ordered_types = ["auth"]
         elif workflow_type == "SEARCH_FILTER":
@@ -420,11 +555,25 @@ class ScenarioPlanner:
             if seq > caps["max_steps"]:
                 break
 
+        # Append validation variant steps when the happy-path has room and
+        # the scenario is testing a create/full-crud operation.
+        remaining_budget = caps["max_steps"] - seq
+        if remaining_budget >= 4 and op_intent["operation"] in ("create", "full_crud"):
+            create_wf = wf_by_type.get("crud_create")
+            if create_wf:
+                variant_steps = self._build_validation_variant(
+                    create_wf, seq, remaining_budget
+                )
+                steps.extend(variant_steps)
+                seq += len(variant_steps)
+
         plan_data: dict[str, Any] = {
             "workflow_type": workflow_type,
             "goal": f"Verify {scenario.title} works as expected",
             "qa_reasoning": (
                 f"KG-recorded plan from {len(available)} workflow(s) for '{mod.name}'. "
+                f"Operation: {op_intent['operation']}. "
+                f"Includes: {', '.join(op_intent['test_variants'])}. "
                 f"Exact selectors from exploration — no AI needed."
             ),
             "steps": steps,
@@ -432,7 +581,9 @@ class ScenarioPlanner:
             "semantic_intent": {
                 "source": "kg_recorded",
                 "module": mod.name,
-                "operation": workflow_type.lower(),
+                "operation": op_intent["operation"],
+                "operation_scope": op_intent["scope_note"],
+                "test_variants": op_intent["test_variants"],
                 "kg_workflows": available,
                 "pass_criteria": "All KG-recorded steps complete without errors",
                 "fail_criteria": "Any non-skippable step fails",
@@ -440,7 +591,24 @@ class ScenarioPlanner:
         }
         plan_data = self._validate_and_cap(plan_data, caps["max_steps"])
 
+        # Check AFTER _validate_and_cap — AI-analyzed stages store action descriptions
+        # ("Click Add", "Fill form") that get filtered out by ALLOWED_ACTIONS. If nothing
+        # executable survives filtering, the KG has nothing useful — fall through to AI.
+        _VACUOUS = {"screenshot", "navigate", "wait_ms", "wait_element", "wait_network", "scroll"}
+        validated_meaningful = [
+            s for s in plan_data["steps"]
+            if (s.get("action") or "").lower() not in _VACUOUS
+        ]
+        if not validated_meaningful:
+            log.warning(
+                "KG plan has no executable test steps after action filtering — falling back to AI",
+                module=mod.name, workflow_type=workflow_type,
+                raw_steps=len(steps), scenario_id=scenario.id,
+            )
+            return None
+
         latest = await self._latest_plan_version(scenario.id)
+        real_step_count = len(plan_data["steps"])
         plan = ExecutionPlan(
             scenario_id=scenario.id,
             execution_mode=execution_mode,
@@ -449,7 +617,7 @@ class ScenarioPlanner:
             semantic_intent=plan_data.get("semantic_intent", {}),
             workflow_stages=self._extract_workflow_stages(plan_data),
             risk_score=self._calculate_risk(plan_data, execution_mode),
-            estimated_duration_seconds=len(steps) * 5,
+            estimated_duration_seconds=real_step_count * 5,
             created_by_model="kg_recorded",
             version=(latest.version + 1 if latest else 1),
         )
@@ -461,12 +629,96 @@ class ScenarioPlanner:
             plan_id=plan.id,
             module=mod.name,
             workflow_type=workflow_type,
-            steps=len(steps),
+            steps=real_step_count,
+            meaningful=len(validated_meaningful),
             kg_workflows=available,
         )
         return plan
 
     # ─── Helpers ──────────────────────────────────────────────────────────────
+
+    def _build_validation_variant(
+        self,
+        create_wf: "ApplicationWorkflow",
+        start_seq: int,
+        budget: int,
+    ) -> list[dict]:
+        """
+        Build a compact required-field validation variant that appends after the
+        KG happy-path steps. Finds the Add-button entry point from the recorded
+        workflow, re-opens the form, submits empty, and asserts a validation error.
+
+        This is one focused variant: empty-submit → required-field error. It costs
+        6 steps and fits within the smallest budget (smoke: 12 total, so budget ≥ 4
+        guard in caller ensures we only append when there is room).
+        """
+        entry = create_wf.entry_point or {}
+        add_trigger = entry.get("selector") or entry.get("label") or "Add|New|Create"
+
+        # Find the submit button from the recorded stages
+        submit_target = "Save|Submit|Create|Add|OK|Confirm"
+        for stage in (create_wf.stages or []):
+            t = (stage.get("target") or stage.get("selector") or "").strip()
+            if t and any(kw in t.lower() for kw in ("save", "submit", "create", "add", "ok")):
+                submit_target = t
+                break
+
+        steps: list[dict] = []
+        seq = start_seq
+
+        base = {
+            "on_fail": "skip",
+            "checkpoint": False,
+            "business_intent": "Required-field validation variant",
+            "phase": "FORM_VALIDATION",
+            "timeout_ms": 8000,
+        }
+
+        if seq < start_seq + budget:
+            steps.append({**base, "seq": seq, "action": "screenshot",
+                          "target": "", "value": "",
+                          "description": "Baseline before required-field validation test",
+                          "timeout_ms": 5000})
+            seq += 1
+
+        if seq < start_seq + budget:
+            steps.append({**base, "seq": seq, "action": "click",
+                          "target": add_trigger, "value": "",
+                          "description": "Open Add form for empty-submit validation test"})
+            seq += 1
+
+        if seq < start_seq + budget:
+            steps.append({**base, "seq": seq, "action": "click",
+                          "target": submit_target, "value": "",
+                          "description": "Click Save/Submit without filling any fields",
+                          "business_intent": "Trigger required-field validation errors"})
+            seq += 1
+
+        if seq < start_seq + budget:
+            steps.append({**base, "seq": seq,
+                          "action": "assert_visible",
+                          "target": "error|required|mandatory|cannot be empty|field is required",
+                          "value": "",
+                          "description": "Verify required-field validation errors are shown",
+                          "checkpoint": True,
+                          "business_intent": "Validation errors must appear on empty submit"})
+            seq += 1
+
+        if seq < start_seq + budget:
+            steps.append({**base, "seq": seq, "action": "screenshot",
+                          "target": "", "value": "",
+                          "description": "Capture validation error state",
+                          "timeout_ms": 5000})
+            seq += 1
+
+        if seq < start_seq + budget:
+            steps.append({**base, "seq": seq, "action": "click",
+                          "target": "Cancel|Close|×|✕|Dismiss",
+                          "value": "",
+                          "description": "Close form to reset state after validation test",
+                          "timeout_ms": 5000})
+
+        return steps
 
     def _validate_and_cap(self, plan_data: dict, max_steps: int) -> dict:
         """Sanitize steps: filter invalid actions, cap count, ensure screenshots."""

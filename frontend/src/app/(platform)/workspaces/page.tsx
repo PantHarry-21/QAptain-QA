@@ -6,7 +6,6 @@ import Link from 'next/link';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { Progress } from '@/components/ui/progress';
 import { Plus } from 'lucide-react';
 import { workspaces as workspacesApi, type Workspace } from '@/lib/api';
 
@@ -153,13 +152,50 @@ export default function WorkspacesPage() {
                     <Badge variant="secondary" className="bg-slate-800 text-slate-300">
                       {w.application_count ?? 0} app{(w.application_count ?? 0) !== 1 ? 's' : ''}
                     </Badge>
+                    {(w.readiness ?? 0) >= 80 && (
+                      <Badge className="bg-emerald-500/20 text-emerald-300 border-emerald-500/30 border">
+                        Ready
+                      </Badge>
+                    )}
+                    {(w.readiness ?? 0) > 0 && (w.readiness ?? 0) < 80 && (
+                      <Badge className="bg-amber-500/20 text-amber-300 border-amber-500/30 border">
+                        In Progress
+                      </Badge>
+                    )}
+                    {(w.readiness ?? 0) === 0 && (
+                      <Badge className="bg-slate-700/60 text-slate-400 border-slate-600/30 border">
+                        Not explored
+                      </Badge>
+                    )}
                   </div>
                   <div>
-                    <div className="mb-1 flex justify-between text-xs text-slate-400">
+                    <div className="mb-1.5 flex justify-between text-xs text-slate-400">
                       <span>Readiness</span>
-                      <span className="text-violet-400 font-medium">{w.readiness ?? 0}%</span>
+                      <span className="font-medium" style={{
+                        color: (w.readiness ?? 0) >= 80 ? '#10b981' : (w.readiness ?? 0) >= 40 ? '#f59e0b' : '#94a3b8'
+                      }}>
+                        {w.readiness ?? 0}%
+                      </span>
                     </div>
-                    <Progress value={w.readiness ?? 0} className="h-2 bg-slate-800 [&>div]:bg-violet-500" />
+                    <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                      <div
+                        className="h-full rounded-full transition-all duration-500"
+                        style={{
+                          width: `${w.readiness ?? 0}%`,
+                          background: (w.readiness ?? 0) >= 80
+                            ? 'linear-gradient(90deg, #10b981, #059669)'
+                            : (w.readiness ?? 0) >= 40
+                              ? 'linear-gradient(90deg, #f59e0b, #d97706)'
+                              : 'linear-gradient(90deg, #6366f1, #4f46e5)',
+                        }}
+                      />
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between text-xs text-slate-500">
+                    <span>Click to open workspace</span>
+                    <svg className="w-4 h-4 text-slate-600 group-hover:text-violet-400 transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                    </svg>
                   </div>
                 </CardContent>
               </Card>
