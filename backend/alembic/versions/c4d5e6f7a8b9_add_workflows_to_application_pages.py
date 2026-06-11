@@ -18,9 +18,9 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column('application_pages',
-        sa.Column('workflows', sa.JSON(), nullable=True))
+    # Column already added by b3c4d5e6f7a8 — use IF NOT EXISTS to be idempotent
+    op.execute("ALTER TABLE application_pages ADD COLUMN IF NOT EXISTS workflows JSON")
 
 
 def downgrade() -> None:
-    op.drop_column('application_pages', 'workflows')
+    pass  # managed by b3c4d5e6f7a8 downgrade
