@@ -130,6 +130,11 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
   // Runs every 4s while session is active; stops once completed/failed/cancelled.
   const lastLogIdRef = useRef<string | undefined>(lastLogId);
   lastLogIdRef.current = lastLogId;
+  // Tracks the deadline (ms since epoch) until which RUNNING→WAITING_HUMAN should be
+  // suppressed. Set for 10s after the user clicks "Explore N modules" so that a concurrent
+  // in-flight poll doesn't flip the status back before the engine commits RUNNING.
+  const suppressWaitingHumanUntilRef = useRef<number>(0);
+
   useEffect(() => {
     const ACTIVE = ['PENDING', 'RUNNING', 'WAITING_HUMAN'];
     if (!session || !ACTIVE.includes(session.status)) return;
@@ -141,11 +146,9 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
           exploreApi.getLogs(sessionId, lastLogIdRef.current),
         ]);
         setSession((s) => {
-          // Prevent the polling loop from reverting RUNNING → WAITING_HUMAN during the
-          // brief window after the user clicks "Explore N modules" and before the engine
-          // commits the new status. The /continue endpoint now sets RUNNING immediately,
-          // but a concurrent poll in-flight could still return the old value.
-          if (s?.status === 'RUNNING' && updatedSession.status === 'WAITING_HUMAN') return s;
+          // Only suppress RUNNING→WAITING_HUMAN within the brief post-"Explore" window,
+          // not indefinitely — otherwise discovery completing never shows the module list.
+          if (s?.status === 'RUNNING' && updatedSession.status === 'WAITING_HUMAN' && Date.now() < suppressWaitingHumanUntilRef.current) return s;
           return s?.status !== updatedSession.status ? updatedSession : s;
         });
         if (newLogs.length > 0) {
@@ -211,6 +214,8 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
       await exploreApi.continueSession(sessionId, {
         selected_module_ids: Array.from(selectedModuleIds),
       });
+      // Suppress RUNNING→WAITING_HUMAN for 10s so an in-flight poll doesn't flip back.
+      suppressWaitingHumanUntilRef.current = Date.now() + 10_000;
       // Stay on the same session page — the status will flip to RUNNING via polling/WS
       setSession((s) => s ? { ...s, status: 'RUNNING' } : s);
     } catch (e) {
