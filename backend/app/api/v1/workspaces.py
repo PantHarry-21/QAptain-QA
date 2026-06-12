@@ -163,6 +163,46 @@ async def delete_workspace(
     await db.commit()
 
 
+@router.delete("/{workspace_id}/applications/{app_id}", status_code=204)
+async def delete_application(
+    workspace_id: str,
+    app_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Permanently delete an application and all its data."""
+    member_result = await db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace_id,
+            WorkspaceMember.user_id == current_user.id,
+        )
+    )
+    if not member_result.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    app_result = await db.execute(
+        select(Application).where(Application.id == app_id, Application.workspace_id == workspace_id)
+    )
+    if not app_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    # 1. Break circular FK: application.knowledge_graph_id → knowledge_graphs
+    await db.execute(sql_update(Application).where(Application.id == app_id).values(knowledge_graph_id=None))
+
+    # 2. Null scenario.module_id so module cascade-delete doesn't conflict
+    await db.execute(sql_update(Scenario).where(Scenario.application_id == app_id).values(module_id=None))
+
+    # 3. Delete execution_runs (steps/logs/reports cascade from runs)
+    scenario_ids_sq = select(Scenario.id).where(Scenario.application_id == app_id).scalar_subquery()
+    await db.execute(sql_delete(ExecutionRun).where(ExecutionRun.scenario_id.in_(scenario_ids_sq)))
+
+    await db.commit()
+
+    # 4. Delete the application — CASCADE handles scenarios, modules, KGs, sessions, credentials, etc.
+    await db.execute(sql_delete(Application).where(Application.id == app_id))
+    await db.commit()
+
+
 @router.get("/{workspace_id}/applications", response_model=list[ApplicationResponse])
 async def list_applications(
     workspace_id: str,

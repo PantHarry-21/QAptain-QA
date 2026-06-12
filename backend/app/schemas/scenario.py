@@ -107,10 +107,10 @@ class ReportResponse(BaseModel):
     risk_level: str
     quality_score: float | None
     summary: dict[str, Any]
-    insights: list[dict[str, Any]]
+    insights: list[Any]
     rca_analysis: dict[str, Any]
-    recommendations: list[dict[str, Any]]
-    timeline: list[dict[str, Any]]
+    recommendations: list[Any]  # strings or dicts depending on executor
+    timeline: list[Any]
     evidence: dict[str, Any]
     created_at: datetime
 

@@ -190,12 +190,12 @@ class AIClient:
         if json_mode and self._provider != "azure_openai":
             kwargs["response_format"] = {"type": "json_object"}
 
-        # Retry on 429 Rate Limit. Azure quota windows are typically 60s, so
-        # 5 retries × 30s wait = 150s covers 2+ quota resets before giving up.
-        # The global rate limiter pre-throttles all Azure calls to prevent bursting.
+        # Retry on 429.  Azure quota windows reset every 60 s, so we retry up to
+        # 8 times with exponential back-off.  The global limiter adds a minimum
+        # spacing between calls (0.5 s) to prevent burst flooding in the first place.
         limiter = get_azure_limiter() if self._provider == "azure_openai" else None
         last_exc: Exception | None = None
-        for attempt in range(5):
+        for attempt in range(8):
             if limiter:
                 await limiter.wait()
             try:
@@ -203,21 +203,22 @@ class AIClient:
                 break
             except openai.RateLimitError as exc:
                 last_exc = exc
-                # Respect Azure's Retry-After header when present — it tells us
-                # exactly how long the quota window needs to reset.
+                # Respect Azure's Retry-After header when present.
                 retry_after = 0
                 try:
                     resp_headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
                     retry_after = int(resp_headers.get("retry-after") or resp_headers.get("Retry-After") or 0)
                 except Exception:
                     pass
-                wait = retry_after if retry_after > 0 else min(15 * (2 ** attempt), 90)
+                # Exponential back-off: 10s, 20s, 40s, 60s, 60s, 60s, 60s
+                wait = retry_after if retry_after > 0 else min(10 * (2 ** attempt), 60)
                 if limiter:
                     limiter.record_retry_after(wait)
-                log.warning("Azure 429 rate limit — backing off",
+                log.warning("Azure 429 — backing off before retry",
                             provider=self._provider, model=model,
-                            attempt=attempt + 1, wait_seconds=wait,
-                            retry_after_header=retry_after or "not provided")
+                            attempt=attempt + 1, max_attempts=8,
+                            wait_seconds=wait,
+                            retry_after_header=retry_after or "not set")
                 await asyncio.sleep(wait)
             except Exception as exc:
                 log.error("OpenAI API call failed", provider=self._provider, model=model,

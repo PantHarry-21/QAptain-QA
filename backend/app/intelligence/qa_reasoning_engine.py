@@ -1225,6 +1225,22 @@ INSTRUCTIONS:
 12. CRITICAL: For the navigate step, use the exact Module URL from context. NEVER navigate to "/" — use the module's specific URL.
 13. If DISCOVERED FORMS are provided, reference the exact field names and the submit button label in your steps.
 14. If DISCOVERED UI INTERACTIONS are provided: reference the action labels exactly (e.g. "Add Product button", "Approve icon", "Pending tab", "Name field") — the executor resolves these to real elements automatically. Do NOT put CSS selectors in target fields.
+
+TEST DATA UNIQUENESS — MANDATORY:
+  For any fill step that creates a named record (Name, Title, Code, Email, etc.), use "{{{{RUN_ID}}}}" as a suffix in the value.
+  Example: if creating a product, use value: "Test Product {{{{RUN_ID}}}}" — NOT "Test Product ABC-001".
+  The executor automatically replaces {{{{RUN_ID}}}} with a unique 8-char tag per run, preventing data collisions on re-runs.
+  Only append {{{{RUN_ID}}}} to PRIMARY identifier fields (Name, Title, Code) — NOT to dates, numbers, or dropdown selections.
+
+BUSINESS OUTCOME VERIFICATION — MANDATORY:
+  "assert_visible" only checks that an element EXISTS on the page — it does NOT verify the content.
+  After ANY create/update/delete operation, you MUST include:
+  1. An "assert_text" step (action: "assert_text") that verifies the ACTUAL RECORD NAME appears in the list/table.
+     Use the SAME value you filled (including the {{{{RUN_ID}}}} suffix) as the target text.
+     This is the ONLY reliable proof that the operation actually persisted in the database.
+  2. For delete: an "assert_not_text" step to confirm the record name is GONE from the list.
+  Never conclude a CRUD test with only a success toast assertion — always verify the data state.
+
 {capability_ctx}"""
 
     # ─── Post-processing ──────────────────────────────────────────────────────

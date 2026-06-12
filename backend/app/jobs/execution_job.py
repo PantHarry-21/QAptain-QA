@@ -82,9 +82,16 @@ def _run_batch_in_thread(run_ids: list[str]) -> None:
 
 
 async def _run_batch_async(run_ids: list[str]) -> None:
-    """Async batch execution — one browser, one login, N scenarios."""
+    """
+    Async batch execution — runs each scenario sequentially using PlaywrightMCPExecutor.
+
+    Uses the same executor as single runs to guarantee consistent behaviour between
+    batch and individual executions. Each scenario gets its own browser instance and
+    login sequence, ensuring full test isolation (shared browser state is an antipattern
+    for test suites — one scenario's side effects shouldn't affect the next).
+    """
     from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-    from app.execution.batch_executor import BatchExecutionOrchestrator
+    from app.execution.playwright_mcp_executor import PlaywrightMCPExecutor
     from config import settings
 
     engine = create_async_engine(
@@ -95,9 +102,14 @@ async def _run_batch_async(run_ids: list[str]) -> None:
     )
     try:
         SessionFactory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-        async with SessionFactory() as db:
-            orchestrator = BatchExecutionOrchestrator(db, main_loop=_main_loop)
-            await orchestrator.execute_batch(run_ids)
+        for run_id in run_ids:
+            try:
+                async with SessionFactory() as db:
+                    executor = PlaywrightMCPExecutor(db, main_loop=_main_loop)
+                    await executor.execute_run(run_id)
+                    log.info("Batch run completed", run_id=run_id)
+            except Exception as e:
+                log.exception("Batch run failed", run_id=run_id, error=str(e))
     except Exception as e:
         log.exception("Background batch execution failed", run_ids=run_ids[:5], error=str(e))
     finally:

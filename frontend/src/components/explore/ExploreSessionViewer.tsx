@@ -200,6 +200,17 @@ export function ExploreSessionViewer({ sessionId, applicationId }: ExploreSessio
       const newPath = pathname.replace(/\/explore\/[^/]+$/, `/explore/${newSession.id}`);
       router.push(newPath);
     } catch (e) {
+      // 409 means a session is already running — redirect to it instead of showing an error
+      if (e instanceof Error && e.message.includes('already running')) {
+        try {
+          const active = await exploreApi.getActiveSession(applicationId);
+          if (active) {
+            const activePath = pathname.replace(/\/explore\/[^/]+$/, `/explore/${active.id}`);
+            router.push(activePath);
+            return;
+          }
+        } catch { /* fall through */ }
+      }
       toast.error(e instanceof ApiError ? e.detail : 'Failed to start discovery');
       setRestarting(false);
     }

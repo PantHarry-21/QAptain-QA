@@ -1,80 +1,100 @@
 """
 Process-wide rate limiter for Azure OpenAI.
 
-Design: REACTIVE, not proactive.
+Design: REACTIVE + minimum spacing, thread-safe across event loops.
 
-We do NOT pre-wait 45s before every call — that makes step-by-step execution
-take 15+ minutes for a 20-step plan. Instead:
+Key insight: each execution thread runs its own asyncio event loop, so
+asyncio.Lock cannot provide mutual exclusion across threads — it is
+event-loop-specific.  We use threading.Lock instead so the singleton
+works correctly whether called from the main loop, a planning thread,
+or an execution thread.
 
-  • Normal path: no wait at all (calls go through immediately)
-  • After a 429: back off for exactly the retry-after the API returned (or
-    an exponential fallback), then resume at a minimum _BACKOFF_INTERVAL
-    between subsequent calls until the quota window resets
-
-This means:
-  - First 429 in a window: pause for retry-after seconds, then continue slowly
-  - No 429s: full speed, no artificial throttle
-  - Concurrent callers all share the same lock so they queue up rather than
-    simultaneously hammering the API after a backoff expires
+Behaviour:
+  • Normal path: enforces a small minimum gap (_MIN_INTERVAL_SECONDS)
+    between consecutive calls to avoid burst flooding (replaces the old
+    45 s pre-wait while still being kind to Azure quotas).
+  • After a 429: extends the deadline to the Retry-After value returned
+    by Azure, then resumes at the minimum interval cadence.
+  • Concurrent callers queue naturally: each caller grabs a slot
+    atomically inside the threading.Lock, then waits outside it.
 """
 from __future__ import annotations
 import asyncio
+import threading
 import time
 import structlog
 
 log = structlog.get_logger()
 
-# After a 429, minimum gap between calls while we're still in a backoff window.
-# This prevents immediately burning the quota again as soon as the retry-after expires.
+# Minimum gap between consecutive Azure calls.
+# 0.5 s  →  max 120 RPM, enough headroom for simultaneous planning +
+# execution without triggering quotas under normal load.
+_MIN_INTERVAL_SECONDS: float = 0.5
+
+# After a 429, how long to space calls once the retry-after window expires.
 _BACKOFF_INTERVAL_SECONDS: float = 5.0
 
 
 class AzureRateLimiter:
     """
-    Reactive 429-aware rate limiter.
+    Thread-safe, reactive Azure OpenAI rate limiter.
 
-    wait()               — call before every Azure API request; only blocks after a 429
-    record_retry_after() — call after receiving a 429 to set the global backoff deadline
+    wait()               — call before every Azure API request
+    record_retry_after() — call after receiving a 429
+    current_wait()       — how many seconds until next slot (0 if free)
+    reset()              — clear all backoff state
     """
 
-    def __init__(self, backoff_interval: float = _BACKOFF_INTERVAL_SECONDS):
-        self._lock = asyncio.Lock()
+    def __init__(
+        self,
+        min_interval: float = _MIN_INTERVAL_SECONDS,
+        backoff_interval: float = _BACKOFF_INTERVAL_SECONDS,
+    ):
+        # threading.Lock works across all event loops (unlike asyncio.Lock).
+        self._lock = threading.Lock()
+        self._min_interval = min_interval
         self._backoff_interval = backoff_interval
-        # _next_allowed is 0 by default — no pre-wait until a 429 is seen
+        # Monotonic deadline: next call is allowed at or after this time.
+        # Starts at 0 so the first call goes through immediately.
         self._next_allowed: float = 0.0
 
     async def wait(self) -> None:
-        """Block until the current backoff window expires, then reserve the next slot."""
-        async with self._lock:
-            now = time.monotonic()
-            delay = self._next_allowed - now
-            if delay > 0:
-                log.info("Azure rate limiter: waiting after 429",
-                         wait_seconds=round(delay, 1))
-                await asyncio.sleep(delay)
-                # After the backoff expires, space subsequent calls by backoff_interval
-                # so we don't immediately flood the API again
-                self._next_allowed = time.monotonic() + self._backoff_interval
+        """Block until a slot is available, then atomically reserve the next one."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                delay = self._next_allowed - now
+                if delay <= 0:
+                    # Slot is free — reserve next slot and return.
+                    self._next_allowed = now + self._min_interval
+                    return
+            # Slot is taken — sleep outside the lock, then re-check.
+            # Sleep slightly longer than needed to avoid a hot spin.
+            await asyncio.sleep(max(0.05, delay))
 
     def current_wait(self) -> float:
-        """Return how many seconds until the next call is allowed (0 if ready now)."""
+        """Return seconds until the next slot is free (0 if available now)."""
         return max(0.0, self._next_allowed - time.monotonic())
 
     def record_retry_after(self, retry_after_seconds: float) -> None:
         """
-        Extend the global backoff after receiving a 429.
-        Only moves the deadline forward, never backward.
+        Push the deadline out by retry_after_seconds after a 429.
+        Only moves forward, never back.
         """
-        new_allowed = time.monotonic() + retry_after_seconds
-        if new_allowed > self._next_allowed:
-            self._next_allowed = new_allowed
-            log.info("Azure rate limiter: 429 received — backoff set",
-                     retry_after_seconds=retry_after_seconds,
-                     next_allowed_in_seconds=round(retry_after_seconds, 1))
+        with self._lock:
+            new_allowed = time.monotonic() + retry_after_seconds
+            if new_allowed > self._next_allowed:
+                self._next_allowed = new_allowed
+                log.info(
+                    "Azure rate limiter: 429 — backoff applied",
+                    retry_after_seconds=round(retry_after_seconds, 1),
+                    next_allowed_in_seconds=round(retry_after_seconds, 1),
+                )
 
     def reset(self) -> None:
-        """Clear all backoff state (e.g. at the start of a new run)."""
-        self._next_allowed = 0.0
+        """Clear all rate-limit state (e.g. at the start of a fresh run)."""
+        with self._lock:
+            self._next_allowed = 0.0
 
 
 _limiter: AzureRateLimiter | None = None

@@ -1,14 +1,16 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { useParams, useSearchParams } from 'next/navigation';
+import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import { BatchExecutionDashboard, type BatchItem } from '@/components/execution/BatchExecutionDashboard';
 import { executions as executionsApi } from '@/lib/api';
 
 export default function BatchExecutionPage() {
   const params = useParams();
+  const router = useRouter();
   const searchParams = useSearchParams();
   const workspaceId = params.workspaceId as string;
+  const [navigatingBack, setNavigatingBack] = useState(false);
 
   const [items, setItems] = useState<BatchItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -42,12 +44,16 @@ export default function BatchExecutionPage() {
     <div className="min-h-screen bg-zinc-950 p-6">
       <div className="max-w-5xl mx-auto">
         <div className="flex items-center gap-3 mb-6">
-          <a
-            href={`/workspaces/${workspaceId}`}
-            className="text-zinc-500 hover:text-zinc-300 text-sm transition-colors"
+          <button
+            onClick={() => { setNavigatingBack(true); router.push(`/workspaces/${workspaceId}`); }}
+            disabled={navigatingBack}
+            className="flex items-center gap-1.5 text-zinc-500 hover:text-zinc-300 text-sm transition-colors disabled:opacity-60"
           >
-            ← Workspace
-          </a>
+            {navigatingBack
+              ? <div className="w-3 h-3 border border-zinc-400 border-t-transparent rounded-full animate-spin" />
+              : '←'}
+            Workspace
+          </button>
           <span className="text-zinc-700">/</span>
           <span className="text-zinc-400 text-sm">Batch Execution</span>
         </div>

@@ -100,6 +100,9 @@ export const workspaces = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+
+  deleteApplication: (workspaceId: string, appId: string) =>
+    request<void>(`/workspaces/${workspaceId}/applications/${appId}`, { method: 'DELETE' }),
 };
 
 // ─── Applications ─────────────────────────────────────────────────────────────

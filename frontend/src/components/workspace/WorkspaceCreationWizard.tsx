@@ -2,60 +2,27 @@
 
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { workspaces as workspaceApi, type ExploreMode } from '@/lib/api';
+import { workspaces as workspaceApi } from '@/lib/api';
 
-type WizardStep = 'workspace' | 'application' | 'credentials' | 'explore' | 'done';
+type WizardStep = 'workspace' | 'application' | 'credentials' | 'done';
 
 interface FormData {
-  // Workspace
   workspaceName: string;
-  // Application
   appName: string;
   appUrl: string;
   appDescription: string;
-  // Credentials
   username: string;
   password: string;
   environmentName: string;
-  // Explore
-  exploreMode: ExploreMode;
 }
 
-const STEP_ORDER: WizardStep[] = ['workspace', 'application', 'credentials', 'explore'];
-
-const EXPLORE_OPTIONS: Array<{
-  mode: ExploreMode;
-  title: string;
-  description: string;
-  duration: string;
-  badge: string;
-  icon: string;
-}> = [
-  {
-    mode: 'SMART',
-    title: 'Smart Explore',
-    description: 'Complete application mapping — clicks every module, sub-module, and link. Builds a full knowledge graph including forms, workflows, and test scenarios. Recommended for first-time onboarding.',
-    duration: '15–45 minutes',
-    badge: 'Recommended',
-    icon: '🔍',
-  },
-  {
-    mode: 'SKIP',
-    title: 'Skip Explore',
-    description: 'No pre-exploration. AI reasons semantically at runtime. Fastest onboarding — ideal if you already know the workflows.',
-    duration: 'Instant',
-    badge: 'Advanced',
-    icon: '🎯',
-  },
-];
+const STEP_ORDER: WizardStep[] = ['workspace', 'application', 'credentials'];
 
 export function WorkspaceCreationWizard() {
   const router = useRouter();
   const [step, setStep] = useState<WizardStep>('workspace');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [createdWorkspaceId, setCreatedWorkspaceId] = useState<string | null>(null);
-  const [createdAppId, setCreatedAppId] = useState<string | null>(null);
 
   const [form, setForm] = useState<FormData>({
     workspaceName: '',
@@ -65,13 +32,12 @@ export function WorkspaceCreationWizard() {
     username: '',
     password: '',
     environmentName: 'Default',
-    exploreMode: 'SMART',
   });
 
   const update = (key: keyof FormData, value: string) =>
     setForm((f) => ({ ...f, [key]: value }));
 
-  const currentStepIndex = STEP_ORDER.indexOf(step);
+  const currentStepIndex = STEP_ORDER.indexOf(step as WizardStep);
 
   const goNext = async () => {
     setError(null);
@@ -81,16 +47,7 @@ export function WorkspaceCreationWizard() {
         setError('Workspace name is required');
         return;
       }
-      setLoading(true);
-      try {
-        const ws = await workspaceApi.create({ name: form.workspaceName });
-        setCreatedWorkspaceId(ws.id);
-        setStep('application');
-      } catch (e: unknown) {
-        setError(e instanceof Error ? e.message : 'Failed to create workspace');
-      } finally {
-        setLoading(false);
-      }
+      setStep('application');
       return;
     }
 
@@ -116,32 +73,26 @@ export function WorkspaceCreationWizard() {
         setError('Username and password are required');
         return;
       }
-      setStep('explore');
-      return;
-    }
-
-    if (step === 'explore') {
       setLoading(true);
       try {
-        const app = await workspaceApi.createApplication(createdWorkspaceId!, {
-          workspace_id: createdWorkspaceId!,
+        // Create workspace + application in one go on the final step
+        const ws = await workspaceApi.create({ name: form.workspaceName });
+        const app = await workspaceApi.createApplication(ws.id, {
+          workspace_id: ws.id,
           name: form.appName,
           base_url: form.appUrl,
           description: form.appDescription,
           username: form.username,
           password: form.password,
           environment_name: form.environmentName,
-          explore_mode: form.exploreMode,
+          explore_mode: 'SMART',
         });
-        setCreatedAppId(app.id);
         setStep('done');
-
-        // Redirect to workspace with explore if not skipping
         setTimeout(() => {
-          router.push(`/workspaces/${createdWorkspaceId}?app=${app.id}&explore=${form.exploreMode !== 'SKIP'}`);
-        }, 1500);
+          router.push(`/workspaces/${ws.id}?app=${app.id}`);
+        }, 1200);
       } catch (e: unknown) {
-        setError(e instanceof Error ? e.message : 'Failed to create application');
+        setError(e instanceof Error ? e.message : 'Failed to create workspace');
       } finally {
         setLoading(false);
       }
@@ -209,9 +160,6 @@ export function WorkspaceCreationWizard() {
         {step === 'credentials' && (
           <StepCredentials form={form} update={update} />
         )}
-        {step === 'explore' && (
-          <StepExplore form={form} update={update} />
-        )}
 
         {/* Navigation */}
         <div className="flex justify-between mt-8">
@@ -236,7 +184,7 @@ export function WorkspaceCreationWizard() {
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
             )}
-            {step === 'explore' ? 'Create Workspace' : 'Continue'}
+            {step === 'credentials' ? 'Create Workspace' : 'Continue'}
           </button>
         </div>
       </div>
@@ -391,46 +339,3 @@ function StepCredentials({ form, update }: { form: FormData; update: (k: keyof F
   );
 }
 
-function StepExplore({ form, update }: { form: FormData; update: (k: keyof FormData, v: string) => void }) {
-  return (
-    <div>
-      <h2 className="text-xl font-semibold text-white mb-1">Exploration Mode</h2>
-      <p className="text-zinc-500 text-sm mb-6">
-        Choose how QAptain learns your application before running tests.
-        You can always run exploration later.
-      </p>
-
-      <div className="space-y-3">
-        {EXPLORE_OPTIONS.map((opt) => (
-          <button
-            key={opt.mode}
-            type="button"
-            onClick={() => update('exploreMode', opt.mode)}
-            className={`
-              w-full text-left p-4 rounded-lg border transition-all
-              ${form.exploreMode === opt.mode
-                ? 'border-blue-500 bg-blue-500/10 ring-1 ring-blue-500'
-                : 'border-zinc-800 bg-zinc-800/50 hover:border-zinc-700'}
-            `}
-          >
-            <div className="flex items-start justify-between mb-1">
-              <div className="flex items-center gap-2">
-                <span>{opt.icon}</span>
-                <span className="font-medium text-white text-sm">{opt.title}</span>
-                <span className={`text-xs px-2 py-0.5 rounded-full ${
-                  opt.badge === 'Recommended' ? 'bg-blue-500/20 text-blue-300' :
-                  opt.badge === 'Fast' ? 'bg-green-500/20 text-green-300' :
-                  'bg-zinc-700 text-zinc-400'
-                }`}>
-                  {opt.badge}
-                </span>
-              </div>
-              <span className="text-xs text-zinc-500">{opt.duration}</span>
-            </div>
-            <p className="text-xs text-zinc-400 ml-6">{opt.description}</p>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}

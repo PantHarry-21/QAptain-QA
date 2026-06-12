@@ -48,9 +48,9 @@ from config import settings
 log = structlog.get_logger()
 
 MAX_ITERATIONS = 60          # Max plan steps per run
-MAX_AI_CALLS_PER_STEP = 4   # Max AI tool calls per individual plan step
+MAX_AI_CALLS_PER_STEP = 6   # Max AI tool calls per individual plan step
 STEP_TIMEOUT_MS = 10_000     # Per-action timeout for Playwright
-NAV_WAIT_MS = 2_000          # Extra wait after navigation for SPAs
+NAV_WAIT_MS = 2_000          # Fallback wait after navigation for SPAs (used if stability check fails)
 
 # ─── Tool definitions (Anthropic format; converted to OpenAI when needed) ─────
 
@@ -178,6 +178,26 @@ PLAYWRIGHT_TOOLS: list[dict] = [
                 "selector": {"type": "string", "description": "CSS selector that should not be visible (optional)"},
                 "timeout":  {"type": "integer", "description": "Milliseconds to wait for invisibility (default 5000)"},
             },
+        },
+    },
+    {
+        "name": "browser_assert_text",
+        "description": (
+            "Assert that an element contains specific text content. "
+            "Use this to verify ACTUAL DATA VALUES after create/update operations "
+            "(e.g. verify the record name in the list, verify a field value). "
+            "Stronger than assert_visible — checks content, not just presence."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text":     {"type": "string", "description": "Text that should be present in the element"},
+                "selector": {"type": "string", "description": "CSS selector of element to check (optional)"},
+                "ref":      {"type": "string", "description": "Element ref from snapshot (optional)"},
+                "exact":    {"type": "boolean", "description": "Match exactly (default false = substring match)"},
+                "timeout":  {"type": "integer", "description": "Milliseconds to wait (default 5000)"},
+            },
+            "required": ["text"],
         },
     },
     {
@@ -387,12 +407,14 @@ class PlaywrightMCPExecutor:
         step_seq = 0
         passed = False
         ai_client = self._build_ai_client()
-        system_prompt = self._build_system_prompt(scenario, plan, env, cred_data, kg_context or {})
+        # Unique 8-char prefix for test data in this run — prevents collisions on re-runs
+        run_tag = run.id[:8].upper()
+        system_prompt = self._build_system_prompt(scenario, plan, env, cred_data, kg_context or {}, run_tag=run_tag)
 
         # ── Navigate to app ──────────────────────────────────────────────────
         try:
-            await page.goto(env.base_url, wait_until="commit", timeout=60_000)
-            await page.wait_for_timeout(1500)
+            await page.goto(env.base_url, wait_until="domcontentloaded", timeout=60_000)
+            await self._wait_for_stable(page)
         except Exception as exc:
             await self._fail_run(run, f"Cannot reach {env.base_url}: {exc}")
             return False, steps_taken
@@ -449,6 +471,11 @@ class PlaywrightMCPExecutor:
 
         # ── Execute plan steps one by one ────────────────────────────────────
         for idx, plan_step in enumerate(plan_steps[:MAX_ITERATIONS]):
+            # Check if the run was cancelled externally between steps
+            await self.db.refresh(run)
+            if run.status == ExecutionStatus.CANCELLED:
+                raise asyncio.CancelledError("Run cancelled by user")
+
             action = (plan_step.get("action") or "").strip().lower()
             on_fail = plan_step.get("on_fail", "skip")
             is_critical = on_fail == "fail"
@@ -480,8 +507,8 @@ class PlaywrightMCPExecutor:
                     step_seq += 1
                     t_start = time.monotonic()
                     try:
-                        await page.goto(nav_url, wait_until="commit", timeout=30_000)
-                        await page.wait_for_timeout(NAV_WAIT_MS)
+                        await page.goto(nav_url, wait_until="domcontentloaded", timeout=30_000)
+                        await self._wait_for_stable(page)
                         result_text = f"Navigated to {nav_url}"
                         nav_status = StepStatus.PASSED
                     except Exception as exc:
@@ -530,21 +557,44 @@ class PlaywrightMCPExecutor:
                                f"Step {idx+1}/{total} [{phase or action.upper()}]: {plan_step.get('description', action)[:80]}")
 
             # Call AI with a fresh, focused context for this single step
+            ai_error: str | None = None
+            tool_calls: list = []
             try:
                 tool_calls, _text = await self._call_ai(ai_client, system_prompt, [
                     {"role": "user", "content": step_msg}
                 ])
             except Exception as exc:
+                ai_error = str(exc)[:200]
                 await self._log_db(run, "ERROR", "ai",
-                                   f"AI call failed for step {idx+1}: {str(exc)[:200]}")
-                if is_critical:
+                                   f"AI call failed for step {idx+1}: {ai_error}")
+
+            if ai_error or not tool_calls:
+                # Record this plan step as SKIPPED so it is visible in the UI
+                step_seq += 1
+                reason = f"AI error: {ai_error}" if ai_error else "AI returned no tool calls"
+                skip_record = ExecutionStep(
+                    id=str(_uuid_mod.uuid4()),
+                    run_id=run.id,
+                    sequence=step_seq,
+                    action_type="skipped",
+                    description=plan_step.get("description") or f"[skipped] {action}",
+                    plan_step={"action": action, "target": plan_step.get("target", ""),
+                               "result": reason, "plan_step_idx": idx + 1},
+                    status=StepStatus.SKIPPED,
+                    started_at=datetime.utcnow(),
+                    completed_at=datetime.utcnow(),
+                    duration_ms=0,
+                )
+                self.db.add(skip_record)
+                steps_taken.append({
+                    "seq": step_seq, "tool": "skipped", "args": {},
+                    "result": reason, "passed": False,
+                    "duration_ms": 0, "screenshot_path": None,
+                })
+                await self.db.commit()
+                if ai_error and is_critical:
                     all_critical_passed = False
                     break
-                continue
-
-            if not tool_calls:
-                await self._log_db(run, "WARNING", "execution",
-                                   f"AI returned no tool call for step {idx+1} ({action})")
                 continue
 
             # Execute tool calls returned for this step
@@ -552,14 +602,14 @@ class PlaywrightMCPExecutor:
             for tc in tool_calls[:MAX_AI_CALLS_PER_STEP]:
                 tool_name = tc["name"]
                 tool_args = tc["arguments"]
+                # Substitute {{RUN_ID}} placeholder in fill values for test data uniqueness
+                if tool_name == "browser_type" and isinstance(tool_args.get("text"), str):
+                    tool_args = dict(tool_args)
+                    tool_args["text"] = tool_args["text"].replace("{{RUN_ID}}", run_tag)
                 step_seq += 1
 
                 t_start = time.monotonic()
                 screenshot_path: str | None = None
-                try:
-                    screenshot_path = await self._save_screenshot(page, run.id, step_seq)
-                except Exception:
-                    pass
 
                 if tool_name == "test_pass":
                     result_text = f"PASS: {tool_args.get('summary', '')}"
@@ -577,10 +627,20 @@ class PlaywrightMCPExecutor:
                     status = (
                         StepStatus.PASSED
                         if not result_text.startswith("Error")
+                        and not result_text.startswith("Assertion failed")
                         else StepStatus.FAILED
                     )
                     if status == StepStatus.FAILED:
                         step_overall_passed = False
+
+                # Always capture screenshot on failure — critical for debugging
+                try:
+                    if status == StepStatus.FAILED:
+                        screenshot_path = await self._save_screenshot(page, run.id, step_seq)
+                    elif tool_name in ("browser_screenshot", "test_pass", "test_fail"):
+                        screenshot_path = await self._save_screenshot(page, run.id, step_seq)
+                except Exception:
+                    pass
 
                 duration_ms = int((time.monotonic() - t_start) * 1000)
                 step_desc = (
@@ -677,6 +737,22 @@ class PlaywrightMCPExecutor:
         if checkpoint:
             lines.append("CHECKPOINT: This step verifies a critical business outcome.")
 
+        # Map plan action to the correct browser tool
+        action_upper = action.upper()
+        tool_hint = ""
+        if action_upper in ("ASSERT_TEXT",):
+            tool_hint = "→ Use browser_assert_text to verify the actual text content exists on the page."
+        elif action_upper in ("ASSERT_VISIBLE",):
+            tool_hint = "→ Use browser_assert_visible to confirm the element is present/visible."
+        elif action_upper in ("ASSERT_NOT_TEXT", "ASSERT_NOT_VISIBLE"):
+            tool_hint = "→ Use browser_assert_not_visible to confirm the text/element is gone."
+        elif action_upper in ("FILL", "TYPE"):
+            tool_hint = "→ Use browser_type with the ref of the matching input field."
+        elif action_upper == "CLICK":
+            tool_hint = "→ Use browser_click with the ref or visible text."
+        elif action_upper == "SELECT":
+            tool_hint = "→ Use browser_select_option."
+
         lines += [
             "",
             f"Current URL: {current_url}",
@@ -686,10 +762,10 @@ class PlaywrightMCPExecutor:
             "Instructions:",
             "- Look at the ARIA tree above to find the element that matches the Target.",
             "- Prefer using 'ref' from the ARIA tree for precise targeting.",
-            "- For ASSERT_VISIBLE / ASSERT_NOT_TEXT: use browser_assert_visible / browser_assert_not_visible.",
-            "- For FILL: use browser_type with the ref of the matching input field.",
-            "- For SELECT: use browser_select_option.",
-            "- For CLICK: use browser_click with the ref or visible text.",
+            f"- {tool_hint}" if tool_hint else "- Choose the most appropriate browser tool for this action.",
+            "- ASSERT_TEXT steps: use browser_assert_text (verifies data VALUE, not just presence).",
+            "- ASSERT_VISIBLE steps: use browser_assert_visible.",
+            "- ASSERT_NOT_TEXT steps: use browser_assert_not_visible.",
             "- Make ONE tool call to execute this step.",
         ]
         return "\n".join(lines)
@@ -712,14 +788,28 @@ class PlaywrightMCPExecutor:
         except Exception as exc:
             return f"Error: Could not reach {env.base_url} — {str(exc)[:100]}"
 
-        # Wait up to 60s for login form to appear
+        # Quick 3-second check: are we already logged in?
+        # If no password field found quickly AND URL isn't a login URL → already authenticated.
+        _login_url_keywords = ("login", "signin", "sign-in", "auth", "sso", "saml")
         try:
             await page.wait_for_selector(
-                'input[type="password"], input[type="text"], input[name*="user" i]',
-                timeout=60_000,
+                'input[type="password"], input[name*="password" i]',
+                timeout=3_000,
             )
+            # Password field appeared quickly — we're on the login page, proceed normally
         except Exception:
-            pass
+            # No password field in 3 seconds
+            current = page.url.lower()
+            if not any(kw in current for kw in _login_url_keywords):
+                return f"Login skipped: already authenticated — current URL: {page.url}"
+            # URL looks like a login page but field hasn't appeared yet — wait longer
+            try:
+                await page.wait_for_selector(
+                    'input[type="password"], input[type="text"], input[name*="user" i]',
+                    timeout=30_000,
+                )
+            except Exception:
+                pass
 
         # Detect login form
         has_form = False
@@ -809,8 +899,7 @@ class PlaywrightMCPExecutor:
                 return "Error: Could not find or click login submit button"
 
         try:
-            await page.wait_for_load_state("domcontentloaded", timeout=15_000)
-            await page.wait_for_timeout(NAV_WAIT_MS)
+            await self._wait_for_stable(page, timeout_ms=15_000)
         except Exception:
             pass
 
@@ -993,6 +1082,7 @@ class PlaywrightMCPExecutor:
         env: Environment,
         cred_data: dict,
         kg_context: dict | None = None,
+        run_tag: str = "",
     ) -> str:
         """
         Concise system prompt — role + credentials + known UI context + rules.
@@ -1026,11 +1116,19 @@ class PlaywrightMCPExecutor:
         if module_name or module_url:
             module_text = f"Module: {module_name}  URL: {module_url}"
 
+        run_tag_text = ""
+        if run_tag:
+            run_tag_text = (
+                f"\nTest Data Run Tag: {run_tag}  "
+                f"← Append this to any unique name you create (e.g. 'Product-{run_tag}'). "
+                f"Use {{{{RUN_ID}}}} in fill values and it will be substituted with this tag automatically."
+            )
+
         return f"""You are an AI QA engineer executing test steps in a live browser.
 
 Scenario: {scenario.title}
 App URL: {env.base_url}   Username: {username}   Password: {password}
-{module_text}
+{module_text}{run_tag_text}
 
 {fields_text}
 
@@ -1044,14 +1142,16 @@ You are given a FRESH snapshot with every step — you do NOT need to call brows
 ## Rules
 1. Use element refs from the ARIA tree in the user message for precise targeting.
 2. For CLICK: use browser_click with ref or text matching the Target.
-3. For FILL/TYPE: use browser_type with the ref of the matching input.
+3. For FILL/TYPE: use browser_type. Append the Run Tag to any test record name for uniqueness.
 4. For SELECT: use browser_select_option.
-5. For ASSERT_VISIBLE / assert_text: use browser_assert_visible.
-6. For ASSERT_NOT_TEXT / assert_not_visible: use browser_assert_not_visible.
-7. For mat-select/custom dropdowns: browser_click to open, browser_wait 500ms, browser_click option.
-8. After form submit: browser_wait for success indicator before the next assertion step.
-9. Make ONE tool call per step — the next step will handle verification.
-10. Only call test_fail if the current step is completely impossible to execute.
+5. For ASSERT_VISIBLE: use browser_assert_visible (checks element is present on page).
+6. For ASSERT DATA VALUES (verify a specific value exists): use browser_assert_text — this checks actual content, not just visibility.
+7. For ASSERT_NOT_TEXT / assert_not_visible: use browser_assert_not_visible.
+8. For mat-select/custom dropdowns: browser_click to open, browser_wait 500ms, browser_click option.
+9. After form submit: browser_wait for success indicator before the next assertion step.
+10. Make ONE tool call per step — the next step will handle verification.
+11. Only call test_fail if the current step is completely impossible to execute.
+12. VERIFY BUSINESS OUTCOMES: After create/update/delete, navigate to the list view and use browser_assert_text to confirm the record name appears/disappears — a success toast alone is not sufficient proof.
 """
 
     # ─── Tool implementations ─────────────────────────────────────────────────
@@ -1079,6 +1179,8 @@ You are given a FRESH snapshot with every step — you do NOT need to call brows
                 return await self._do_assert_visible(page, args)
             elif name == "browser_assert_not_visible":
                 return await self._do_assert_not_visible(page, args)
+            elif name == "browser_assert_text":
+                return await self._do_assert_text(page, args)
             elif name == "browser_scroll":
                 return await self._do_scroll(page, args)
             elif name == "browser_screenshot":
@@ -1095,7 +1197,15 @@ You are given a FRESH snapshot with every step — you do NOT need to call brows
             return f"Error: {exc!s}"
 
     async def _do_snapshot(self, page: Page) -> str:
-        """Return the ARIA accessibility tree as structured text with element refs."""
+        """
+        Return an interactive-elements-only ARIA tree with element refs.
+
+        Filters to keep only actionable nodes (buttons, inputs, links, selects, tabs, etc.)
+        and context-providing nodes (headings, alerts, table cells, dialog titles).
+        This produces a much denser, more useful snapshot than the raw tree —
+        especially for complex enterprise UIs where the full tree can be 15,000+ chars.
+        Cap at 8000 chars (≈ 2000 tokens) instead of 3000.
+        """
         try:
             url   = page.url
             title = await page.title()
@@ -1103,6 +1213,26 @@ You are given a FRESH snapshot with every step — you do NOT need to call brows
             snapshot = await page.accessibility.snapshot(interesting_only=True)
             self._ref_map = {}
             counter = [0]
+
+            # Roles that are always included and get a ref (actionable/interactive)
+            INTERACTIVE_ROLES = {
+                "button", "link", "textbox", "combobox", "listbox", "checkbox",
+                "radio", "switch", "menuitem", "tab", "spinbutton", "searchbox",
+                "menuitemcheckbox", "menuitemradio", "option", "treeitem",
+                "slider", "scrollbar", "gridcell",
+            }
+            # Roles included only when they have a name (provide context)
+            CONTEXT_ROLES = {
+                "heading", "alert", "alertdialog", "dialog", "status", "log",
+                "columnheader", "rowheader", "cell",
+            }
+            # Roles always skipped (structural noise)
+            SKIP_ROLES = {
+                "none", "generic", "group", "region", "main", "navigation",
+                "complementary", "contentinfo", "banner", "document", "application",
+                "list", "listitem", "presentation", "separator", "table", "grid",
+                "row", "rowgroup", "toolbar",
+            }
 
             def _fmt(node: dict, indent: int = 0) -> list[str]:
                 if not node:
@@ -1112,30 +1242,35 @@ You are given a FRESH snapshot with every step — you do NOT need to call brows
                 value = node.get("value", "")
                 desc  = node.get("description", "")
 
-                # Skip structural-only nodes but still recurse into children
-                skip_roles = {
-                    "none", "generic", "group", "region", "main",
-                    "navigation", "complementary", "contentinfo", "banner",
-                    "document", "application", "list",
-                }
                 lines: list[str] = []
-                if role not in skip_roles:
+                include = (
+                    role in INTERACTIVE_ROLES
+                    or (role in CONTEXT_ROLES and name)
+                )
+
+                if role in SKIP_ROLES:
+                    for child in node.get("children") or []:
+                        lines.extend(_fmt(child, indent))
+                    return lines
+
+                if include:
                     counter[0] += 1
                     ref = f"e{counter[0]}"
                     self._ref_map[ref] = {"role": role, "name": name, "value": value}
-
                     parts = [f"[{role}]"]
                     if name:
                         parts.append(f'"{name}"')
-                    if value:
+                    if value and value != name:
                         parts.append(f'value="{value}"')
                     if desc and desc != name:
                         parts.append(f'desc="{desc}"')
                     parts.append(f"(ref={ref})")
                     lines.append("  " * indent + " ".join(parts))
-
-                for child in node.get("children") or []:
-                    lines.extend(_fmt(child, indent + (0 if role in skip_roles else 1)))
+                    for child in node.get("children") or []:
+                        lines.extend(_fmt(child, indent + 1))
+                else:
+                    for child in node.get("children") or []:
+                        lines.extend(_fmt(child, indent))
                 return lines
 
             node_lines: list[str] = []
@@ -1148,21 +1283,37 @@ You are given a FRESH snapshot with every step — you do NOT need to call brows
             else:
                 output.append("(No interactive elements found — page may still be loading)")
             result = "\n".join(output)
-            # Cap snapshot size to control Azure input token costs.
-            # 3000 chars ≈ 750 tokens. Snapshots beyond this are mostly deep nested
-            # structural noise — the AI only needs the top interactive elements.
-            if len(result) > 3000:
-                result = result[:3000] + "\n... (snapshot truncated — use browser_scroll if needed)"
+            # 8000 chars ≈ 2000 tokens — adequate for complex enterprise UIs
+            if len(result) > 8000:
+                result = result[:8000] + "\n... (more elements below — use browser_scroll to reveal them)"
             return result
         except Exception as exc:
             return f"Snapshot error: {exc}. URL: {page.url}"
+
+    async def _wait_for_stable(self, page: Page, timeout_ms: int = 5000) -> None:
+        """
+        Wait for the page to reach a stable state after navigation or interaction.
+        Replaces hard sleeps with an intelligent wait:
+          1. domcontentloaded — basic DOM is ready
+          2. networkidle — no pending XHR/fetch for 500ms (with short timeout so we don't block)
+          3. Fall back to a short fixed wait if networkidle is too slow (e.g. long-polling apps)
+        """
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+        except Exception:
+            pass
+        try:
+            await page.wait_for_load_state("networkidle", timeout=2000)
+        except Exception:
+            # networkidle can hang on apps with continuous polling — use short fixed wait
+            await page.wait_for_timeout(800)
 
     async def _do_navigate(self, page: Page, url: str) -> str:
         if not url:
             return "Error: No URL provided"
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            await page.wait_for_timeout(NAV_WAIT_MS)
+            await self._wait_for_stable(page)
             return f"Navigated to {page.url}"
         except PWTimeout:
             return f"Navigation timeout — page may still be loading. Current URL: {page.url}"
@@ -1394,6 +1545,62 @@ You are given a FRESH snapshot with every step — you do NOT need to call brows
                 return f"Assertion failed: Text '{text}' is still visible. Error: {e}"
 
         return "Error: Specify text or selector for browser_assert_not_visible"
+    async def _do_assert_text(self, page: Page, args: dict) -> str:
+        """
+        Assert that an element contains specific text content.
+        Stronger than assert_visible — verifies actual data values, not just presence.
+        """
+        text     = args.get("text", "")
+        ref      = args.get("ref")
+        selector = args.get("selector")
+        exact    = args.get("exact", False)
+        timeout  = args.get("timeout", 5000)
+
+        if not text:
+            return "Error: No text specified for browser_assert_text"
+
+        # Strategy 1: check specific element by selector
+        if selector:
+            try:
+                loc = page.locator(selector).first
+                await loc.wait_for(state="visible", timeout=timeout)
+                content = (await loc.text_content() or "").strip()
+                if (exact and text == content) or (not exact and text.lower() in content.lower()):
+                    return f"Assertion passed: Element '{selector}' contains '{text}'"
+                return f"Assertion failed: Element '{selector}' text is '{content[:120]}', expected to contain '{text}'"
+            except Exception as e:
+                return f"Assertion failed: Could not check element '{selector}' — {str(e)[:120]}"
+
+        # Strategy 2: check element by ref
+        if ref and ref in self._ref_map:
+            node = self._ref_map[ref]
+            role = node.get("role", "")
+            name = node.get("name", "")
+            try:
+                loc = page.get_by_role(role, name=name).first if (role and name) else None
+                if loc:
+                    content = (await loc.text_content() or "").strip()
+                    if (exact and text == content) or (not exact and text.lower() in content.lower()):
+                        return f"Assertion passed: Element (ref={ref}) contains '{text}'"
+                    return f"Assertion failed: Element (ref={ref}) text is '{content[:120]}', expected to contain '{text}'"
+            except Exception:
+                pass
+
+        # Strategy 3: page-wide text search (most forgiving)
+        try:
+            # Use Playwright's built-in locator which handles dynamic content
+            loc = page.get_by_text(text, exact=exact)
+            count = await loc.count()
+            if count > 0:
+                return f"Assertion passed: Text '{text}' found on page ({count} occurrence(s))"
+            # Final fallback — check page source text content
+            body_text = await page.evaluate("document.body.innerText")
+            if text.lower() in (body_text or "").lower():
+                return f"Assertion passed: Text '{text}' found in page content"
+            return f"Assertion failed: Text '{text}' NOT found anywhere on page"
+        except Exception as e:
+            return f"Assertion failed: browser_assert_text error — {str(e)[:120]}"
+
     async def _do_scroll(self, page: Page, args: dict) -> str:
         direction = args.get("direction", "down")
         amount    = int(args.get("amount", 400))
@@ -1500,38 +1707,172 @@ You are given a FRESH snapshot with every step — you do NOT need to call brows
         passed: bool,
     ) -> None:
         try:
-            quality_score = 100.0 if passed else max(
-                0.0, 100.0 * sum(1 for s in steps if s.get("passed")) / max(len(steps), 1)
-            )
+            total         = len(steps)
+            passed_count  = sum(1 for s in steps if s.get("passed"))
+            failed_count  = total - passed_count
+            # Steps that carry business checkpoint semantics (tagged in plan)
+            checkpoint_steps   = [s for s in steps if s.get("checkpoint")]
+            checkpoint_passed  = sum(1 for s in checkpoint_steps if s.get("passed"))
+            checkpoint_total   = len(checkpoint_steps)
+
+            # ── Deterministic quality score (not AI-generated) ──────────────────
+            # Formula: 60% step pass rate + 30% checkpoint pass rate − 10% failure penalty
+            if total == 0:
+                quality_score = 0.0
+            else:
+                step_score       = (passed_count / total) * 60.0
+                checkpoint_score = (checkpoint_passed / max(checkpoint_total, 1)) * 30.0
+                failure_penalty  = (failed_count / total) * 10.0
+                quality_score    = round(max(0.0, min(100.0, step_score + checkpoint_score - failure_penalty)), 1)
+
+            # ── Risk level derived from quality score ────────────────────────────
+            if quality_score >= 90:
+                risk = RiskLevel.LOW
+            elif quality_score >= 70:
+                risk = RiskLevel.MEDIUM
+            elif quality_score >= 40:
+                risk = RiskLevel.HIGH
+            else:
+                risk = RiskLevel.CRITICAL if hasattr(RiskLevel, "CRITICAL") else RiskLevel.HIGH
+
+            # ── Run history trend (last 10 completed runs for same scenario) ────
+            consecutive_failures = 0
+            flakiness_score      = 0.0
+            last_pass_at: str | None = None
+            try:
+                from sqlalchemy import desc as _sql_desc
+                hist_result = await self.db.execute(
+                    select(ExecutionRun)
+                    .where(
+                        ExecutionRun.scenario_id == run.scenario_id,
+                        ExecutionRun.id != run.id,
+                        ExecutionRun.status.in_([ExecutionStatus.COMPLETED, ExecutionStatus.FAILED]),
+                    )
+                    .order_by(_sql_desc(ExecutionRun.completed_at))
+                    .limit(10)
+                )
+                history = hist_result.scalars().all()
+                if history:
+                    for h in history:
+                        if h.status == ExecutionStatus.FAILED:
+                            consecutive_failures += 1
+                        else:
+                            last_pass_at = h.completed_at.isoformat() if h.completed_at else None
+                            break
+                    pass_count_hist  = sum(1 for h in history if h.status == ExecutionStatus.COMPLETED)
+                    flakiness_score  = round(1.0 - (pass_count_hist / len(history)), 2)
+            except Exception as _trend_err:
+                log.debug("Trend query failed", error=str(_trend_err)[:100])
+
+            # ── Insights derived from execution data (factual, not AI narrative) ─
+            insights: list[str] = []
+            failed_steps_info = [s for s in steps if not s.get("passed")]
+            if failed_count > 0:
+                tools_failed = ", ".join(dict.fromkeys(s["tool"] for s in failed_steps_info[:5]))
+                insights.append(f"{failed_count} step(s) failed — actions: {tools_failed}")
+            if checkpoint_total > 0 and checkpoint_passed < checkpoint_total:
+                insights.append(
+                    f"BUSINESS OUTCOME ALERT: {checkpoint_total - checkpoint_passed} of {checkpoint_total} "
+                    f"business checkpoint(s) not verified"
+                )
+            if consecutive_failures >= 3:
+                insights.append(
+                    f"STABILITY ALERT: Scenario has failed {consecutive_failures} consecutive runs"
+                )
+            if flakiness_score > 0.4:
+                insights.append(
+                    f"FLAKINESS DETECTED: Scenario passes only "
+                    f"{round((1 - flakiness_score) * 100)}% of recent runs"
+                )
+            if any("timeout" in (s.get("result") or "").lower() for s in failed_steps_info):
+                insights.append("Timeout errors detected — application may be loading slowly")
+            if any("not found" in (s.get("result") or "").lower() for s in failed_steps_info):
+                insights.append("Element-not-found errors — consider re-exploring to refresh selectors")
+
+            # ── Recommendations (actionable, based on failure patterns) ──────────
+            recommendations: list[str] = []
+            if any("element" in (s.get("result") or "").lower() and "not found" in (s.get("result") or "").lower()
+                   for s in failed_steps_info):
+                recommendations.append(
+                    "Re-explore the application to rebuild the knowledge graph with fresh selectors"
+                )
+            if any("timeout" in (s.get("result") or "").lower() for s in failed_steps_info):
+                recommendations.append(
+                    "Add explicit wait_ms steps after actions that trigger heavy data loading"
+                )
+            if any("assertion failed" in (s.get("result") or "").lower() for s in failed_steps_info):
+                recommendations.append(
+                    "Assertion failures indicate unexpected UI state — verify test data exists before running"
+                )
+            if consecutive_failures >= 3:
+                recommendations.append(
+                    f"Scenario has failed {consecutive_failures} times in a row — "
+                    f"review if the application flow has changed since last successful run"
+                    + (f" (last passed: {last_pass_at})" if last_pass_at else "")
+                )
+            if flakiness_score > 0.3:
+                recommendations.append(
+                    "Flaky scenario — add browser_wait steps after dynamic content loads "
+                    "and ensure test data is unique per run using the {{RUN_ID}} placeholder"
+                )
+
             timeline = [
                 {
-                    "seq": s["seq"],
-                    "tool": s["tool"],
-                    "result": s["result"][:150],
+                    "seq":         s["seq"],
+                    "tool":        s["tool"],
+                    "result":      s["result"][:200],
                     "duration_ms": s["duration_ms"],
-                    "passed": s["passed"],
+                    "passed":      s["passed"],
+                    "screenshot":  s.get("screenshot_path"),
                 }
                 for s in steps
             ]
             summary = {
-                "total_steps":  len(steps),
-                "passed_steps": sum(1 for s in steps if s.get("passed")),
-                "failed_steps": sum(1 for s in steps if not s.get("passed")),
-                "outcome":      "PASSED" if passed else "FAILED",
-                "executor":     "playwright_mcp",
+                "total_steps":           total,
+                "passed_steps":          passed_count,
+                "failed_steps":          failed_count,
+                "checkpoint_steps":      checkpoint_total,
+                "checkpoints_passed":    checkpoint_passed,
+                "outcome":               "PASSED" if passed else "FAILED",
+                "executor":              "playwright_mcp",
+                "quality_formula":       "60%×step_pass + 30%×checkpoint_pass − 10%×failure_rate",
+                "consecutive_failures":  consecutive_failures,
+                "flakiness_score":       flakiness_score,
+                "last_pass_at":          last_pass_at,
             }
+
             report = ExecutionReport(
                 id=str(_uuid_mod.uuid4()),
                 run_id=run.id,
-                risk_level=RiskLevel.LOW if passed else RiskLevel.HIGH,
+                risk_level=risk,
                 quality_score=quality_score,
                 summary=summary,
-                insights=[],
-                rca_analysis={},
-                recommendations=[],
+                insights=insights,
+                rca_analysis={
+                    "consecutive_failures": consecutive_failures,
+                    "flakiness_score":      flakiness_score,
+                    "failed_steps": [
+                        {"seq": s["seq"], "tool": s["tool"], "result": s["result"][:200]}
+                        for s in failed_steps_info[:10]
+                    ],
+                    "checkpoint_coverage": {
+                        "total":  checkpoint_total,
+                        "passed": checkpoint_passed,
+                        "rate":   round(checkpoint_passed / max(checkpoint_total, 1), 2),
+                    },
+                },
+                recommendations=recommendations,
                 timeline=timeline,
             )
             self.db.add(report)
             await self.db.commit()
+            log.info(
+                "Report built",
+                run_id=run.id,
+                quality_score=quality_score,
+                risk=risk.value if hasattr(risk, "value") else str(risk),
+                flakiness=flakiness_score,
+                consecutive_failures=consecutive_failures,
+            )
         except Exception as exc:
             log.warning("Report generation failed", run_id=run.id, error=str(exc))

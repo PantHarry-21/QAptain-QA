@@ -14,6 +14,7 @@ from app.db.session import get_db
 from app.db.models import (
     User, Scenario, ScenarioPriority, ExecutionPlan, ExecutionRun,
     Environment, Credential, ApplicationModule, ApplicationWorkflow,
+    Application,
 )
 from sqlalchemy import func
 from app.core.dependencies import get_current_user, require_app_access
@@ -1003,8 +1004,20 @@ async def list_runs(
 
 # ─── Playwright Script ────────────────────────────────────────────────────────
 
-def _step_to_playwright(step: dict, indent: str = "  ") -> str:
-    """Convert a single plan step to Playwright TypeScript code line(s)."""
+def _is_pipe_selector(target: str) -> bool:
+    """Return True when target is an AI-executor OR-list like 'Add|New|Create'."""
+    return "|" in target and not target.startswith("//") and not target.startswith("xpath=")
+
+
+def _pipe_to_regex(target: str) -> str:
+    """Convert 'Add|New|Create CRM' → '/Add|New|Create CRM/i' JS regex literal."""
+    # Escape forward slashes inside the pattern; keep | as-is for regex OR
+    pattern = target.replace("/", "\\/")
+    return f"/{pattern}/i"
+
+
+def _step_to_playwright(step: dict, indent: str = "  ", base_url: str = "") -> str:
+    """Convert a single plan step to valid Playwright TypeScript code."""
     action = (step.get("action") or "").lower()
     target = step.get("target") or step.get("selector") or ""
     value = step.get("value") or step.get("test_value") or ""
@@ -1012,53 +1025,108 @@ def _step_to_playwright(step: dict, indent: str = "  ") -> str:
     timeout = step.get("timeout_ms", 8000)
 
     comment = f"{indent}// {desc}" if desc else ""
-    t = target.replace("'", "\\'")
     v = str(value).replace("'", "\\'") if value else ""
 
     if action == "navigate":
-        code = f"{indent}await page.goto('{t}');"
+        # Build a proper absolute URL
+        if not target or target in ("/", ""):
+            url = base_url or "/"
+        elif target.startswith("http"):
+            url = target
+        else:
+            url = (base_url.rstrip("/") + "/" + target.lstrip("/")) if base_url else target
+        code = f"{indent}await page.goto('{url}');"
+
     elif action == "click":
-        code = f"{indent}await page.click('{t}', {{ timeout: {timeout} }});"
+        if _is_pipe_selector(target):
+            regex = _pipe_to_regex(target)
+            code = f"{indent}await page.getByRole('button', {{ name: {regex} }}).first().click({{ timeout: {timeout} }});"
+        else:
+            t = target.replace("'", "\\'")
+            code = f"{indent}await page.locator('{t}').click({{ timeout: {timeout} }});"
+
     elif action == "fill":
-        code = f"{indent}await page.fill('{t}', '{v}');"
+        v_escaped = v.replace("\\", "\\\\")
+        if _is_pipe_selector(target):
+            regex = _pipe_to_regex(target)
+            code = f"{indent}await page.getByLabel({regex}).first().fill('{v_escaped}');"
+        else:
+            t = target.replace("'", "\\'")
+            code = f"{indent}await page.locator('{t}').fill('{v_escaped}');"
+
     elif action == "clear":
-        code = f"{indent}await page.fill('{t}', '');"
+        if _is_pipe_selector(target):
+            regex = _pipe_to_regex(target)
+            code = f"{indent}await page.getByLabel({regex}).first().fill('');"
+        else:
+            t = target.replace("'", "\\'")
+            code = f"{indent}await page.locator('{t}').fill('');"
+
     elif action == "select":
+        t = target.replace("'", "\\'")
         code = f"{indent}await page.selectOption('{t}', '{v}');"
+
     elif action == "key_press":
         key = v or target or "Enter"
         code = f"{indent}await page.keyboard.press('{key}');"
+
     elif action == "hover":
+        t = target.replace("'", "\\'")
         code = f"{indent}await page.hover('{t}');"
-    elif action == "assert_visible":
-        code = f"{indent}await expect(page.locator('{t}')).toBeVisible({{ timeout: {timeout} }});"
-    elif action == "assert_not_visible":
-        code = f"{indent}await expect(page.locator('{t}')).not.toBeVisible();"
-    elif action == "assert_text":
-        code = f"{indent}await expect(page.locator('{t}')).toContainText('{v}');"
-    elif action == "assert_not_text":
-        code = f"{indent}await expect(page.locator('{t}')).not.toContainText('{v}');"
+
+    elif action in ("assert_visible", "assert_text", "assert_not_visible", "assert_not_text",
+                    "assert_count", "assert_ai_semantic"):
+        if _is_pipe_selector(target):
+            regex = _pipe_to_regex(target)
+            locator = f"page.getByText({regex})"
+        else:
+            t = target.replace("'", "\\'")
+            locator = f"page.locator('{t}')"
+
+        if action == "assert_visible":
+            code = f"{indent}await expect({locator}).toBeVisible({{ timeout: {timeout} }});"
+        elif action == "assert_not_visible":
+            code = f"{indent}await expect({locator}).not.toBeVisible();"
+        elif action == "assert_text":
+            code = f"{indent}await expect({locator}).toContainText('{v}');"
+        elif action == "assert_not_text":
+            code = f"{indent}await expect({locator}).not.toContainText('{v}');"
+        elif action == "assert_count":
+            code = f"{indent}await expect({locator}).toHaveCount({v or 1});"
+        else:  # assert_ai_semantic
+            code = f"{indent}// AI semantic assertion: {desc or v}"
+
     elif action == "assert_url":
-        pat = (v or t).replace("/", "\\/")
+        pat = (v or target).replace("/", "\\/")
         code = f"{indent}await expect(page).toHaveURL(/{pat}/);"
-    elif action == "assert_count":
-        code = f"{indent}await expect(page.locator('{t}')).toHaveCount({v or 1});"
+
     elif action == "wait_element":
+        if _is_pipe_selector(target):
+            # Convert OR list to comma-separated CSS for waitForSelector
+            css = ", ".join(p.strip() for p in target.split("|"))
+            t = css.replace("'", "\\'")
+        else:
+            t = target.replace("'", "\\'")
         code = f"{indent}await page.waitForSelector('{t}', {{ timeout: {timeout} }});"
+
     elif action == "wait_ms":
         ms = int(v) if str(v).isdigit() else timeout
         code = f"{indent}await page.waitForTimeout({ms});"
+
     elif action == "wait_network":
         code = f"{indent}await page.waitForLoadState('networkidle');"
+
     elif action == "scroll":
         code = f"{indent}await page.evaluate(() => window.scrollBy(0, 400));"
+
     elif action == "upload":
+        t = target.replace("'", "\\'")
         code = f"{indent}await page.setInputFiles('{t}', '{v or 'path/to/file'}');"
+
     elif action == "screenshot":
         label = desc.lower().replace(" ", "_")[:30] if desc else "step"
         code = f"{indent}await page.screenshot({{ path: 'screenshots/{label}.png' }});"
-    elif action == "assert_ai_semantic":
-        code = f"{indent}// AI semantic assertion: {desc or v}"
+
     else:
         code = f"{indent}// TODO: {action} — {desc or target}"
 
@@ -1066,7 +1134,7 @@ def _step_to_playwright(step: dict, indent: str = "  ") -> str:
 
 
 def _plan_to_playwright_script(scenario_title: str, steps: list[dict], base_url: str = "") -> str:
-    """Generate a complete Playwright TypeScript test file from plan steps."""
+    """Generate a complete, runnable Playwright TypeScript test from plan steps."""
     lines = [
         "import { test, expect } from '@playwright/test';",
         "",
@@ -1074,12 +1142,7 @@ def _plan_to_playwright_script(scenario_title: str, steps: list[dict], base_url:
     ]
 
     for step in steps:
-        action = (step.get("action") or "").lower()
-        if action == "screenshot":
-            # screenshots in Playwright scripts are optional evidence — include but as low noise
-            lines.append(_step_to_playwright(step))
-        else:
-            lines.append(_step_to_playwright(step))
+        lines.append(_step_to_playwright(step, base_url=base_url))
         lines.append("")
 
     lines.append("});")
@@ -1106,6 +1169,19 @@ async def get_playwright_script(
     scenario = result.scalar_one_or_none()
     if not scenario:
         raise HTTPException(status_code=404, detail="Scenario not found")
+
+    # Resolve the application base URL so navigate steps get a real URL
+    base_url = ""
+    try:
+        app_result = await db.execute(
+            select(Application).where(Application.id == scenario.application_id)
+        )
+        app = app_result.scalar_one_or_none()
+        if app:
+            # Use module URL if available (more specific), else app base URL
+            base_url = (scenario.module_url or app.base_url or "").rstrip("/")
+    except Exception:
+        pass
 
     # Prefer KG-recorded plan, then latest plan
     plan: "ExecutionPlan | None" = None
@@ -1162,7 +1238,7 @@ async def get_playwright_script(
         steps.append({"action": "assert_visible", "target": ".success", "description": "Verify success state"})
         source = "skeleton"
 
-    script = _plan_to_playwright_script(scenario.title, steps)
+    script = _plan_to_playwright_script(scenario.title, steps, base_url=base_url)
 
     return {
         "scenario_id": scenario_id,

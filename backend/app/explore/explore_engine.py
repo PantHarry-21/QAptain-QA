@@ -1885,6 +1885,14 @@ class ExploreEngine:
                         }]
                     if category == "add" and dialog_data.get("roundtrip"):
                         add_roundtrip_done = True
+                        # After a successful add, immediately try to edit then delete the created
+                        # record so the KG learns the full CRUD lifecycle for this module.
+                        roundtrip_info = dialog_data.get("roundtrip", {})
+                        if roundtrip_info.get("submitted") and not roundtrip_info.get("error_on_submit"):
+                            try:
+                                await self._try_edit_delete_from_table(page)
+                            except Exception as _lc_err:
+                                log.debug("CRUD lifecycle after add failed", error=str(_lc_err)[:100])
 
                     # Record structured workflow steps to KG so the planner can build
                     # exact-selector plans without AI for any explored module.
@@ -2069,26 +2077,26 @@ class ExploreEngine:
         if dialog_info:
             category = el_info.get("category", "")
 
-            if do_roundtrip and category in ("add", "edit") and dialog_info.get("fields"):
+            if do_roundtrip and category in ("add", "edit"):
                 # Step 1: Probe validation contract — submit empty, capture required-field errors
-                validation_errors = await asyncio.to_thread(self._probe_form_validation, dialog_info)
-                if validation_errors:
-                    dialog_info["validation_rules"] = validation_errors
+                # Only probe if there are pre-detected fields (Angular Material fields may be missed)
+                if dialog_info.get("fields"):
+                    validation_errors = await asyncio.to_thread(self._probe_form_validation, dialog_info)
+                    if validation_errors:
+                        dialog_info["validation_rules"] = validation_errors
 
-                # Step 2: Complete-action roundtrip — fill with test data, submit, capture success
-                if dialog_info.get("submit_selector"):
-                    roundtrip = await asyncio.to_thread(self._complete_action_roundtrip, dialog_info)
-                    dialog_info["roundtrip"] = roundtrip
-                    current_url = self._browser.get_current_url()
-                    if current_url != before_url:
-                        try:
-                            self._browser.driver.back()
-                            await asyncio.sleep(1.0)
-                        except Exception:
-                            pass
-                else:
-                    await asyncio.to_thread(self._close_any_dialog)
-                    await asyncio.sleep(0.5)
+                # Step 2: Complete-action roundtrip — fill with test data, submit, capture success.
+                # _complete_action_roundtrip does its own live DOM field scan when pre-extracted
+                # selectors are missing (handles Angular Material, custom components, etc.).
+                roundtrip = await asyncio.to_thread(self._complete_action_roundtrip, dialog_info)
+                dialog_info["roundtrip"] = roundtrip
+                current_url = self._browser.get_current_url()
+                if current_url != before_url:
+                    try:
+                        self._browser.driver.back()
+                        await asyncio.sleep(1.0)
+                    except Exception:
+                        pass
             else:
                 # Just capture the form structure, then close
                 await asyncio.to_thread(self._close_any_dialog)
@@ -2291,7 +2299,7 @@ class ExploreEngine:
 
         url_before = self._browser.get_current_url()
 
-        # Fill fields
+        # Fill fields — try pre-extracted selectors first
         for field in fields[:12]:
             label = field.get("label", "")
             f_type = (field.get("type") or "text").lower()
@@ -2356,6 +2364,13 @@ class ExploreEngine:
                 time.sleep(0.15)
             except Exception as e:
                 log.debug("Field fill skipped during roundtrip", field=label, error=str(e)[:80])
+
+        # Fallback: if no pre-extracted fields had valid selectors (common for Angular Material,
+        # React, or any component that doesn't set id/name/aria-label), do a live DOM scan of
+        # the open dialog and fill all visible inputs directly.
+        if not result["filled_fields"]:
+            live_filled = self._fill_dialog_inputs_directly()
+            result["filled_fields"].extend(live_filled)
 
         # Find and click submit button
         btn = None
@@ -2466,6 +2481,287 @@ class ExploreEngine:
                 pass
 
         return result
+
+    def _fill_dialog_inputs_directly(self) -> list[dict]:
+        """
+        Live DOM scan: find all visible inputs in any open dialog and fill them with realistic
+        test data. Called when pre-extracted field selectors are empty (Angular Material, React,
+        custom components that don't use id/name/aria-label on their native input elements).
+        """
+        from selenium.webdriver.common.by import By
+
+        filled = []
+
+        # Locate the open dialog container — try multiple selector strategies
+        dialog_el = None
+        for sel in (
+            '[role="dialog"]', '[aria-modal="true"]',
+            '.cdk-overlay-pane [class*="dialog"]', '.cdk-dialog-container',
+            '.MuiDialog-paper', '.ant-modal-content', '.modal.show',
+        ):
+            try:
+                for el in self._browser.driver.find_elements(By.CSS_SELECTOR, sel):
+                    if el.is_displayed():
+                        dialog_el = el
+                        break
+            except Exception:
+                pass
+            if dialog_el:
+                break
+
+        if not dialog_el:
+            return filled
+
+        # Collect visible text/email/number/textarea inputs (skip hidden/submit/button/disabled)
+        try:
+            inputs = dialog_el.find_elements(
+                By.CSS_SELECTOR,
+                'input:not([type="hidden"]):not([type="submit"]):not([type="button"])'
+                ':not([type="checkbox"]):not([type="radio"])'
+                ':not([disabled]):not([readonly]),'
+                'textarea:not([disabled]):not([readonly])',
+            )
+        except Exception:
+            return filled
+
+        for i, inp in enumerate(inputs[:12]):
+            try:
+                if not inp.is_displayed():
+                    continue
+
+                # Derive label from multiple sources (Angular Material uses mat-label, not <label>)
+                inp_id = inp.get_attribute("id") or ""
+                label = ""
+
+                if inp_id:
+                    try:
+                        lbl = self._browser.driver.find_element(By.CSS_SELECTOR, f'label[for="{inp_id}"]')
+                        label = lbl.text.strip()
+                    except Exception:
+                        pass
+
+                if not label:
+                    # Walk up to nearest mat-form-field / form-group and find a label there
+                    label = self._browser.execute_script("""
+                        const inp = arguments[0];
+                        const parent = inp.closest(
+                            'mat-form-field, .mat-form-field, .form-group, .form-field, '
+                            + '[class*="field-wrapper"], [class*="input-group"]'
+                        );
+                        if (!parent) return '';
+                        const lbl = parent.querySelector(
+                            'mat-label, label, [class*="label"], [class*="field-label"], '
+                            + '[class*="field-name"], .mat-form-field-label'
+                        );
+                        return lbl ? lbl.textContent.trim().slice(0, 80) : '';
+                    """, inp) or ""
+
+                if not label:
+                    label = (
+                        inp.get_attribute("placeholder") or
+                        inp.get_attribute("aria-label") or
+                        inp.get_attribute("name") or
+                        inp.get_attribute("formcontrolname") or
+                        f"field_{i}"
+                    )
+
+                inp_type = inp.get_attribute("type") or "text"
+                value = self._generate_field_test_value({"label": label, "type": inp_type})
+
+                # Fill using Angular/React-compatible native value setter
+                self._browser.execute_script("""
+                    const inp = arguments[0]; const val = arguments[1];
+                    const nativeSetter = Object.getOwnPropertyDescriptor(
+                        inp.tagName === 'TEXTAREA'
+                            ? window.HTMLTextAreaElement.prototype
+                            : window.HTMLInputElement.prototype,
+                        'value'
+                    );
+                    if (nativeSetter && nativeSetter.set) {
+                        nativeSetter.set.call(inp, val);
+                    } else {
+                        inp.value = val;
+                    }
+                    inp.dispatchEvent(new Event('focus', {bubbles: true}));
+                    inp.dispatchEvent(new Event('input', {bubbles: true}));
+                    inp.dispatchEvent(new Event('change', {bubbles: true}));
+                    inp.dispatchEvent(new Event('blur', {bubbles: true}));
+                """, inp, value)
+                filled.append({"field": label, "value": value})
+                time.sleep(0.12)
+            except Exception as e:
+                log.debug("Live dialog input fill skipped", idx=i, error=str(e)[:60])
+
+        # Handle native <select> dropdowns in the dialog
+        try:
+            selects = dialog_el.find_elements(By.CSS_SELECTOR, 'select:not([disabled])')
+            for sel_el in selects[:4]:
+                if not sel_el.is_displayed():
+                    continue
+                try:
+                    from selenium.webdriver.support.ui import Select as _Sel
+                    s = _Sel(sel_el)
+                    opts = [o for o in s.options if o.get_attribute("value") and o.text.strip()]
+                    if opts:
+                        s.select_by_index(min(1, len(opts) - 1))
+                        filled.append({"field": "dropdown", "value": opts[min(1, len(opts)-1)].text})
+                        time.sleep(0.1)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        return filled
+
+    async def _try_edit_delete_from_table(self, page: "ApplicationPage") -> None:
+        """
+        After a successful Add roundtrip, find the newly created record in the table and:
+        1. Click its Edit button (row-level) → modify a field → submit
+        2. Click its Delete button → confirm → verify record is removed
+        This completes the full CRUD lifecycle and teaches the KG what edit/delete workflows look like.
+        """
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.common.action_chains import ActionChains
+
+        await asyncio.sleep(1.2)  # Wait for table to refresh after add
+
+        # Locate the first visible data row
+        row_el = None
+        row_sel_used = ""
+        for sel in (
+            "table tbody tr",
+            '[role="grid"] [role="row"]',
+            '[role="rowgroup"] [role="row"]',
+            ".mat-row", ".ant-table-row", ".ag-row",
+        ):
+            try:
+                rows = self._browser.driver.find_elements(By.CSS_SELECTOR, sel)
+                for r in rows:
+                    if r.is_displayed():
+                        cells = r.find_elements(By.CSS_SELECTOR, 'td, [role="cell"], [role="gridcell"]')
+                        if cells:
+                            row_el = r
+                            row_sel_used = sel
+                            break
+            except Exception:
+                pass
+            if row_el:
+                break
+
+        if not row_el:
+            await self._log("INFO", "exploration", "No table rows found after Add — skipping edit/delete lifecycle")
+            return
+
+        # Hover over row to reveal hover-only action buttons
+        try:
+            ActionChains(self._browser.driver).move_to_element(row_el).perform()
+            await asyncio.sleep(0.6)
+        except Exception:
+            pass
+
+        # Look for Edit and Delete buttons on the row or in its last cell
+        edit_btn = None
+        delete_btn = None
+        try:
+            btn_candidates = row_el.find_elements(
+                By.CSS_SELECTOR,
+                'button, [role="button"], a, [class*="icon-btn"], [class*="action-btn"], mat-icon-button',
+            )
+            for btn in btn_candidates:
+                try:
+                    if not btn.is_displayed():
+                        continue
+                    text = (
+                        btn.text or btn.get_attribute("aria-label") or
+                        btn.get_attribute("title") or btn.get_attribute("mattooltip") or ""
+                    ).strip().lower()
+                    if edit_btn is None and any(k in text for k in ("edit", "modify", "update", "pencil")):
+                        edit_btn = btn
+                    elif delete_btn is None and any(k in text for k in ("delete", "remove", "trash")):
+                        delete_btn = btn
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # ── Edit roundtrip ───────────────────────────────────────────────────────
+        if edit_btn:
+            try:
+                before_url = self._browser.get_current_url()
+                self._browser.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'}); arguments[0].click()", edit_btn
+                )
+                await asyncio.sleep(1.5)
+
+                dialog_info = await asyncio.to_thread(self._extract_dialog_or_form)
+                if dialog_info and (dialog_info.get("fields") or True):
+                    roundtrip = await asyncio.to_thread(self._complete_action_roundtrip, dialog_info)
+                    indicator = roundtrip.get("success_indicator", "")
+                    fields_filled = len(roundtrip.get("filled_fields", []))
+                    await self._log("INFO", "exploration",
+                        f"Edit roundtrip: filled {fields_filled} field(s) — {indicator or 'submitted'}")
+                    current_url = self._browser.get_current_url()
+                    if current_url != before_url:
+                        try:
+                            self._browser.driver.back()
+                            await asyncio.sleep(1.2)
+                        except Exception:
+                            pass
+                    # Re-hover after dialog closes to find delete button on the same row
+                    try:
+                        rows = self._browser.driver.find_elements(By.CSS_SELECTOR, row_sel_used)
+                        if rows:
+                            ActionChains(self._browser.driver).move_to_element(rows[0]).perform()
+                            await asyncio.sleep(0.5)
+                            for btn in rows[0].find_elements(By.CSS_SELECTOR,
+                                'button, [role="button"], [class*="icon-btn"]'):
+                                if not btn.is_displayed():
+                                    continue
+                                text = (btn.text or btn.get_attribute("aria-label") or "").strip().lower()
+                                if delete_btn is None and any(k in text for k in ("delete", "remove", "trash")):
+                                    delete_btn = btn
+                    except Exception:
+                        pass
+                else:
+                    await asyncio.to_thread(self._close_any_dialog)
+            except Exception as e:
+                log.debug("Edit lifecycle roundtrip failed", error=str(e)[:80])
+                await asyncio.to_thread(self._close_any_dialog)
+
+        # ── Delete roundtrip ─────────────────────────────────────────────────────
+        if delete_btn:
+            try:
+                self._browser.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'}); arguments[0].click()", delete_btn
+                )
+                await asyncio.sleep(1.0)
+
+                # Confirm delete dialog
+                confirmed = False
+                for text in ("Yes", "Confirm", "Delete", "OK", "Yes, Delete", "Proceed", "Sure"):
+                    try:
+                        b = self._browser.driver.find_element(
+                            By.XPATH,
+                            f'//*[self::button or @role="button"][contains(normalize-space(.), "{text}") '
+                            f'and not(contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZ",'
+                            f'"abcdefghijklmnopqrstuvwxyz"),"cancel"))]',
+                        )
+                        if b.is_displayed():
+                            self._browser.execute_script("arguments[0].click()", b)
+                            confirmed = True
+                            break
+                    except Exception:
+                        pass
+
+                if confirmed:
+                    await asyncio.sleep(0.8)
+                    await self._log("INFO", "exploration",
+                        "Delete confirmed — test record cleaned up after full CRUD lifecycle")
+                else:
+                    await asyncio.to_thread(self._close_any_dialog)
+            except Exception as e:
+                log.debug("Delete lifecycle roundtrip failed", error=str(e)[:80])
+                await asyncio.to_thread(self._close_any_dialog)
 
     async def _record_workflow_to_kg(
         self,
@@ -2761,6 +3057,9 @@ class ExploreEngine:
 
         count = 0
         mod_by_id = {m.id: m for m in modules}
+        # Collect (id, module_id, title, description) before commit — SQLAlchemy
+        # AsyncSession expires object attributes after commit, so we capture values now.
+        new_scenario_refs: list[tuple[str, str, str, str]] = []
 
         for module_id_key, wf_types in wf_by_module.items():
             mod = mod_by_id.get(module_id_key)
@@ -2776,7 +3075,7 @@ class ExploreEngine:
                 title = tmpl["title"].format(module=module_name)
                 if title in existing_titles:
                     continue
-                self.db.add(Scenario(
+                sc = Scenario(
                     application_id=application_id,
                     title=title,
                     description=tmpl["description"].format(module=module_name),
@@ -2785,7 +3084,9 @@ class ExploreEngine:
                     module_id=module_id_key,
                     source="kg_generated",
                     is_active=True,
-                ))
+                )
+                self.db.add(sc)
+                new_scenario_refs.append((sc.id, module_id_key, title, tmpl["description"].format(module=module_name)))
                 existing_titles.add(title)
                 count += 1
 
@@ -2796,22 +3097,25 @@ class ExploreEngine:
             if has_all_crud:
                 e2e_title = f"Full CRUD — {module_name} End-to-End"
                 if e2e_title not in existing_titles:
-                    self.db.add(Scenario(
+                    e2e_desc = (
+                        f"1. Navigate to the {module_name} module.\n"
+                        f"2. Create a new {module_name} record with valid data — verify it appears in the list.\n"
+                        f"3. Edit the created record with updated values — verify changes are saved.\n"
+                        f"4. Delete the record — verify it is removed from the list.\n"
+                        f"5. Confirm no data leakage or state bleed between operations."
+                    )
+                    e2e_sc = Scenario(
                         application_id=application_id,
                         title=e2e_title,
-                        description=(
-                            f"1. Navigate to the {module_name} module.\n"
-                            f"2. Create a new {module_name} record with valid data — verify it appears in the list.\n"
-                            f"3. Edit the created record with updated values — verify changes are saved.\n"
-                            f"4. Delete the record — verify it is removed from the list.\n"
-                            f"5. Confirm no data leakage or state bleed between operations."
-                        ),
+                        description=e2e_desc,
                         priority=ScenarioPriority.CRITICAL,
                         tags=["kg_backed", "functional", "crud", "end_to_end", "regression"],
                         module_id=module_id_key,
                         source="kg_generated",
                         is_active=True,
-                    ))
+                    )
+                    self.db.add(e2e_sc)
+                    new_scenario_refs.append((e2e_sc.id, module_id_key, e2e_title, e2e_desc))
                     existing_titles.add(e2e_title)
                     count += 1
 
@@ -2822,6 +3126,35 @@ class ExploreEngine:
                 f"{count} KG-backed scenario(s) auto-generated from exploration "
                 f"(exact selectors recorded — no AI needed for execution)",
             )
+
+            # Pre-build ExecutionPlan records from KG workflows so scenarios are
+            # immediately runnable — no separate "Generate Plan" click needed.
+            # Use plain-value refs because session expires attributes after commit.
+            from app.intelligence.scenario_planner import ScenarioPlanner
+            from types import SimpleNamespace
+            planner = ScenarioPlanner(self.db)
+            plans_created = 0
+            for sc_id, sc_module_id, sc_title, sc_desc in new_scenario_refs:
+                sc_ref = SimpleNamespace(
+                    id=sc_id, module_id=sc_module_id,
+                    title=sc_title, description=sc_desc,
+                )
+                try:
+                    plan = await planner._build_plan_from_kg(sc_ref, "functional")
+                    if plan:
+                        plans_created += 1
+                except Exception as _plan_err:
+                    log.warning(
+                        "Pre-build KG plan failed — scenario still usable via AI planning",
+                        scenario_id=sc_id, error=str(_plan_err)[:120],
+                    )
+            if plans_created:
+                await self._log(
+                    "SUCCESS", "plans",
+                    f"{plans_created}/{count} KG-backed execution plan(s) pre-built "
+                    f"from recorded selectors — ready to run without AI",
+                )
+
         return count
 
     async def _auto_link_existing_scenarios(self, application_id: str) -> int:
@@ -2913,7 +3246,11 @@ class ExploreEngine:
         """) or {"row_count": 0, "is_empty": True, "empty_message": None}
 
     def _extract_dialog_or_form(self) -> dict | None:
-        """Detect and extract the structure of any dialog/modal open on the page."""
+        """
+        Detect and extract the structure of any dialog/modal open on the page.
+        Handles standard HTML, Angular Material (mat-form-field / mat-label / mat-select),
+        React MUI, Bootstrap modals, and CDK overlays.
+        """
         return self._browser.execute_script("""
         (function() {
             function isVisible(el) {
@@ -2924,8 +3261,9 @@ class ExploreEngine:
             const DIALOG_SELS = [
                 '[role="dialog"]','[role="alertdialog"]',
                 '.modal.show','.modal.is-active','[class*="modal-open"]',
-                '.MuiDialog-root','.ant-modal',
+                '.MuiDialog-root', '.MuiDialog-paper', '.ant-modal-content',
                 '[data-modal="true"]','[aria-modal="true"]',
+                '.cdk-dialog-container', '.cdk-overlay-pane [class*="dialog"]',
                 '[class*="dialog"]:not(head):not(script)',
             ];
             let dialog = null;
@@ -2949,35 +3287,105 @@ class ExploreEngine:
                 if (al && al.length < 80) return '[aria-label="'+al+'"]';
                 const nm = el.getAttribute('name');
                 if (nm && nm.length < 60) return el.tagName.toLowerCase()+'[name="'+nm+'"]';
+                const fcn = el.getAttribute('formcontrolname') || el.getAttribute('ng-model');
+                if (fcn && fcn.length < 60) return '[formcontrolname="'+fcn+'"]';
                 return '';
             }
 
+            function getLabelForInput(inp, container) {
+                // 1. Native <label for="id">
+                if (inp.id) {
+                    const lbl = container.querySelector('label[for="'+inp.id+'"]')
+                              || document.querySelector('label[for="'+inp.id+'"]');
+                    if (lbl) return lbl.textContent.trim();
+                }
+                // 2. Angular Material: walk up to mat-form-field, find mat-label
+                const matFF = inp.closest('mat-form-field, .mat-form-field, .mat-mdc-form-field');
+                if (matFF) {
+                    const ml = matFF.querySelector(
+                        'mat-label, label, .mat-form-field-label, .mdc-floating-label, '
+                        + '[class*="field-label"], [class*="label-text"]'
+                    );
+                    if (ml) return ml.textContent.trim();
+                }
+                // 3. Nearest enclosing form-group / field-wrapper label
+                const fg = inp.closest(
+                    '.form-group, .form-field, [class*="field-wrapper"], [class*="input-group"], '
+                    + '[class*="form-item"], [class*="form-row"]'
+                );
+                if (fg) {
+                    const lbl = fg.querySelector('label, [class*="label"], [class*="field-name"]');
+                    if (lbl) return lbl.textContent.trim();
+                }
+                // 4. Fallback attributes
+                return inp.getAttribute('placeholder') || inp.getAttribute('aria-label')
+                    || inp.getAttribute('name') || inp.getAttribute('formcontrolname') || '';
+            }
+
             const fields = [];
+            const seenLabels = new Set();
+
+            // ── Standard inputs (input / textarea / select) ──────────────────
             for (const inp of dialog.querySelectorAll(
-                'input:not([type="hidden"]):not([type="submit"]):not([type="button"]),textarea,select'
+                'input:not([type="hidden"]):not([type="submit"]):not([type="button"]),'
+                + 'textarea, select'
             )) {
                 if (!isVisible(inp)) continue;
-                const lel = inp.id ? document.querySelector(`label[for="${inp.id}"]`) : null;
-                const label = (lel ? lel.textContent.trim() : '')
-                    || inp.getAttribute('placeholder') || inp.getAttribute('aria-label')
-                    || inp.getAttribute('name') || '';
-                if (!label) continue;
+                const label = getLabelForInput(inp, dialog);
+                if (!label || seenLabels.has(label.toLowerCase())) continue;
+                seenLabels.add(label.toLowerCase());
+
                 const isSelect = inp.tagName.toLowerCase() === 'select';
                 const opts = [];
                 if (isSelect) {
                     for (const o of inp.options) {
-                        if (!o.disabled && o.value !== '' && o.text.trim() !== '') {
+                        if (!o.disabled && o.value !== '' && o.text.trim() !== '')
                             opts.push(o.text.trim());
-                        }
                     }
                 }
                 fields.push({
                     label: label.slice(0,100),
                     type: isSelect ? 'dropdown' : (inp.getAttribute('type')||'text'),
-                    name: inp.getAttribute('name')||'',
+                    name: inp.getAttribute('name') || inp.getAttribute('formcontrolname') || '',
                     required: inp.required || inp.getAttribute('aria-required')==='true',
                     selector: getBestSelector(inp),
                     options: opts.slice(0, 20),
+                });
+            }
+
+            // ── Angular Material mat-form-field (catches mat-select, mat-autocomplete) ──
+            for (const ff of dialog.querySelectorAll(
+                'mat-form-field, .mat-form-field, .mat-mdc-form-field'
+            )) {
+                if (!isVisible(ff)) continue;
+                const labelEl = ff.querySelector(
+                    'mat-label, label, .mat-form-field-label, .mdc-floating-label'
+                );
+                const label = labelEl ? labelEl.textContent.trim() : '';
+                if (!label || seenLabels.has(label.toLowerCase())) continue;
+
+                // Check for mat-select (custom element, not a native <select>)
+                const matSel = ff.querySelector('mat-select, .mat-mdc-select');
+                // Check for native input inside the mat-form-field
+                const nativeInp = ff.querySelector(
+                    'input:not([type="hidden"]):not([disabled]), textarea:not([disabled])'
+                );
+                if (!matSel && !nativeInp) continue;
+
+                seenLabels.add(label.toLowerCase());
+                const isMatSelect = !!matSel && !nativeInp;
+                const targetEl = isMatSelect ? matSel : nativeInp;
+                const required = ff.querySelector('.mat-form-field-required-marker, .mdc-floating-label--required') !== null
+                    || (targetEl && (targetEl.required || targetEl.getAttribute('aria-required') === 'true'));
+
+                fields.push({
+                    label: label.slice(0,100),
+                    type: isMatSelect ? 'mat-select' : (nativeInp ? (nativeInp.getAttribute('type')||'text') : 'text'),
+                    name: targetEl ? (targetEl.getAttribute('name') || targetEl.getAttribute('formcontrolname') || '') : '',
+                    required: required,
+                    selector: targetEl ? getBestSelector(targetEl) : '',
+                    options: [],
+                    _mat_form_field: true,
                 });
             }
 
@@ -2986,10 +3394,13 @@ class ExploreEngine:
             for (const btn of dialog.querySelectorAll('button,[role="button"],input[type="submit"]')) {
                 if (!isVisible(btn)) continue;
                 const t = (btn.textContent||btn.value||btn.getAttribute('aria-label')||'').trim().toLowerCase();
-                if (!submit_selector && /^(save|submit|create|add|confirm|ok|done|apply)/.test(t))
-                    submit_selector = getBestSelector(btn) || ('button:contains("'+btn.textContent.trim().slice(0,30)+'")');
-                if (!cancel_selector && /^(cancel|close|dismiss|back|no)/.test(t))
-                    cancel_selector = getBestSelector(btn) || ('button:contains("'+btn.textContent.trim().slice(0,30)+'")');
+                if (!submit_selector && /^(save|submit|create|add|confirm|ok|done|apply)/.test(t)) {
+                    const s = getBestSelector(btn);
+                    submit_selector = s;  // empty string is fine — roundtrip uses XPath fallback
+                }
+                if (!cancel_selector && /^(cancel|close|dismiss|back|no)/.test(t)) {
+                    cancel_selector = getBestSelector(btn);
+                }
             }
 
             const titleEl = dialog.querySelector(
